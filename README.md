@@ -6,29 +6,6 @@ MCP Server for AWS DevOps Agent to collect diagnostic logs from EKS worker nodes
 
 This solution enables DevOps Agent to collect diagnostic logs from EKS worker nodes through a secure MCP Gateway. It solves the challenge of running async SSM Automations and retrieving results without requiring direct S3 access for the agent.
 
-## Architecture
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  DevOps Agent   │────▶│  AgentCore       │────▶│  Lambda         │
-│                 │     │  Gateway (MCP)   │     │  Function       │
-└─────────────────┘     └──────────────────┘     └────────┬────────┘
-                                                          │
-                        ┌──────────────────┐              │
-                        │  Cognito         │◀─────────────┤
-                        │  (OAuth)         │              │
-                        └──────────────────┘              │
-                                                          ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  EKS Worker     │◀────│  SSM Automation  │◀────│  SSM            │
-│  Node           │     │  Role            │     │  Automation     │
-└─────────────────┘     └──────────────────┘     └────────┬────────┘
-                                                          │
-                        ┌──────────────────┐              │
-                        │  S3 Bucket       │◀─────────────┘
-                        │  (Auto-unzip)    │
-                        └──────────────────┘
-```
 
 ## MCP Tools
 
@@ -177,29 +154,6 @@ The agent will:
 
 ---
 
-## Using as a CDK Construct
-
-You can also use this as a construct in your own CDK application:
-
-```typescript
-import { SsmAutomationGatewayConstruct } from './ssm-automation-gateway-construct';
-
-const gateway = new SsmAutomationGatewayConstruct(this, 'MyGateway', {
-  gatewayName: 'MySSMGateway',
-  logRetentionDays: 14,
-});
-```
-
-### Construct Properties
-
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `gatewayName` | string | `EksNodeLogMcpGW` | Name for the AgentCore Gateway |
-| `cognitoUserPoolName` | string | `ssm-automation-gateway-pool` | Name for the Cognito User Pool |
-| `resourceServerName` | string | `ssm-automation-gateway-id` | Name for the Cognito Resource Server |
-| `logRetentionDays` | number | `30` | Days to retain logs in S3 |
-
----
 
 ## CloudFormation Outputs
 
@@ -224,37 +178,6 @@ To delete all resources:
 cdk destroy
 ```
 
----
-
-## Troubleshooting
-
-### CDK Bootstrap Error
-If you see "This stack uses assets, so the toolkit stack must be deployed":
-```bash
-cdk bootstrap aws://<account-id>/<region>
-```
-
-### Gateway Already Exists Error
-If deploying fails with "A gateway with name 'X' already exists":
-- Delete the existing gateway in BedrockAgentCore console, or
-- Change the `gatewayName` property in the construct
-
-### Lambda Permission Error
-If you see "Gateway execution role lacks permission to invoke Lambda":
-- The construct automatically adds the required permission
-- If using manual deployment, ensure the Lambda has a resource-based policy allowing `bedrock-agentcore.amazonaws.com`
-
----
-
-## Security
-
-- All resources are deployed within your AWS account
-- Cognito provides OAuth 2.0 client credentials authentication
-- S3 bucket has versioning enabled and public access blocked
-- IAM roles follow least-privilege principle
-- Logs are automatically deleted after 30 days (configurable)
-
----
 
 ## License
 
