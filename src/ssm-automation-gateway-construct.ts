@@ -752,7 +752,9 @@ def list_automations(arguments):
 def list_collected_logs(arguments):
     instance_id = arguments.get('instanceId', '')
     try:
-        prefix = f'eks-logs/{instance_id}/' if instance_id else 'eks-logs/'
+        # SSM document uploads files as eks_i-{instanceId}_{uuid}.tar.gz at bucket root
+        # Extracted files are in eks_i-{instanceId}_{uuid}/extracted/
+        prefix = f'eks_{instance_id}' if instance_id else 'eks_'
         response = s3_client.list_objects_v2(Bucket=LOGS_BUCKET, Prefix=prefix, MaxKeys=100)
         logs = [{'key': obj['Key'], 'size': obj['Size'], 'lastModified': obj['LastModified'].isoformat()} for obj in response.get('Contents', [])]
         return {'statusCode': 200, 'body': json.dumps({'success': True, 'logs': logs, 'count': len(logs), 'bucket': LOGS_BUCKET})}
