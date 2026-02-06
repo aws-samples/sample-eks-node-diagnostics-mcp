@@ -547,6 +547,32 @@ export class SsmAutomationGatewayConstruct extends Construct {
           Required: ['logKey'],
         },
       },
+      {
+        Name: 'search_log_errors',
+        Description: 'Search collected logs for error messages, warnings, and failures. Scans large log files (kubelet, containerd, dmesg, system logs) and returns only lines containing errors.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID to search logs for (e.g., i-0123456789abcdef0)',
+            },
+            pattern: {
+              Type: 'string',
+              Description: 'Custom regex pattern to search for (default: error|fail|fatal|panic|crash|oom|killed|denied|refused|timeout|exception)',
+            },
+            logTypes: {
+              Type: 'string',
+              Description: 'Comma-separated log types to search: kubelet,containerd,dmesg,kernel,networking,storage,ipamd (default: all)',
+            },
+            maxResults: {
+              Type: 'integer',
+              Description: 'Maximum number of error lines to return per log file (default: 50)',
+            },
+          },
+          Required: ['instanceId'],
+        },
+      },
     ];
   }
 
@@ -698,6 +724,8 @@ def lambda_handler(event, context):
         return list_collected_logs(event)
     elif tool_name == 'get_log_content':
         return get_log_content(event)
+    elif tool_name == 'search_log_errors':
+        return search_log_errors(event)
     else:
         return {'statusCode': 400, 'body': json.dumps({'error': f'Unknown tool: {tool_name}'})}
 
@@ -782,6 +810,105 @@ def get_log_content(arguments):
         return {'statusCode': 200, 'body': json.dumps({'success': True, 'logKey': log_key, 'content': content_str, 'size': file_size, 'truncated': truncated})}
     except s3_client.exceptions.NoSuchKey:
         return {'statusCode': 404, 'body': json.dumps({'error': f'Log file not found: {log_key}'})}
+    except Exception as e:
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+import re
+
+def search_log_errors(arguments):
+    instance_id = arguments.get('instanceId')
+    if not instance_id:
+        return {'statusCode': 400, 'body': json.dumps({'error': 'instanceId is required'})}
+    
+    # Default error patterns for EKS/Kubernetes troubleshooting
+    default_pattern = r'(?i)(error|fail|fatal|panic|crash|oom|killed|denied|refused|timeout|exception|unable|cannot|couldn\\'t|invalid|unauthorized|forbidden|not found|no space|disk pressure|memory pressure|evict|backoff|crashloop|imagepull|networkplugin|notready|unreachable|connection refused|tls handshake|certificate|expired|rejected|dropped|lost|missing|broken|corrupt)'
+    custom_pattern = arguments.get('pattern', default_pattern)
+    log_types_str = arguments.get('logTypes', '')
+    max_results = min(arguments.get('maxResults', 50), 100)
+    
+    # Map log types to file patterns
+    log_type_patterns = {
+        'kubelet': ['kubelet'],
+        'containerd': ['containerd'],
+        'dmesg': ['dmesg'],
+        'kernel': ['kernel', 'dmesg'],
+        'networking': ['networking', 'iptables', 'conntrack', 'iproute', 'ifconfig'],
+        'storage': ['storage', 'mount', 'lsblk', 'xfs'],
+        'ipamd': ['ipamd', 'aws-routed-eni', 'cni'],
+        'docker': ['docker'],
+        'sandbox': ['sandbox'],
+    }
+    
+    # Parse requested log types
+    if log_types_str:
+        requested_types = [t.strip().lower() for t in log_types_str.split(',')]
+        file_patterns = []
+        for t in requested_types:
+            if t in log_type_patterns:
+                file_patterns.extend(log_type_patterns[t])
+    else:
+        file_patterns = None  # Search all logs
+    
+    try:
+        # List all extracted log files for this instance
+        prefix = f'eks_{instance_id}'
+        response = s3_client.list_objects_v2(Bucket=LOGS_BUCKET, Prefix=prefix, MaxKeys=500)
+        
+        results = {'instanceId': instance_id, 'pattern': custom_pattern, 'files_searched': 0, 'total_errors': 0, 'errors_by_file': []}
+        
+        for obj in response.get('Contents', []):
+            key = obj['Key']
+            # Only search extracted text files
+            if '/extracted/' not in key:
+                continue
+            if not any(key.endswith(ext) for ext in ['.txt', '.log', '.conf', '.yaml', '.json', '']):
+                continue
+            # Skip binary/archive files
+            if any(key.endswith(ext) for ext in ['.tar.gz', '.zip', '.gz', '.tar']):
+                continue
+            
+            # Filter by log type if specified
+            if file_patterns:
+                if not any(p in key.lower() for p in file_patterns):
+                    continue
+            
+            results['files_searched'] += 1
+            
+            try:
+                # Read file content (limit to 5MB per file)
+                file_response = s3_client.get_object(Bucket=LOGS_BUCKET, Key=key, Range='bytes=0-5242879')
+                content = file_response['Body'].read()
+                try:
+                    content_str = content.decode('utf-8')
+                except:
+                    content_str = content.decode('latin-1', errors='ignore')
+                
+                # Search for error patterns
+                error_lines = []
+                for i, line in enumerate(content_str.split('\\n')):
+                    if re.search(custom_pattern, line):
+                        error_lines.append({'line_num': i + 1, 'content': line[:500]})  # Truncate long lines
+                        if len(error_lines) >= max_results:
+                            break
+                
+                if error_lines:
+                    # Extract just the filename from the full path
+                    filename = key.split('/extracted/')[-1] if '/extracted/' in key else key
+                    results['errors_by_file'].append({
+                        'file': filename,
+                        'full_key': key,
+                        'error_count': len(error_lines),
+                        'errors': error_lines
+                    })
+                    results['total_errors'] += len(error_lines)
+            except Exception as e:
+                print(f"Error reading {key}: {str(e)}")
+                continue
+        
+        # Sort by error count descending
+        results['errors_by_file'].sort(key=lambda x: x['error_count'], reverse=True)
+        
+        return {'statusCode': 200, 'body': json.dumps({'success': True, **results})}
     except Exception as e:
         return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 `;
