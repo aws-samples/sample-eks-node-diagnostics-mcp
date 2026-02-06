@@ -563,7 +563,7 @@ export class SsmAutomationGatewayConstruct extends Construct {
             },
             logTypes: {
               Type: 'string',
-              Description: 'Comma-separated log types to search: kubelet,containerd,dmesg,kernel,networking,storage,ipamd (default: all)',
+              Description: 'Comma-separated log types to search: kubelet,containerd,dmesg,kernel,messages,system,networking,storage,ipamd,docker,pods,aws-node,coredns,config,security (default: all)',
             },
             maxResults: {
               Type: 'integer',
@@ -826,17 +826,24 @@ def search_log_errors(arguments):
     log_types_str = arguments.get('logTypes', '')
     max_results = min(arguments.get('maxResults', 50), 100)
     
-    # Map log types to file patterns
+    # Map log types to file patterns (based on EKS worker node log locations)
     log_type_patterns = {
-        'kubelet': ['kubelet'],
+        'kubelet': ['kubelet', 'kube-proxy'],
         'containerd': ['containerd'],
         'dmesg': ['dmesg'],
         'kernel': ['kernel', 'dmesg'],
-        'networking': ['networking', 'iptables', 'conntrack', 'iproute', 'ifconfig'],
-        'storage': ['storage', 'mount', 'lsblk', 'xfs'],
-        'ipamd': ['ipamd', 'aws-routed-eni', 'cni'],
-        'docker': ['docker'],
+        'messages': ['messages', 'syslog'],
+        'system': ['messages', 'syslog', 'secure', 'audit', 'cron', 'cloud-init', 'user-data'],
+        'networking': ['networking', 'iptables', 'conntrack', 'iproute', 'ifconfig', 'resolv'],
+        'storage': ['storage', 'mount', 'lsblk', 'xfs', 'fstab', 'ebs-csi', 'efs-csi', 'fsx-csi', 's3-csi'],
+        'ipamd': ['ipamd', 'aws-routed-eni', 'cni', 'plugin.log', 'egress-plugin', 'network-policy-agent'],
+        'docker': ['docker', 'daemon.json'],
         'sandbox': ['sandbox'],
+        'pods': ['pods/', 'containers/'],
+        'aws-node': ['aws-node', 'cni-metrics-helper'],
+        'coredns': ['coredns'],
+        'config': ['kubelet-config', 'config.json', 'config.toml', 'kubeconfig', 'bootstrap'],
+        'security': ['secure', 'audit'],
     }
     
     # Parse requested log types
