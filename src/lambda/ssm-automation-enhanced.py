@@ -45,12 +45,8 @@ class Severity(Enum):
     INFO = 'info'
 
 
-# Error patterns by severity - Comprehensive patterns from:
-# 1. AWS EKS troubleshooting docs: https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html
-# 2. EKSLogAnalyzer: https://code.amazon.com/packages/EKSLogAnalyzer
 ERROR_PATTERNS = {
     Severity.CRITICAL: [
-        # === KERNEL/SYSTEM CRITICAL (from EKSLogAnalyzer dmesg.go) ===
         r'BUG:.*',  # Kernel bug detected
         r'kernel panic',
         r'watchdog: BUG: soft lockup',  # Soft lockup detection
@@ -67,7 +63,6 @@ ERROR_PATTERNS = {
         r'IPVS.*error',  # IPVS mode error
         r'conntrack.*exhausted',  # Connection tracking full
         
-        # === KUBELET CRITICAL (from EKSLogAnalyzer kubeletlog.go) ===
         r'failed to (list|ensure lease exists).*Unauthorized',  # AWS auth issue
         r'(Server rejected|Unable to register).*Unauthorized',  # Node registration failed
         r'UnauthorizedOperation:',  # IAM permission issue
@@ -86,7 +81,6 @@ ERROR_PATTERNS = {
         r'failed to validate kubelet flags:',  # Kubelet flag validation
         r'(failed to list|ensure lease exists|Server rejected|Unable to register).*dial.*i/o timeout',  # Network failure
         
-        # === IPAMD/CNI CRITICAL (from EKSLogAnalyzer ipamd.go) ===
         r'Starting L-IPAMD',  # IPAMD restart (critical if repeated)
         r'InsufficientFreeAddressesInSubnet',  # IP exhaustion
         r'Failed to check API server connectivity.*no configuration has been provided',  # Missing token
@@ -94,7 +88,6 @@ ERROR_PATTERNS = {
         r'Failed to check API server connectivity',  # API connectivity failure
         r'Unauthorized operation: failed to call .* due to missing permissions',  # IAM missing permissions
         
-        # === NODE JOIN FAILURES (from AWS docs) ===
         r'Instances failed to join',
         r'failed to join the kubernetes cluster',
         r'unable to register node',
@@ -102,7 +95,6 @@ ERROR_PATTERNS = {
         r'certificate has expired',
         r'x509: certificate',
         
-        # === IRSA/OIDC/STS ERRORS (from AWS re:Post) ===
         r'WebIdentityErr: failed to retrieve credentials',  # IRSA credential retrieval failed
         r'InvalidIdentityToken.*No OpenIDConnect provider found',  # OIDC provider not found
         r'InvalidIdentityToken.*Incorrect token audience',  # Wrong OIDC audience
@@ -111,7 +103,6 @@ ERROR_PATTERNS = {
         r'InvalidClientTokenId.*security token.*invalid',  # Invalid security token
         r'ValidationError.*Request ARN is invalid',  # Invalid IAM ARN format
         
-        # === CLUSTER HEALTH ERROR CODES (from AWS docs) ===
         r'SUBNET_NOT_FOUND',  # Subnet not found
         r'SECURITY_GROUP_NOT_FOUND',  # Security group not found
         r'IP_NOT_AVAILABLE',  # IP not available in subnet
@@ -126,7 +117,6 @@ ERROR_PATTERNS = {
         r'STS_REGIONAL_ENDPOINT_DISABLED',  # STS endpoint disabled
         r'OPT_IN_REQUIRED',  # EC2 subscription missing
         
-        # === MANAGED NODE GROUP ERRORS (AWS error codes) ===
         r'AccessDenied',
         r'AmiIdNotFound',
         r'AsgInstanceLaunchFailures',
@@ -145,13 +135,11 @@ ERROR_PATTERNS = {
         r'Ec2SecurityGroupDeletionFailure',  # Cannot delete remote access security group
         r'InternalFailure',  # Amazon EKS server-side issue
         
-        # === HYBRID NODES CRITICAL (nodeadm) ===
         r'nodeadm.*failed',
         r'nodeadm.*error',
         r'failed to initialize node',
         r'SSM activation failed',
         
-        # === STORAGE CRITICAL ===
         r'error mounting.*etc-hosts.*to rootfs.*/etc/hosts',  # /etc/hosts mount failed
         r'volume.*failed',
         r'mount.*failed',
@@ -165,20 +153,17 @@ ERROR_PATTERNS = {
         r'mount: wrong fs type',  # Filesystem type mismatch
         r'fsck.*error',  # Filesystem check error
         
-        # === KNOWN BAD KERNELS (from EKSLogAnalyzer kernel_bugs.go) ===
         r'5\.4\.214-120\.368',  # Known PLEG issue kernel
         r'5\.4\.217-126\.408',  # Known PLEG issue kernel
         r'5\.4\.238-155\.346',  # Known SMB mount issue kernel
         
-        # === CONTAINER RUNTIME CRITICAL (from AWS docs exact strings) ===
-        r'Container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady',  # Exact AWS docs string
+        r'Container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady',
         r'network plugin is not ready: cni config uninitialized',  # CNI not initialized
         r'container_linux\.go.*starting container process',  # Container start failure
         r'exec format error',  # Wrong architecture (amd64/arm64 mismatch)
         r'no such file or directory',  # Missing entrypoint/binary
         r'permission denied',  # File permissions issue
         
-        # === VPC CNI/IP CRITICAL (from AWS re:Post) ===
         r'Failed to assign an IP address to pod',  # IP assignment failure
         r'no free IP addresses',  # IP exhaustion
         r'ENI allocation failed',  # ENI limit or subnet issue
@@ -186,7 +171,6 @@ ERROR_PATTERNS = {
         r'NetworkNotReady',  # Network not ready condition
         r'networkPlugin cni failed',  # CNI plugin failure
         
-        # === DNS CRITICAL (from AWS re:Post) ===
         r'dial udp.*:53.*i/o timeout',  # DNS port unreachable (High)
         r'dial udp.*:53.*timeout',  # DNS timeout (High)
         r'upstream.*unreachable',  # CoreDNS upstream unreachable (High)
@@ -194,16 +178,13 @@ ERROR_PATTERNS = {
         r'CoreDNS.*error',  # CoreDNS error (High)
         r'DNS.*timeout',  # DNS query timeout (High)
         
-        # === NODE JOIN CRITICAL (from AWS docs) ===
         r'node "" not found',  # Missing private DNS entry
-        r'Failed to list \*v1\.Service: Unauthorized',  # Exact AWS docs string
-        r'Unable to register node.*with API server: Unauthorized',  # Exact AWS docs string
+        r'Failed to list \*v1\.Service: Unauthorized',
+        r'Unable to register node.*with API server: Unauthorized',
         
-        # === OOM/RESOURCE CRITICAL (from kernel logs) ===
         r'Killed process.*total-vm',  # OOM killer with memory info
         r'exit code 137',  # SIGKILL (OOM or manual kill)
         
-        # === IMAGE PULL CRITICAL ===
         r'Failed to pull image',  # Image pull failure
         r'unauthorized.*authentication required',  # Registry auth missing
         r'manifest.*not found',  # Image/tag doesn't exist
@@ -211,7 +192,6 @@ ERROR_PATTERNS = {
         r'ECR.*token.*expired',  # ECR auth expired
         r'pull access denied',  # No pull permission
         
-        # === SECRETS/WEBHOOK CRITICAL ===
         r'failed to get secret',  # Secret retrieval failed
         r'secrets.*not found',  # Secret doesn't exist
         r'secrets.*forbidden',  # No permission to access secret
@@ -222,7 +202,6 @@ ERROR_PATTERNS = {
         r'admission.*rejected',  # Admission controller rejected
         r'CreateContainerConfigError',  # Container config error (often secrets-related)
         
-        # === NEW PATTERNS FROM EKSLogAnalyzer ids.go (February 2026) ===
         # Bandwidth/Network Limits
         r'Rx packets queued/dropped',  # IDBandwidthInExceeded - Rx bandwidth exceeded
         r'Tx packets queued/dropped',  # IDPPSExceeded - Tx packets per second exceeded
@@ -233,27 +212,22 @@ ERROR_PATTERNS = {
         r'nf_conntrack.*table full',  # IDConntrackExceededKernel - Conntrack exceeded at kernel level
         r'Maximum connections exceeded',  # IDConntrackExceeded - Instance level conntrack exceeded
         
-        # iptables Issues (from EKSLogAnalyzer iptables.go)
         r'REJECT.*rule',  # IDUnexpectedRejectRule - Unexpected REJECT rule in iptables
         r'Missing.*IPAMD.*iptables',  # IDMissingIPAMdIptablesRules - Missing IPAMD iptables rules
         r'port.*conflict',  # Port conflict detected
         
-        # Interface Issues (from EKSLogAnalyzer interfaces.go)
         r'interface.*down',  # IDInterfaceDown - Network interface down
         r'Missing.*IPv6.*address',  # IDMissingIPv6Address - Missing IPv6 address
         r'Missing.*loopback',  # IDMissingLoopbackInterface - Missing loopback interface
         
-        # Route Issues (from EKSLogAnalyzer)
         r'Missing.*pod.*IP.*route',  # IDMissingIPRouteRules - Missing pod IP route rules
         r'Missing.*default.*route',  # IDMissingDefaultRoutes - Missing default route rules
         
-        # Process Issues (from EKSLogAnalyzer processes.go)
         r'Excessive.*threads',  # IDExcessiveThreads - Too many threads
         r'zombie.*process',  # IdExcessiveZombieProcesses - Zombie processes
         r'Approaching.*kernel.*pid.*max',  # IDApproachingKernelPidMax - Near PID limit
         r'runc.*init.*hung',  # IDRuncInitPossiblyHung - runc init possibly hung
         
-        # Nodeadm Issues (from EKSLogAnalyzer nodeadm.go)
         r'nodeadm.*run.*restart',  # IDNodeadmRunRestart - Nodeadm run restart
         
         # Bootstrap/Boot Issues
@@ -264,14 +238,12 @@ ERROR_PATTERNS = {
         # Auto Mode Issues
         r'VPC.*CNI.*pod.*Auto.*Mode.*node',  # IDAutoModeNodeWithAwsNode - VPC CNI pod on Auto Mode node
         
-        # ec2-net-utils Package (from EKSLogAnalyzer)
         r'ec2-net-utils',  # IDHasEC2NetUtilsPackage - ec2-net-utils package installed (causes issues)
         
         # Security Agent Issues
         r'Trend.*Micro.*Security.*Agent',  # IDHasTrendMicroSecurityAgent - Trend Micro agent running (known issues)
     ],
     Severity.WARNING: [
-        # === KUBELET WARNINGS (from EKSLogAnalyzer kubeletlog.go) ===
         r'Readiness probe for ".*?:(.*)" failed',  # Readiness probe failure
         r'Liveness probe for ".*?:(.*)" failed',  # Liveness probe failure
         r'due to client-side throttling',  # Client-side throttling
@@ -281,14 +253,12 @@ ERROR_PATTERNS = {
         r'--node-labels=""',  # Empty node labels
         r'(Starting|Stopping).* Kubernetes Kubelet',  # Kubelet restart
         
-        # === KERNEL/DMESG WARNINGS (from EKSLogAnalyzer dmesg.go) ===
         r'\S+: Found a Tx that wasn\'t completed on time',  # TX not completed
         r'nfs: server .*? not responding',  # NFS not responding
         r'net_ratelimit:.*\d+ callbacks suppressed',  # Kernel log rate limiting
         r'martian source .* from .*, on dev',  # Martian packet
         r'mce: .*: Core temperature is above threshold',  # CPU overheating
         
-        # === SYSTEM WARNINGS (from EKSLogAnalyzer messages.go) ===
         r'is not authorized to perform: .*? ',  # Missing AWS permission
         r'rsyslogd:.* \d+ messages lost due to rate-limiting',  # Syslog rate limiting
         r'systemd.*Failed to start .*?\.',  # Service failed to start
@@ -296,7 +266,6 @@ ERROR_PATTERNS = {
         r'cloud-init: \+ mount /.*? /.*?',  # Unexpected mount operation
         r'kernel: Command line:',  # Multiple boots
         
-        # === NETWORKING WARNINGS (from EKSLogAnalyzer networking) ===
         r'getsockopt: no route to host',
         r'network is unreachable',
         r'dial tcp.*connection refused',
@@ -307,7 +276,6 @@ ERROR_PATTERNS = {
         r'resolve.*failed',
         r'lookup.*failed',
         
-        # === POD/CONTAINER WARNINGS ===
         r'ImagePullBackOff',
         r'ErrImagePull',
         r'CrashLoopBackOff',
@@ -318,7 +286,6 @@ ERROR_PATTERNS = {
         r'FailedMount',
         r'FailedAttachVolume',
         
-        # === RESOURCE WARNINGS ===
         r'Insufficient cpu',
         r'Insufficient memory',
         r'Insufficient pods',
@@ -327,7 +294,6 @@ ERROR_PATTERNS = {
         r'Evicted',
         r'OOMKilled',
         
-        # === SCHEDULING WARNINGS ===
         r'node\(s\) didn\'t match.*selector',  # Node selector mismatch
         r'node\(s\) had.*taint',  # Taint/toleration mismatch
         r'node\(s\) didn\'t have free ports',  # Host port conflict
@@ -337,24 +303,19 @@ ERROR_PATTERNS = {
         r'NodeAffinity',  # Affinity rule not satisfied
         r'PodAffinity',  # Pod affinity not satisfied
         
-        # === STORAGE WARNINGS ===
         r'VolumeResizeFailed',
         r'WaitForFirstConsumer',
         r'Pending.*PersistentVolumeClaim',
         r'xfs_repair',  # XFS filesystem repair needed
         r'PVC.*pending',  # PVC in pending state
         
-        # === VPC CNI WARNINGS ===
         r'VPC CNI v1\.20\.4',  # Known buggy version
         
-        # === PROCESS WARNINGS (from EKSLogAnalyzer) ===
         r'runc init',  # runc init possibly hung
         r'zombie',  # Zombie processes
         
-        # === KNOWN BAD SOFTWARE (from EKSLogAnalyzer wellknown_bugs.go) ===
         r'DataDog.*7\.38\.[01]',  # DataDog zombie process bug
         
-        # === ADDITIONAL WARNINGS FROM CATALOG ===
         r'Back-off restarting failed container',  # Container restart backoff
         r'denied.*access',  # Access denied (generic)
         r'dial tcp.*connection refused.*registry',  # Registry connection refused
@@ -367,19 +328,14 @@ ERROR_PATTERNS = {
         r'MutatingWebhook.*error',  # Mutating webhook error (Medium severity)
         r'ValidatingWebhook.*error',  # Validating webhook error (Medium severity)
         
-        # === NEW WARNING PATTERNS FROM EKSLogAnalyzer ids.go (February 2026) ===
-        # Throttling/Performance (from EKSLogAnalyzer cputhrottling.go, iothrottling.go)
         r'cpu.*throttl',  # IDCPUThrottling - CPU throttling detected
         r'io.*delay',  # IDIODelays - I/O delays detected
         
-        # Storage (from EKSLogAnalyzer diskusage.go, xfs.go)
         r'High.*Disk.*Usage',  # IDHighDiskUsage - High disk usage
         r'XFS.*Small.*Average.*Cluster.*Size',  # IDXFSSmallAverageClusterSize - XFS cluster size issue
         
-        # Conntrack (from EKSLogAnalyzer conntrack.go)
         r'UNREPLIED.*conntrack',  # IDConntrackUnrepliedEntries - Multiple UNREPLIED entries in conntrack
         
-        # kube-proxy (from EKSLogAnalyzer kube_proxy.go)
         r'kube-proxy.*slow',  # IDKubeProxySlow - Slow kube-proxy performance
         
         # Pod Issues
@@ -401,7 +357,6 @@ ERROR_PATTERNS = {
         # Well-known Application Bugs
         r'Well.*known.*application.*bug',  # IDWellKnownApplicationBug - Well-known application bug detected
         
-        # === GENERAL WARNINGS ===
         r'(?i)error',
         r'(?i)fail',
         r'(?i)denied',
@@ -413,24 +368,19 @@ ERROR_PATTERNS = {
         r'(?i)unreachable',
     ],
     Severity.INFO: [
-        # === PROBE INFO ===
         r'readiness probe failed',
         r'liveness probe failed',
         r'startup probe failed',
         
-        # === THROTTLING INFO (from EKSLogAnalyzer) ===
         r'CPU Throttling',
         r'I/O Delay',
         
-        # === DISK INFO ===
         r'High Disk Usage',
         r'Small XFS Average Cluster Size',
         
-        # === NETWORK INFO ===
         r'Many Network Connections',
         r'Interface Down',
         
-        # === GENERAL INFO ===
         r'(?i)warn',
         r'(?i)warning',
         r'(?i)unable',
@@ -1125,7 +1075,6 @@ def generate_recommendations(critical_findings: List[Dict], warning_findings: Li
                 'category': 'memory',
                 'issue': 'Memory pressure detected',
                 'action': 'Review pod resource limits and node capacity. Consider scaling up or adding nodes.',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html'
             })
         elif 'unauthorized' in pattern or 'denied' in pattern:
             recommendations.append({
@@ -1133,7 +1082,6 @@ def generate_recommendations(critical_findings: List[Dict], warning_findings: Li
                 'category': 'auth',
                 'issue': 'Authentication/authorization failures',
                 'action': 'Check IAM roles, RBAC policies, and aws-auth ConfigMap.',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting_iam.html'
             })
         elif 'cni' in pattern or 'ipamd' in pattern or 'network' in pattern:
             recommendations.append({
@@ -1141,7 +1089,6 @@ def generate_recommendations(critical_findings: List[Dict], warning_findings: Li
                 'category': 'networking',
                 'issue': 'CNI/networking issues detected',
                 'action': 'Check VPC CNI plugin logs, subnet IP availability, and security groups.',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting-cni.html'
             })
         elif 'pleg' in pattern:
             recommendations.append({
@@ -1149,7 +1096,6 @@ def generate_recommendations(critical_findings: List[Dict], warning_findings: Li
                 'category': 'kubelet',
                 'issue': 'PLEG (Pod Lifecycle Event Generator) issues',
                 'action': 'Check for container runtime issues, disk I/O problems, or too many pods on node.',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html'
             })
     
     # Remove duplicates
@@ -1568,7 +1514,6 @@ def generate_preventive_recommendations(category: str) -> List[Dict]:
             {
                 'category': 'monitoring',
                 'recommendation': 'Set up CloudWatch alarms for EBS volume attachment failures',
-                'reference': 'https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-volume-status.html'
             },
             {
                 'category': 'configuration',
@@ -1585,54 +1530,46 @@ def generate_preventive_recommendations(category: str) -> List[Dict]:
             {
                 'category': 'monitoring',
                 'recommendation': 'Set up Container Insights for memory/CPU monitoring',
-                'reference': 'https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-EKS-quickstart.html'
             },
         ],
         'C': [
             {
                 'category': 'capacity_planning',
                 'recommendation': 'Enable VPC CNI prefix delegation for higher IP density',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html'
             },
             {
                 'category': 'monitoring',
                 'recommendation': 'Monitor subnet IP availability with CloudWatch',
-                'reference': 'https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cloudwatch.html'
             },
         ],
         'D': [
             {
                 'category': 'configuration',
                 'recommendation': 'Increase nf_conntrack_max via node configuration',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/node-group-launch-template.html'
             },
         ],
         'E': [
             {
                 'category': 'capacity_planning',
                 'recommendation': 'Implement Cluster Autoscaler or Karpenter',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html'
             },
         ],
         'F': [
             {
                 'category': 'security',
                 'recommendation': 'Use ECR pull-through cache for external images',
-                'reference': 'https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html'
             },
         ],
         'G': [
             {
                 'category': 'reliability',
                 'recommendation': 'Scale CoreDNS based on cluster size',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/coredns.html'
             },
         ],
         'H': [
             {
                 'category': 'security',
                 'recommendation': 'Use EKS Pod Identity for secrets access',
-                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html'
             },
         ],
     }
@@ -2835,7 +2772,6 @@ def generate_incident_summary(arguments: Dict) -> Dict:
                     'action': f'read_log_chunk(logKey="{finding.get("fullKey")}")'
                 })
         
-        # === POD/NODE FAILURE TRIAGE ===
         if include_triage and findings:
             try:
                 check_timeout()
