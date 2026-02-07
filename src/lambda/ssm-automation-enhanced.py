@@ -60,6 +60,12 @@ ERROR_PATTERNS = {
         r'\s.*?\[\d+\]: segfault at',  # Segfault
         r'task .*?:\d+ blocked for more than',  # Process blocked (I/O)
         r'(ip|nf)_conntrack: table full, dropping packet',  # Conntrack exhaustion
+        r'dropping packet',  # Conntrack or iptables dropping packets
+        r'iptables.*error',  # iptables rule error
+        r'iptables-restore.*failed',  # iptables restore failed
+        r'kube-proxy.*error',  # kube-proxy issue
+        r'IPVS.*error',  # IPVS mode error
+        r'conntrack.*exhausted',  # Connection tracking full
         
         # === KUBELET CRITICAL (from EKSLogAnalyzer kubeletlog.go) ===
         r'failed to (list|ensure lease exists).*Unauthorized',  # AWS auth issue
@@ -96,6 +102,30 @@ ERROR_PATTERNS = {
         r'certificate has expired',
         r'x509: certificate',
         
+        # === IRSA/OIDC/STS ERRORS (from AWS re:Post) ===
+        r'WebIdentityErr: failed to retrieve credentials',  # IRSA credential retrieval failed
+        r'InvalidIdentityToken.*No OpenIDConnect provider found',  # OIDC provider not found
+        r'InvalidIdentityToken.*Incorrect token audience',  # Wrong OIDC audience
+        r"InvalidIdentityToken.*HTTPS certificate doesn't match",  # OIDC thumbprint mismatch
+        r'AccessDenied.*Not authorized to perform sts:AssumeRoleWithWebIdentity',  # IRSA assume role denied
+        r'InvalidClientTokenId.*security token.*invalid',  # Invalid security token
+        r'ValidationError.*Request ARN is invalid',  # Invalid IAM ARN format
+        
+        # === CLUSTER HEALTH ERROR CODES (from AWS docs) ===
+        r'SUBNET_NOT_FOUND',  # Subnet not found
+        r'SECURITY_GROUP_NOT_FOUND',  # Security group not found
+        r'IP_NOT_AVAILABLE',  # IP not available in subnet
+        r'VPC_NOT_FOUND',  # VPC not found - UNRECOVERABLE
+        r'ASSUME_ROLE_ACCESS_DENIED',  # Cannot assume cluster role
+        r'PERMISSION_ACCESS_DENIED',  # Insufficient role permissions
+        r'ASSUME_ROLE_ACCESS_DENIED_USING_SLR',  # Cannot assume EKS service-linked-role
+        r'PERMISSION_ACCESS_DENIED_USING_SLR',  # SLR insufficient permissions
+        r'KMS_KEY_DISABLED',  # KMS key disabled
+        r'KMS_KEY_NOT_FOUND',  # KMS key not found - UNRECOVERABLE
+        r'KMS_GRANT_REVOKED',  # KMS grants revoked - UNRECOVERABLE
+        r'STS_REGIONAL_ENDPOINT_DISABLED',  # STS endpoint disabled
+        r'OPT_IN_REQUIRED',  # EC2 subscription missing
+        
         # === MANAGED NODE GROUP ERRORS (AWS error codes) ===
         r'AccessDenied',
         r'AmiIdNotFound',
@@ -110,6 +140,10 @@ ERROR_PATTERNS = {
         r'InstanceLimitExceeded',
         r'InsufficientFreeAddresses',
         r'NodeCreationFailure',
+        r'AutoScalingGroupInvalidConfiguration',  # ASG config modified externally
+        r'Ec2LaunchTemplateVersionMismatch',  # Launch template version mismatch
+        r'Ec2SecurityGroupDeletionFailure',  # Cannot delete remote access security group
+        r'InternalFailure',  # Amazon EKS server-side issue
         
         # === HYBRID NODES CRITICAL (nodeadm) ===
         r'nodeadm.*failed',
@@ -122,11 +156,119 @@ ERROR_PATTERNS = {
         r'volume.*failed',
         r'mount.*failed',
         r'PersistentVolume.*failed',
+        r'Unable to attach or mount volumes',  # General mount failure
+        r'MountVolume\.SetUp failed',  # Mount setup failed
+        r'timed out waiting for the condition.*volume',  # Mount timeout
+        r'ebs-csi.*error',  # EBS CSI driver error
+        r'efs-csi.*error',  # EFS CSI driver error
+        r'mount\.nfs.*timed out',  # NFS mount timeout
+        r'mount: wrong fs type',  # Filesystem type mismatch
+        r'fsck.*error',  # Filesystem check error
         
         # === KNOWN BAD KERNELS (from EKSLogAnalyzer kernel_bugs.go) ===
         r'5\.4\.214-120\.368',  # Known PLEG issue kernel
         r'5\.4\.217-126\.408',  # Known PLEG issue kernel
         r'5\.4\.238-155\.346',  # Known SMB mount issue kernel
+        
+        # === CONTAINER RUNTIME CRITICAL (from AWS docs exact strings) ===
+        r'Container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady',  # Exact AWS docs string
+        r'network plugin is not ready: cni config uninitialized',  # CNI not initialized
+        r'container_linux\.go.*starting container process',  # Container start failure
+        r'exec format error',  # Wrong architecture (amd64/arm64 mismatch)
+        r'no such file or directory',  # Missing entrypoint/binary
+        r'permission denied',  # File permissions issue
+        
+        # === VPC CNI/IP CRITICAL (from AWS re:Post) ===
+        r'Failed to assign an IP address to pod',  # IP assignment failure
+        r'no free IP addresses',  # IP exhaustion
+        r'ENI allocation failed',  # ENI limit or subnet issue
+        r'failed to set up sandbox container.*network',  # Network setup failure
+        r'NetworkNotReady',  # Network not ready condition
+        r'networkPlugin cni failed',  # CNI plugin failure
+        
+        # === DNS CRITICAL (from AWS re:Post) ===
+        r'dial udp.*:53.*i/o timeout',  # DNS port unreachable (High)
+        r'dial udp.*:53.*timeout',  # DNS timeout (High)
+        r'upstream.*unreachable',  # CoreDNS upstream unreachable (High)
+        r'coredns.*unhealthy',  # CoreDNS unhealthy (High)
+        r'CoreDNS.*error',  # CoreDNS error (High)
+        r'DNS.*timeout',  # DNS query timeout (High)
+        
+        # === NODE JOIN CRITICAL (from AWS docs) ===
+        r'node "" not found',  # Missing private DNS entry
+        r'Failed to list \*v1\.Service: Unauthorized',  # Exact AWS docs string
+        r'Unable to register node.*with API server: Unauthorized',  # Exact AWS docs string
+        
+        # === OOM/RESOURCE CRITICAL (from kernel logs) ===
+        r'Killed process.*total-vm',  # OOM killer with memory info
+        r'exit code 137',  # SIGKILL (OOM or manual kill)
+        
+        # === IMAGE PULL CRITICAL ===
+        r'Failed to pull image',  # Image pull failure
+        r'unauthorized.*authentication required',  # Registry auth missing
+        r'manifest.*not found',  # Image/tag doesn't exist
+        r'repository does not exist',  # Wrong repository
+        r'ECR.*token.*expired',  # ECR auth expired
+        r'pull access denied',  # No pull permission
+        
+        # === SECRETS/WEBHOOK CRITICAL ===
+        r'failed to get secret',  # Secret retrieval failed
+        r'secrets.*not found',  # Secret doesn't exist
+        r'secrets.*forbidden',  # No permission to access secret
+        r'KMS.*error',  # KMS error (High severity)
+        r'decrypt.*failed',  # Decryption failed (High severity)
+        r'webhook.*timeout',  # Webhook timeout
+        r'webhook.*denied',  # Webhook denied request
+        r'admission.*rejected',  # Admission controller rejected
+        r'CreateContainerConfigError',  # Container config error (often secrets-related)
+        
+        # === NEW PATTERNS FROM EKSLogAnalyzer ids.go (February 2026) ===
+        # Bandwidth/Network Limits
+        r'Rx packets queued/dropped',  # IDBandwidthInExceeded - Rx bandwidth exceeded
+        r'Tx packets queued/dropped',  # IDPPSExceeded - Tx packets per second exceeded
+        r'Bandwidth.*exceeded',  # IDBandwidthOutExceeded - Bandwidth out exceeded
+        r'LinkLocal.*dropped',  # IDLinkLocalExceeded - LinkLocal packets dropped
+        
+        # Conntrack (kernel level)
+        r'nf_conntrack.*table full',  # IDConntrackExceededKernel - Conntrack exceeded at kernel level
+        r'Maximum connections exceeded',  # IDConntrackExceeded - Instance level conntrack exceeded
+        
+        # iptables Issues (from EKSLogAnalyzer iptables.go)
+        r'REJECT.*rule',  # IDUnexpectedRejectRule - Unexpected REJECT rule in iptables
+        r'Missing.*IPAMD.*iptables',  # IDMissingIPAMdIptablesRules - Missing IPAMD iptables rules
+        r'port.*conflict',  # Port conflict detected
+        
+        # Interface Issues (from EKSLogAnalyzer interfaces.go)
+        r'interface.*down',  # IDInterfaceDown - Network interface down
+        r'Missing.*IPv6.*address',  # IDMissingIPv6Address - Missing IPv6 address
+        r'Missing.*loopback',  # IDMissingLoopbackInterface - Missing loopback interface
+        
+        # Route Issues (from EKSLogAnalyzer)
+        r'Missing.*pod.*IP.*route',  # IDMissingIPRouteRules - Missing pod IP route rules
+        r'Missing.*default.*route',  # IDMissingDefaultRoutes - Missing default route rules
+        
+        # Process Issues (from EKSLogAnalyzer processes.go)
+        r'Excessive.*threads',  # IDExcessiveThreads - Too many threads
+        r'zombie.*process',  # IdExcessiveZombieProcesses - Zombie processes
+        r'Approaching.*kernel.*pid.*max',  # IDApproachingKernelPidMax - Near PID limit
+        r'runc.*init.*hung',  # IDRuncInitPossiblyHung - runc init possibly hung
+        
+        # Nodeadm Issues (from EKSLogAnalyzer nodeadm.go)
+        r'nodeadm.*run.*restart',  # IDNodeadmRunRestart - Nodeadm run restart
+        
+        # Bootstrap/Boot Issues
+        r'Repeated.*bootstrap.*execution',  # IDRepeatedBootstrapExecution - Repeated bootstrap
+        r'Multiple.*boots',  # IDMultipleBoots - Multiple boots detected
+        r'Unexpected.*filesystem.*mount.*operation',  # IDUnexpectedFilesystemMountOperation - Unexpected mount after bootstrap
+        
+        # Auto Mode Issues
+        r'VPC.*CNI.*pod.*Auto.*Mode.*node',  # IDAutoModeNodeWithAwsNode - VPC CNI pod on Auto Mode node
+        
+        # ec2-net-utils Package (from EKSLogAnalyzer)
+        r'ec2-net-utils',  # IDHasEC2NetUtilsPackage - ec2-net-utils package installed (causes issues)
+        
+        # Security Agent Issues
+        r'Trend.*Micro.*Security.*Agent',  # IDHasTrendMicroSecurityAgent - Trend Micro agent running (known issues)
     ],
     Severity.WARNING: [
         # === KUBELET WARNINGS (from EKSLogAnalyzer kubeletlog.go) ===
@@ -185,10 +327,22 @@ ERROR_PATTERNS = {
         r'Evicted',
         r'OOMKilled',
         
+        # === SCHEDULING WARNINGS ===
+        r'node\(s\) didn\'t match.*selector',  # Node selector mismatch
+        r'node\(s\) had.*taint',  # Taint/toleration mismatch
+        r'node\(s\) didn\'t have free ports',  # Host port conflict
+        r'0/\d+ nodes are available',  # No schedulable nodes
+        r'Unschedulable',  # Pod can't be scheduled
+        r'PodToleratesNodeTaints',  # Toleration issue
+        r'NodeAffinity',  # Affinity rule not satisfied
+        r'PodAffinity',  # Pod affinity not satisfied
+        
         # === STORAGE WARNINGS ===
         r'VolumeResizeFailed',
         r'WaitForFirstConsumer',
         r'Pending.*PersistentVolumeClaim',
+        r'xfs_repair',  # XFS filesystem repair needed
+        r'PVC.*pending',  # PVC in pending state
         
         # === VPC CNI WARNINGS ===
         r'VPC CNI v1\.20\.4',  # Known buggy version
@@ -199,6 +353,53 @@ ERROR_PATTERNS = {
         
         # === KNOWN BAD SOFTWARE (from EKSLogAnalyzer wellknown_bugs.go) ===
         r'DataDog.*7\.38\.[01]',  # DataDog zombie process bug
+        
+        # === ADDITIONAL WARNINGS FROM CATALOG ===
+        r'Back-off restarting failed container',  # Container restart backoff
+        r'denied.*access',  # Access denied (generic)
+        r'dial tcp.*connection refused.*registry',  # Registry connection refused
+        r'no such host.*ecr',  # ECR DNS failure
+        r'no such host',  # Host not resolvable (generic)
+        r'i/o timeout.*registry',  # Registry timeout
+        r'NXDOMAIN',  # DNS domain not found
+        r'SERVFAIL',  # DNS server failure
+        r'CoreDNS.*error',  # CoreDNS error
+        r'MutatingWebhook.*error',  # Mutating webhook error (Medium severity)
+        r'ValidatingWebhook.*error',  # Validating webhook error (Medium severity)
+        
+        # === NEW WARNING PATTERNS FROM EKSLogAnalyzer ids.go (February 2026) ===
+        # Throttling/Performance (from EKSLogAnalyzer cputhrottling.go, iothrottling.go)
+        r'cpu.*throttl',  # IDCPUThrottling - CPU throttling detected
+        r'io.*delay',  # IDIODelays - I/O delays detected
+        
+        # Storage (from EKSLogAnalyzer diskusage.go, xfs.go)
+        r'High.*Disk.*Usage',  # IDHighDiskUsage - High disk usage
+        r'XFS.*Small.*Average.*Cluster.*Size',  # IDXFSSmallAverageClusterSize - XFS cluster size issue
+        
+        # Conntrack (from EKSLogAnalyzer conntrack.go)
+        r'UNREPLIED.*conntrack',  # IDConntrackUnrepliedEntries - Multiple UNREPLIED entries in conntrack
+        
+        # kube-proxy (from EKSLogAnalyzer kube_proxy.go)
+        r'kube-proxy.*slow',  # IDKubeProxySlow - Slow kube-proxy performance
+        
+        # Pod Issues
+        r'Pod.*stuck.*terminating',  # IDPodStuckTerminating - Pod stuck terminating
+        
+        # Environment Issues
+        r'Large.*environment.*variables',  # IDLargeEnvironment - Large environment variables
+        
+        # Cron Issues
+        r'Rapid.*cron',  # IDRapidCron - Rapid cron job execution
+        
+        # Container Issues
+        r'Many.*dead.*containers',  # IDManyDeadContainers - Large number of dead containers
+        
+        # Network Configuration
+        r'Missing.*MACAddressPolicy',  # IDMissingMACAddressPolicy - Missing MACAddressPolicy configuration
+        r'Non.*default.*VPC.*CNI.*settings',  # IDNonDefaultVPCCNISettings - Non-default VPC CNI settings
+        
+        # Well-known Application Bugs
+        r'Well.*known.*application.*bug',  # IDWellKnownApplicationBug - Well-known application bug detected
         
         # === GENERAL WARNINGS ===
         r'(?i)error',
