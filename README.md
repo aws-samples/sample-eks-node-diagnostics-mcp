@@ -1,21 +1,65 @@
 # EKS Node Log MCP
 
-MCP Server for AWS DevOps Agent to collect diagnostic logs from EKS worker nodes using SSM Automation.
+Production-grade MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
 
 ## Overview
 
 This solution enables DevOps Agent to collect diagnostic logs from EKS worker nodes through a secure MCP Gateway. It solves the challenge of running async SSM Automations and retrieving results without requiring direct S3 access for the agent.
 
+### Key Features
+
+- **Async Task Pattern**: Start log collection and poll for completion with idempotency support
+- **Byte-Range Streaming**: Read multi-GB log files without truncation
+- **Pre-Indexed Findings**: Fast error discovery without scanning raw files
+- **Manifest Validation**: Verify bundle completeness before analysis
+- **KMS Encryption**: Server-side encryption for all stored logs
+- **Secure Artifact References**: Presigned URLs for large file downloads
+
+---
 
 ## MCP Tools
 
+### Tier 1: Core Operations
+
 | Tool | Description |
 |------|-------------|
-| `run_eks_log_collection` | Start log collection from an EKS worker node |
-| `get_automation_status` | Check the status of an SSM Automation execution |
-| `list_automations` | List recent SSM Automation executions |
-| `list_collected_logs` | List collected logs in S3 (includes extracted files) |
-| `get_log_content` | Read the content of a specific log file |
+| `start_log_collection` | Start log collection with idempotency token support |
+| `get_collection_status` | Get detailed status with progress tracking and failure parsing |
+| `validate_bundle_completeness` | Verify all expected files were extracted |
+| `get_error_summary` | Get pre-indexed error findings (fast path) |
+| `read_log_chunk` | Byte-range streaming for multi-GB files (NO TRUNCATION) |
+
+### Tier 2: Advanced Analysis
+
+| Tool | Description |
+|------|-------------|
+| `search_logs_deep` | Full-text regex search across all logs |
+| `correlate_events` | Cross-file timeline correlation |
+| `get_artifact_reference` | Secure presigned URLs for large artifacts |
+| `generate_incident_summary` | AI-ready structured incident summary |
+| `list_collection_history` | Audit trail of past collections |
+
+---
+
+## Agent Workflow
+
+Recommended workflow for incident response:
+
+```
+1. start_log_collection(instanceId, idempotencyToken)
+   ↓
+2. get_collection_status(executionId) [poll until Success]
+   ↓
+3. validate_bundle_completeness(executionId)
+   ↓
+4. get_error_summary(instanceId) [fast path - pre-indexed]
+   ↓
+5. search_logs_deep(instanceId, query) [if deeper investigation needed]
+   ↓
+6. read_log_chunk(logKey, startByte, endByte) [for specific file context]
+   ↓
+7. generate_incident_summary(instanceId) [final report]
+```
 
 ---
 
@@ -85,6 +129,7 @@ Configure AWS credentials with permissions to create:
 - IAM Roles and Policies
 - Lambda Functions
 - S3 Buckets
+- KMS Keys
 - Cognito User Pools
 - BedrockAgentCore Gateway
 
@@ -94,6 +139,63 @@ aws configure
 aws sso login --profile your-profile
 export AWS_PROFILE=your-profile
 ```
+
+### 6. EKS Worker Node IAM Permissions (Required)
+
+The `AWSSupport-CollectEKSInstanceLogs` SSM document runs on the EKS worker node and uploads logs directly to S3. The EKS worker node's IAM instance profile must have permissions to write to the logs bucket.
+
+After deployment, add the following inline policy to your EKS node group IAM role:
+
+```bash
+# Get the S3 bucket name and KMS key ARN from CDK outputs
+BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name EksNodeLogMcpStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`LogsBucketName`].OutputValue' --output text)
+KMS_KEY_ARN=$(aws cloudformation describe-stacks --stack-name EksNodeLogMcpStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`EncryptionKeyArn`].OutputValue' --output text)
+
+# Add policy to your EKS node role (replace YOUR_EKS_NODE_ROLE_NAME)
+aws iam put-role-policy \
+  --role-name YOUR_EKS_NODE_ROLE_NAME \
+  --policy-name EksNodeLogMcpS3Upload \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"s3:PutObject\",
+          \"s3:GetBucketPolicyStatus\",
+          \"s3:GetBucketAcl\"
+        ],
+        \"Resource\": [
+          \"arn:aws:s3:::${BUCKET_NAME}\",
+          \"arn:aws:s3:::${BUCKET_NAME}/*\"
+        ]
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"kms:GenerateDataKey\",
+          \"kms:Encrypt\"
+        ],
+        \"Resource\": \"${KMS_KEY_ARN}\"
+      }
+    ]
+  }"
+```
+
+**To find your EKS node role name:**
+```bash
+# List node groups for your cluster
+aws eks list-nodegroups --cluster-name YOUR_CLUSTER_NAME
+
+# Get the node role ARN
+aws eks describe-nodegroup --cluster-name YOUR_CLUSTER_NAME \
+  --nodegroup-name YOUR_NODEGROUP_NAME \
+  --query 'nodegroup.nodeRole' --output text
+```
+
+> **Note**: Without these permissions, log collection will fail at the upload step with an S3 access denied error.
 
 ---
 
@@ -107,7 +209,7 @@ cd eks-node-log-mcp
 # Make the script executable
 chmod +x deploy.sh
 
-# Deploy and get configuration
+# Deploy
 ./deploy.sh
 ```
 
@@ -138,22 +240,59 @@ After deployment, configure the MCP Server in DevOps Agent Console with the valu
 
 ---
 
-## Usage Example
+## Usage Examples
 
-Once configured, you can ask DevOps Agent:
+### Basic Log Collection
 
 ```
 Collect logs from EKS worker node i-0123456789abcdef0
 ```
 
-The agent will:
-1. Start the SSM Automation (`run_eks_log_collection`)
-2. Poll for completion (`get_automation_status`)
-3. List the collected logs (`list_collected_logs`)
-4. Read and analyze the log content (`get_log_content`)
+### Incident Investigation
+
+```
+I'm investigating a node issue on i-0123456789abcdef0. 
+Collect logs, find any critical errors, and give me a summary.
+```
+
+### Deep Search
+
+```
+Search for OOM or memory pressure errors in the logs from i-0123456789abcdef0
+```
+
+### Read Specific Log Section
+
+```
+Read bytes 1000000-2000000 from the kubelet log file
+```
 
 ---
 
+## Architecture
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  DevOps Agent   │────▶│  MCP Gateway     │────▶│  Lambda         │
+│  (MCP Client)   │     │  (AgentCore)     │     │  (Enhanced)     │
+└─────────────────┘     └──────────────────┘     └────────┬────────┘
+                                                          │
+                        ┌─────────────────────────────────┼─────────────────────────────────┐
+                        │                                 │                                 │
+                        ▼                                 ▼                                 ▼
+               ┌─────────────────┐             ┌─────────────────┐             ┌─────────────────┐
+               │  SSM Automation │             │  S3 Bucket      │             │  Findings       │
+               │  (Log Collect)  │────────────▶│  (KMS Encrypted)│◀────────────│  Indexer        │
+               └─────────────────┘             └─────────────────┘             └─────────────────┘
+                        │                                 │
+                        ▼                                 ▼
+               ┌─────────────────┐             ┌─────────────────┐
+               │  EKS Worker     │             │  Unzip Lambda   │
+               │  Node           │             │  (Auto-extract) │
+               └─────────────────┘             └─────────────────┘
+```
+
+---
 
 ## CloudFormation Outputs
 
@@ -167,6 +306,18 @@ The agent will:
 | `OAuthScope` | OAuth Scope (use only ONE) |
 | `LogsBucketName` | S3 bucket for collected logs |
 | `SSMAutomationRoleArn` | IAM role for SSM Automation |
+| `EncryptionKeyArn` | KMS key ARN |
+
+---
+
+## Security Features
+
+- **KMS Encryption**: All logs encrypted at rest with customer-managed key
+- **Block Public Access**: S3 bucket blocks all public access
+- **Enforce SSL**: All S3 operations require HTTPS
+- **Presigned URLs**: 15-minute expiration for artifact downloads
+- **Idempotency**: Prevents duplicate executions with token mapping
+- **Audit Logging**: CloudWatch logs for all Lambda invocations
 
 ---
 
@@ -178,6 +329,7 @@ To delete all resources:
 cdk destroy
 ```
 
+---
 
 ## License
 

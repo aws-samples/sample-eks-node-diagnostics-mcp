@@ -1,2 +1,2 @@
-export * from './ssm-automation-gateway-construct';
-export * from './ssm-automation-gateway-stack';
+export * from './ssm-automation-gateway-construct-v2';
+export * from './ssm-automation-gateway-stack-v2';
