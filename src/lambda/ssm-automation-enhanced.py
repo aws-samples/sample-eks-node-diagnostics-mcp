@@ -250,6 +250,222 @@ ERROR_PATTERNS = {
     ],
 }
 
+# =============================================================================
+# POD/NODE FAILURE TRIAGE PATTERNS
+# =============================================================================
+
+# Category A: Volume/CSI Mount Issues
+TRIAGE_VOLUME_CSI_PATTERNS = [
+    (r'FailedMount', 'high'),
+    (r'FailedAttachVolume', 'high'),
+    (r'Unable to attach or mount volumes', 'high'),
+    (r'MountVolume\.SetUp failed', 'high'),
+    (r'volume.*not found', 'medium'),
+    (r'VolumeResizeFailed', 'medium'),
+    (r'WaitForFirstConsumer', 'medium'),
+    (r'timed out waiting for the condition.*volume', 'high'),
+    (r'ebs-csi.*error', 'high'),
+    (r'efs-csi.*error', 'high'),
+    (r'mount\.nfs.*timed out', 'high'),
+    (r'mount: wrong fs type', 'high'),
+    (r'fsck.*error', 'medium'),
+    (r'xfs_repair', 'medium'),
+    (r'PersistentVolume.*failed', 'high'),
+    (r'PVC.*pending', 'medium'),
+]
+
+# Category B: Worker Node Issues
+TRIAGE_NODE_ISSUES_PATTERNS = [
+    (r'Node became not ready', 'high'),
+    (r'NodeNotReady', 'high'),
+    (r'PLEG is not healthy', 'high'),
+    (r'Unit kubelet.*entered failed state', 'high'),
+    (r'failed to run Kubelet', 'high'),
+    (r'OCI runtime create failed', 'high'),
+    (r'containerd.*error', 'medium'),
+    (r'docker.*error', 'medium'),
+    (r'DiskPressure', 'high'),
+    (r'MemoryPressure', 'high'),
+    (r'PIDPressure', 'high'),
+    (r'eviction.*threshold', 'medium'),
+    (r'Taint.*NoSchedule', 'medium'),
+    (r'Taint.*NoExecute', 'high'),
+    (r'OOMKilled', 'high'),
+    (r'Memory cgroup out of memory', 'high'),
+    (r'invoked oom-killer', 'high'),
+    (r'Killed process.*total-vm', 'high'),
+    (r'exit code 137', 'high'),
+    (r'CrashLoopBackOff', 'high'),
+    (r'Back-off restarting failed container', 'medium'),
+    (r'Evicted', 'high'),
+    (r'PodEvicted', 'high'),
+]
+
+# Category C: CNI/Networking Issues
+TRIAGE_CNI_NETWORK_PATTERNS = [
+    (r'InsufficientFreeAddressesInSubnet', 'high'),
+    (r'failed to assign an IP address', 'high'),
+    (r'no free IP addresses', 'high'),
+    (r'ENI.*allocation.*failed', 'high'),
+    (r'ipamd.*error', 'high'),
+    (r'aws-node.*error', 'medium'),
+    (r'no networks found in /etc/cni/net\.d', 'high'),
+    (r'CNI.*failed', 'high'),
+    (r'plugin.*returned.*error', 'medium'),
+    (r'failed to set up sandbox container.*network', 'high'),
+    (r'NetworkNotReady', 'high'),
+    (r'networkPlugin cni failed', 'high'),
+    (r'SNAT.*error', 'medium'),
+    (r'egress.*failed', 'medium'),
+]
+
+# Category D: iptables/conntrack/kube-proxy
+TRIAGE_IPTABLES_CONNTRACK_PATTERNS = [
+    (r'ip_conntrack: table full', 'high'),
+    (r'nf_conntrack: table full', 'high'),
+    (r'dropping packet', 'high'),
+    (r'iptables.*error', 'medium'),
+    (r'iptables-restore.*failed', 'high'),
+    (r'kube-proxy.*error', 'medium'),
+    (r'IPVS.*error', 'medium'),
+    (r'conntrack.*exhausted', 'high'),
+    (r'nf_conntrack_max', 'medium'),
+]
+
+# Category E: Scheduling Constraints
+TRIAGE_SCHEDULING_PATTERNS = [
+    (r'FailedScheduling', 'high'),
+    (r'Insufficient cpu', 'high'),
+    (r'Insufficient memory', 'high'),
+    (r'Insufficient pods', 'medium'),
+    (r'node\(s\) didn\'t match.*selector', 'high'),
+    (r'node\(s\) had.*taint', 'high'),
+    (r'node\(s\) didn\'t have free ports', 'medium'),
+    (r'PodToleratesNodeTaints', 'medium'),
+    (r'NodeAffinity', 'medium'),
+    (r'PodAffinity', 'medium'),
+    (r'0/\d+ nodes are available', 'high'),
+    (r'Unschedulable', 'high'),
+]
+
+# Category F: Image Pull/Auth Issues
+TRIAGE_IMAGE_PULL_PATTERNS = [
+    (r'ImagePullBackOff', 'high'),
+    (r'ErrImagePull', 'high'),
+    (r'Failed to pull image', 'high'),
+    (r'unauthorized.*authentication required', 'high'),
+    (r'manifest.*not found', 'high'),
+    (r'repository does not exist', 'high'),
+    (r'denied.*access', 'high'),
+    (r'ECR.*token.*expired', 'high'),
+    (r'dial tcp.*connection refused.*registry', 'medium'),
+    (r'no such host.*ecr', 'high'),
+    (r'i/o timeout.*registry', 'medium'),
+    (r'pull access denied', 'high'),
+]
+
+# Category G: DNS/CoreDNS Issues
+TRIAGE_DNS_PATTERNS = [
+    (r'CoreDNS.*error', 'high'),
+    (r'SERVFAIL', 'medium'),
+    (r'NXDOMAIN', 'medium'),
+    (r'lookup.*failed', 'medium'),
+    (r'no such host', 'medium'),
+    (r'DNS.*timeout', 'high'),
+    (r'resolve.*failed', 'medium'),
+    (r'dial udp.*53.*timeout', 'high'),
+    (r'upstream.*unreachable', 'high'),
+    (r'coredns.*unhealthy', 'high'),
+]
+
+# Category H: Secrets/KMS/Webhook/Admission
+TRIAGE_SECRETS_WEBHOOK_PATTERNS = [
+    (r'failed to get secret', 'high'),
+    (r'secrets.*not found', 'high'),
+    (r'secrets.*forbidden', 'high'),
+    (r'KMS.*error', 'high'),
+    (r'decrypt.*failed', 'high'),
+    (r'webhook.*timeout', 'high'),
+    (r'webhook.*denied', 'high'),
+    (r'admission.*rejected', 'high'),
+    (r'MutatingWebhook.*error', 'medium'),
+    (r'ValidatingWebhook.*error', 'medium'),
+    (r'CreateContainerConfigError', 'high'),
+]
+
+# All triage categories with metadata
+TRIAGE_CATEGORIES = {
+    'A': {
+        'name': 'Volume/CSI Mount Issues',
+        'patterns': TRIAGE_VOLUME_CSI_PATTERNS,
+        'log_sources': ['storage', 'kubelet', 'dmesg', 'messages', 'ebs-csi', 'efs-csi'],
+        'description': 'EBS/EFS CSI driver failures, mount timeouts, permission denied, PVC/PV mismatch'
+    },
+    'B': {
+        'name': 'Worker Node Issues',
+        'patterns': TRIAGE_NODE_ISSUES_PATTERNS,
+        'log_sources': ['kubelet', 'dmesg', 'messages', 'containerd', 'docker'],
+        'description': 'kubelet issues, containerd/runtime issues, disk full, memory pressure, node not ready, OOMKilled'
+    },
+    'C': {
+        'name': 'CNI/Networking Issues',
+        'patterns': TRIAGE_CNI_NETWORK_PATTERNS,
+        'log_sources': ['ipamd', 'aws-node', 'networking', 'cni', 'plugin.log'],
+        'description': 'VPC CNI IP exhaustion, ENI allocation failures, aws-node errors, SNAT/egress issues'
+    },
+    'D': {
+        'name': 'iptables/conntrack/kube-proxy',
+        'patterns': TRIAGE_IPTABLES_CONNTRACK_PATTERNS,
+        'log_sources': ['networking', 'iptables', 'conntrack', 'dmesg', 'messages'],
+        'description': 'conntrack exhaustion, kube-proxy rule failures, iptables restore errors'
+    },
+    'E': {
+        'name': 'Scheduling Constraints',
+        'patterns': TRIAGE_SCHEDULING_PATTERNS,
+        'log_sources': ['kubelet', 'pods'],
+        'description': 'insufficient CPU/memory, affinity/nodeSelector mismatch, taints/tolerations mismatch'
+    },
+    'F': {
+        'name': 'Image Pull/Auth Issues',
+        'patterns': TRIAGE_IMAGE_PULL_PATTERNS,
+        'log_sources': ['kubelet', 'containerd', 'docker'],
+        'description': 'registry auth, ECR token, DNS resolution, throttling'
+    },
+    'G': {
+        'name': 'DNS/CoreDNS Issues',
+        'patterns': TRIAGE_DNS_PATTERNS,
+        'log_sources': ['coredns', 'networking', 'kubelet', 'pods'],
+        'description': 'CoreDNS failures, upstream timeouts, NXDOMAIN storms'
+    },
+    'H': {
+        'name': 'Secrets/KMS/Webhook/Admission',
+        'patterns': TRIAGE_SECRETS_WEBHOOK_PATTERNS,
+        'log_sources': ['kubelet', 'messages', 'secure'],
+        'description': 'secrets retrieval errors, webhook timeout/deny'
+    },
+}
+
+# Pod state patterns for detection
+POD_STATE_PATTERNS = {
+    'Pending': [r'Pod.*Pending', r'status.*Pending', r'phase.*Pending'],
+    'ContainerCreating': [r'ContainerCreating', r'creating container'],
+    'CrashLoopBackOff': [r'CrashLoopBackOff', r'Back-off restarting failed container'],
+    'ImagePullBackOff': [r'ImagePullBackOff', r'ErrImagePull'],
+    'OOMKilled': [r'OOMKilled', r'exit code 137', r'Memory cgroup out of memory'],
+    'Evicted': [r'Evicted', r'PodEvicted', r'eviction'],
+    'Error': [r'RunContainerError', r'CreateContainerError', r'CreateContainerConfigError'],
+}
+
+# Node condition patterns
+NODE_CONDITION_PATTERNS = {
+    'NotReady': [r'NodeNotReady', r'Node became not ready', r'condition.*Ready.*False'],
+    'DiskPressure': [r'DiskPressure', r'disk pressure'],
+    'MemoryPressure': [r'MemoryPressure', r'memory pressure'],
+    'PIDPressure': [r'PIDPressure', r'pid pressure'],
+    'NetworkUnavailable': [r'NetworkUnavailable', r'NetworkNotReady'],
+}
+
+
 # Log type to file pattern mapping
 # Aligned with official EKS log collector: https://github.com/awslabs/amazon-eks-ami/blob/main/log-collector-script/
 LOG_TYPE_PATTERNS = {
@@ -413,13 +629,27 @@ def store_idempotency_mapping(instance_id: str, token: str, execution_id: str):
 
 
 def find_findings_index(prefix: str) -> Optional[str]:
-    """Find the findings index file for a log collection."""
-    list_result = safe_s3_list(f'{prefix}/', max_keys=100)
+    """
+    Find the findings index file for a log collection.
+    Searches for the most recent findings_index.json file.
+    
+    Prefix format: eks_{instance_id} (without trailing slash or execution_id)
+    Actual S3 structure: eks_{instance_id}_{execution_id}/extracted/findings_index.json
+    """
+    # List all objects with this prefix (will match eks_i-xxx_* patterns)
+    list_result = safe_s3_list(prefix, max_keys=500)
     
     if list_result['success']:
-        for obj in list_result['objects']:
-            if FINDINGS_INDEX_FILE in obj['key']:
-                return obj['key']
+        # Find all findings index files and get the most recent one
+        index_files = [
+            obj for obj in list_result['objects']
+            if FINDINGS_INDEX_FILE in obj['key']
+        ]
+        
+        if index_files:
+            # Sort by last modified (most recent first)
+            index_files.sort(key=lambda x: x.get('last_modified', ''), reverse=True)
+            return index_files[0]['key']
     
     return None
 
@@ -731,6 +961,516 @@ def generate_recommendations(critical_findings: List[Dict], warning_findings: Li
             unique_recommendations.append(rec)
     
     return unique_recommendations
+
+
+# =============================================================================
+# POD/NODE TRIAGE FUNCTIONS
+# =============================================================================
+
+def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data: Dict) -> Dict:
+    """
+    Perform comprehensive pod/node failure triage analysis.
+    Multi-pass scanning to ensure no errors are missed.
+    
+    Returns structured triage result with root cause, evidence, and remediation.
+    """
+    import time
+    start_time = time.time()
+    
+    triage_result = {
+        'triageVersion': '1.0',
+        'analyzedAt': datetime.utcnow().isoformat(),
+        'pod_states_detected': [],
+        'node_conditions_detected': [],
+        'most_likely_root_cause': None,
+        'evidence': [],
+        'secondary_hypotheses': [],
+        'immediate_remediation_steps': [],
+        'preventive_recommendations': [],
+        'followup_validation_commands': [],
+        'coverage_report': {
+            'files_scanned': 0,
+            'files_total': 0,
+            'files_skipped': [],
+            'categories_checked': list(TRIAGE_CATEGORIES.keys()),
+            'categories_with_findings': [],
+            'missing_log_sources': [],
+            'scan_limitations': [],
+            'scan_duration_ms': 0
+        }
+    }
+    
+    # PASS 1: Analyze pre-indexed findings by category
+    category_scores = {}
+    category_evidence = {}
+    
+    for cat_id, cat_info in TRIAGE_CATEGORIES.items():
+        category_scores[cat_id] = {'score': 0, 'high_matches': 0, 'medium_matches': 0, 'patterns_matched': []}
+        category_evidence[cat_id] = []
+        
+        for pattern, confidence in cat_info['patterns']:
+            try:
+                regex = re.compile(pattern, re.IGNORECASE)
+                for finding in findings:
+                    sample = finding.get('sample', '')
+                    file_path = finding.get('file', '')
+                    
+                    if regex.search(sample) or regex.search(finding.get('pattern', '')):
+                        if confidence == 'high':
+                            category_scores[cat_id]['score'] += 3
+                            category_scores[cat_id]['high_matches'] += 1
+                        else:
+                            category_scores[cat_id]['score'] += 1
+                            category_scores[cat_id]['medium_matches'] += 1
+                        
+                        category_scores[cat_id]['patterns_matched'].append(pattern)
+                        
+                        # Collect evidence
+                        category_evidence[cat_id].append({
+                            'file_path': file_path,
+                            'full_key': finding.get('fullKey', ''),
+                            'timestamp': extract_timestamp(sample),
+                            'line_number': None,  # Would need deep scan for this
+                            'byte_range': None,
+                            'excerpt': sample[:300] if sample else '',
+                            'pattern_matched': pattern,
+                            'relevance': 'primary' if confidence == 'high' else 'corroborating'
+                        })
+            except re.error:
+                continue
+    
+    # PASS 2: Detect pod states
+    pod_states = detect_pod_states(findings)
+    triage_result['pod_states_detected'] = pod_states
+    
+    # PASS 3: Detect node conditions
+    node_conditions = detect_node_conditions(findings)
+    triage_result['node_conditions_detected'] = node_conditions
+    
+    # PASS 4: Determine root cause
+    # Sort categories by score
+    sorted_categories = sorted(
+        category_scores.items(),
+        key=lambda x: (x[1]['score'], x[1]['high_matches']),
+        reverse=True
+    )
+    
+    # Find categories with findings
+    categories_with_findings = [
+        cat_id for cat_id, scores in sorted_categories
+        if scores['score'] > 0
+    ]
+    triage_result['coverage_report']['categories_with_findings'] = categories_with_findings
+    
+    if sorted_categories and sorted_categories[0][1]['score'] > 0:
+        top_cat_id = sorted_categories[0][0]
+        top_cat_info = TRIAGE_CATEGORIES[top_cat_id]
+        top_scores = sorted_categories[0][1]
+        
+        # Calculate confidence
+        confidence_score = min(0.99, top_scores['score'] / 10.0)
+        if top_scores['high_matches'] >= 2:
+            confidence = 'high'
+            confidence_score = max(confidence_score, 0.85)
+        elif top_scores['high_matches'] >= 1:
+            confidence = 'medium'
+            confidence_score = max(confidence_score, 0.60)
+        else:
+            confidence = 'low'
+        
+        # Build root cause summary
+        evidence_list = category_evidence[top_cat_id][:5]  # Top 5 evidence items
+        primary_evidence = evidence_list[0] if evidence_list else {}
+        
+        triage_result['most_likely_root_cause'] = {
+            'category': top_cat_id,
+            'category_name': top_cat_info['name'],
+            'confidence': confidence,
+            'confidence_score': round(confidence_score, 2),
+            'summary': f"{top_cat_info['name']} detected",
+            'technical_detail': primary_evidence.get('excerpt', 'See evidence for details')[:200]
+        }
+        
+        triage_result['evidence'] = evidence_list
+        
+        # Add secondary hypotheses
+        for cat_id, scores in sorted_categories[1:4]:  # Next 3 categories
+            if scores['score'] > 0:
+                cat_info = TRIAGE_CATEGORIES[cat_id]
+                sec_confidence_score = min(0.50, scores['score'] / 15.0)
+                triage_result['secondary_hypotheses'].append({
+                    'category': cat_id,
+                    'category_name': cat_info['name'],
+                    'confidence': 'low' if sec_confidence_score < 0.3 else 'medium',
+                    'confidence_score': round(sec_confidence_score, 2),
+                    'summary': f"Possible {cat_info['name'].lower()}",
+                    'evidence_count': len(category_evidence[cat_id])
+                })
+        
+        # Generate remediation steps
+        triage_result['immediate_remediation_steps'] = generate_triage_remediation(
+            top_cat_id, evidence_list, pod_states, node_conditions
+        )
+        
+        # Generate preventive recommendations
+        triage_result['preventive_recommendations'] = generate_preventive_recommendations(top_cat_id)
+        
+        # Generate followup commands
+        triage_result['followup_validation_commands'] = generate_followup_commands(
+            top_cat_id, pod_states, node_conditions
+        )
+    
+    # Update coverage report
+    triage_result['coverage_report']['files_scanned'] = bundle_data.get('fileCount', 0)
+    triage_result['coverage_report']['files_total'] = bundle_data.get('fileCount', 0)
+    triage_result['coverage_report']['scan_duration_ms'] = int((time.time() - start_time) * 1000)
+    
+    # Check for missing log sources
+    found_patterns = bundle_data.get('foundPatterns', [])
+    expected_sources = ['kubelet', 'containerd', 'dmesg', 'messages', 'networking', 'ipamd']
+    missing = [s for s in expected_sources if s not in found_patterns]
+    if missing:
+        triage_result['coverage_report']['missing_log_sources'] = missing
+    
+    return triage_result
+
+
+def detect_pod_states(findings: List[Dict]) -> List[Dict]:
+    """Detect pod states from findings."""
+    detected_states = {}
+    
+    for state, patterns in POD_STATE_PATTERNS.items():
+        count = 0
+        sample_pods = []
+        
+        for finding in findings:
+            sample = finding.get('sample', '')
+            for pattern in patterns:
+                try:
+                    if re.search(pattern, sample, re.IGNORECASE):
+                        count += finding.get('count', 1)
+                        # Try to extract pod name
+                        pod_match = re.search(r'pod[/\s]+([a-z0-9-]+)', sample, re.IGNORECASE)
+                        if pod_match and pod_match.group(1) not in sample_pods:
+                            sample_pods.append(pod_match.group(1))
+                        break
+                except re.error:
+                    continue
+        
+        if count > 0:
+            detected_states[state] = {
+                'state': state,
+                'count': count,
+                'sample_pods': sample_pods[:5]
+            }
+    
+    return list(detected_states.values())
+
+
+def detect_node_conditions(findings: List[Dict]) -> List[Dict]:
+    """Detect node conditions from findings."""
+    detected_conditions = []
+    
+    for condition, patterns in NODE_CONDITION_PATTERNS.items():
+        for finding in findings:
+            sample = finding.get('sample', '')
+            for pattern in patterns:
+                try:
+                    if re.search(pattern, sample, re.IGNORECASE):
+                        severity = 'critical' if condition in ['NotReady', 'MemoryPressure'] else 'warning'
+                        detected_conditions.append({
+                            'condition': condition,
+                            'severity': severity,
+                            'message': sample[:150]
+                        })
+                        break
+                except re.error:
+                    continue
+    
+    # Deduplicate
+    seen = set()
+    unique_conditions = []
+    for cond in detected_conditions:
+        if cond['condition'] not in seen:
+            seen.add(cond['condition'])
+            unique_conditions.append(cond)
+    
+    return unique_conditions
+
+
+def generate_triage_remediation(category: str, evidence: List[Dict], 
+                                 pod_states: List[Dict], node_conditions: List[Dict]) -> List[Dict]:
+    """Generate immediate remediation steps based on triage category."""
+    steps = []
+    priority = 1
+    
+    if category == 'A':  # Volume/CSI
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check PV/PVC status',
+                'command': "kubectl get pv,pvc -A | grep -E 'Pending|Failed'",
+                'expected_outcome': 'Identify stuck volumes'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Check EBS volume attachment',
+                'command': "aws ec2 describe-volumes --filters Name=status,Values=attaching,error --query 'Volumes[].{ID:VolumeId,State:State}'",
+                'expected_outcome': 'Find volumes stuck in attaching state'
+            },
+            {
+                'priority': priority + 2,
+                'action': 'Check CSI driver pods',
+                'command': 'kubectl get pods -n kube-system -l app=ebs-csi-controller',
+                'expected_outcome': 'Verify CSI controller is running'
+            },
+        ]
+    elif category == 'B':  # Node Issues
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check node status',
+                'command': 'kubectl get nodes -o wide',
+                'expected_outcome': 'Identify NotReady nodes'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Check node conditions',
+                'command': "kubectl describe nodes | grep -A5 'Conditions:'",
+                'expected_outcome': 'Identify pressure conditions'
+            },
+            {
+                'priority': priority + 2,
+                'action': 'Check pod resource usage',
+                'command': 'kubectl top pods -A --sort-by=memory | head -20',
+                'expected_outcome': 'Find memory-hungry pods'
+            },
+        ]
+        # Add OOM-specific steps if detected
+        if any(s.get('state') == 'OOMKilled' for s in pod_states):
+            steps.append({
+                'priority': priority + 3,
+                'action': 'Increase memory limits for affected pods',
+                'command': 'kubectl set resources deployment/<name> --limits=memory=1Gi',
+                'expected_outcome': 'Prevent future OOM kills'
+            })
+    elif category == 'C':  # CNI/Networking
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check subnet IP availability',
+                'command': "aws ec2 describe-subnets --query 'Subnets[].{ID:SubnetId,AvailableIPs:AvailableIpAddressCount}'",
+                'expected_outcome': 'Identify IP-exhausted subnets'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Check aws-node daemonset',
+                'command': 'kubectl get pods -n kube-system -l k8s-app=aws-node',
+                'expected_outcome': 'Verify CNI pods are running'
+            },
+            {
+                'priority': priority + 2,
+                'action': 'Check ENI allocation',
+                'command': "aws ec2 describe-network-interfaces --filters Name=description,Values='*amazon-vpc-cni*' --query 'NetworkInterfaces | length(@)'",
+                'expected_outcome': 'Count ENIs used by VPC CNI'
+            },
+        ]
+    elif category == 'D':  # iptables/conntrack
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check conntrack table usage',
+                'command': 'cat /proc/sys/net/netfilter/nf_conntrack_count && cat /proc/sys/net/netfilter/nf_conntrack_max',
+                'expected_outcome': 'Compare current vs max conntrack entries'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Increase conntrack max if needed',
+                'command': 'sudo sysctl -w net.netfilter.nf_conntrack_max=262144',
+                'expected_outcome': 'Increase conntrack table size'
+            },
+        ]
+    elif category == 'E':  # Scheduling
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check pending pods',
+                'command': "kubectl get pods -A --field-selector=status.phase=Pending",
+                'expected_outcome': 'List all pending pods'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Check node resources',
+                'command': 'kubectl describe nodes | grep -A10 "Allocated resources"',
+                'expected_outcome': 'See resource allocation per node'
+            },
+            {
+                'priority': priority + 2,
+                'action': 'Check for taints',
+                'command': "kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\"\\t\"}{.spec.taints[*].key}{\"\\n\"}{end}'",
+                'expected_outcome': 'Identify node taints blocking scheduling'
+            },
+        ]
+    elif category == 'F':  # Image Pull
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check image pull errors',
+                'command': "kubectl get events -A --field-selector=reason=Failed | grep -i image",
+                'expected_outcome': 'Find image pull failures'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Verify ECR authentication',
+                'command': 'aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com',
+                'expected_outcome': 'Test ECR authentication'
+            },
+        ]
+    elif category == 'G':  # DNS
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check CoreDNS pods',
+                'command': 'kubectl get pods -n kube-system -l k8s-app=kube-dns',
+                'expected_outcome': 'Verify CoreDNS is running'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Test DNS resolution',
+                'command': 'kubectl run -it --rm debug --image=busybox --restart=Never -- nslookup kubernetes.default',
+                'expected_outcome': 'Verify DNS works from pod'
+            },
+        ]
+    elif category == 'H':  # Secrets/Webhook
+        steps = [
+            {
+                'priority': priority,
+                'action': 'Check secrets access',
+                'command': 'kubectl get secrets -A | head -20',
+                'expected_outcome': 'List accessible secrets'
+            },
+            {
+                'priority': priority + 1,
+                'action': 'Check webhook configurations',
+                'command': 'kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations',
+                'expected_outcome': 'List active webhooks'
+            },
+        ]
+    
+    return steps
+
+
+def generate_preventive_recommendations(category: str) -> List[Dict]:
+    """Generate preventive recommendations based on category."""
+    recommendations = {
+        'A': [
+            {
+                'category': 'monitoring',
+                'recommendation': 'Set up CloudWatch alarms for EBS volume attachment failures',
+                'reference': 'https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-volume-status.html'
+            },
+            {
+                'category': 'configuration',
+                'recommendation': 'Use volumeBindingMode: WaitForFirstConsumer in StorageClass',
+                'reference': 'https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode'
+            },
+        ],
+        'B': [
+            {
+                'category': 'capacity_planning',
+                'recommendation': 'Implement pod resource requests and limits',
+                'reference': 'https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+            },
+            {
+                'category': 'monitoring',
+                'recommendation': 'Set up Container Insights for memory/CPU monitoring',
+                'reference': 'https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-EKS-quickstart.html'
+            },
+        ],
+        'C': [
+            {
+                'category': 'capacity_planning',
+                'recommendation': 'Enable VPC CNI prefix delegation for higher IP density',
+                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html'
+            },
+            {
+                'category': 'monitoring',
+                'recommendation': 'Monitor subnet IP availability with CloudWatch',
+                'reference': 'https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cloudwatch.html'
+            },
+        ],
+        'D': [
+            {
+                'category': 'configuration',
+                'recommendation': 'Increase nf_conntrack_max via node configuration',
+                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/node-group-launch-template.html'
+            },
+        ],
+        'E': [
+            {
+                'category': 'capacity_planning',
+                'recommendation': 'Implement Cluster Autoscaler or Karpenter',
+                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html'
+            },
+        ],
+        'F': [
+            {
+                'category': 'security',
+                'recommendation': 'Use ECR pull-through cache for external images',
+                'reference': 'https://docs.aws.amazon.com/AmazonECR/latest/userguide/pull-through-cache.html'
+            },
+        ],
+        'G': [
+            {
+                'category': 'reliability',
+                'recommendation': 'Scale CoreDNS based on cluster size',
+                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/coredns.html'
+            },
+        ],
+        'H': [
+            {
+                'category': 'security',
+                'recommendation': 'Use EKS Pod Identity for secrets access',
+                'reference': 'https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html'
+            },
+        ],
+    }
+    
+    return recommendations.get(category, [])
+
+
+def generate_followup_commands(category: str, pod_states: List[Dict], 
+                                node_conditions: List[Dict]) -> List[Dict]:
+    """Generate followup validation commands."""
+    commands = []
+    
+    # Common commands
+    commands.append({
+        'tool': 'kubectl',
+        'command': "kubectl get pods -A | grep -E 'Pending|ContainerCreating|CrashLoopBackOff|Error' | wc -l",
+        'purpose': 'Count pods in problematic states'
+    })
+    
+    if category == 'C':  # CNI
+        commands.append({
+            'tool': 'kubectl',
+            'command': 'kubectl logs -n kube-system -l k8s-app=aws-node --tail=50',
+            'purpose': 'Check aws-node for IP allocation success'
+        })
+    elif category == 'B':  # Node
+        commands.append({
+            'tool': 'kubectl',
+            'command': 'kubectl get nodes',
+            'purpose': 'Verify all nodes are Ready'
+        })
+    elif category == 'A':  # Volume
+        commands.append({
+            'tool': 'kubectl',
+            'command': "kubectl get pv,pvc -A | grep -v Bound",
+            'purpose': 'Check for unbound volumes'
+        })
+    
+    return commands
 
 
 # =============================================================================
@@ -1771,18 +2511,30 @@ def get_artifact_reference(arguments: Dict) -> Dict:
 
 def generate_incident_summary(arguments: Dict) -> Dict:
     """
-    Generate AI-ready structured incident summary.
+    Generate AI-ready structured incident summary with Pod/Node failure triage.
     Gracefully handles missing data - returns partial summary without failing.
     
     Inputs:
         instanceId: EC2 instance ID (required)
         includeRecommendations: Include remediation suggestions (default: true)
+        includeTriage: Include pod/node failure triage analysis (default: true)
     
     Returns:
-        summary with criticalFindings, timeline, recommendations, artifactLinks
+        summary with criticalFindings, timeline, recommendations, artifactLinks, pod_node_triage
     """
+    import time
+    start_time = time.time()
+    MAX_EXECUTION_TIME = 25  # Leave buffer for API Gateway 29s timeout
+    
+    def check_timeout():
+        elapsed = time.time() - start_time
+        if elapsed > MAX_EXECUTION_TIME:
+            raise TimeoutError(f"Execution time exceeded {MAX_EXECUTION_TIME}s")
+        return elapsed
+    
     instance_id = arguments.get('instanceId')
     include_recommendations = arguments.get('includeRecommendations', True)
+    include_triage = arguments.get('includeTriage', True)
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
@@ -1791,20 +2543,28 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         # Get bundle completeness - don't fail if this errors
         bundle_data = {}
         try:
+            check_timeout()
             bundle_result = validate_bundle_completeness({'instanceId': instance_id})
             if bundle_result['statusCode'] == 200:
                 bundle_data = json.loads(bundle_result['body'])
+        except TimeoutError:
+            raise
         except Exception as e:
             print(f"Warning: Could not get bundle completeness: {str(e)}")
         
         # Get error summary - don't fail if this errors
         error_data = {}
         try:
+            check_timeout()
             error_result = get_error_summary({'instanceId': instance_id, 'severity': 'all'})
             if error_result['statusCode'] == 200:
                 error_data = json.loads(error_result['body'])
+        except TimeoutError:
+            raise
         except Exception as e:
             print(f"Warning: Could not get error summary: {str(e)}")
+        
+        check_timeout()
         
         # Build summary with available data
         findings = error_data.get('findings', [])
@@ -1822,6 +2582,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         summary = {
             'instanceId': instance_id,
             'generatedAt': datetime.utcnow().isoformat(),
+            'executionTimeMs': int((time.time() - start_time) * 1000),
             'bundleStatus': {
                 'complete': bundle_data.get('complete', False),
                 'fileCount': bundle_data.get('fileCount', 0),
@@ -1836,6 +2597,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
             'criticalFindings': [
                 {
                     'file': f.get('file'),
+                    'fullKey': f.get('fullKey'),
                     'pattern': f.get('pattern'),
                     'count': f.get('count'),
                     'sample': f.get('sample', '')[:200]
@@ -1845,6 +2607,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
             'warningFindings': [
                 {
                     'file': f.get('file'),
+                    'fullKey': f.get('fullKey'),
                     'pattern': f.get('pattern'),
                     'count': f.get('count')
                 }
@@ -1871,7 +2634,73 @@ def generate_incident_summary(arguments: Dict) -> Dict:
                     'action': f'read_log_chunk(logKey="{finding.get("fullKey")}")'
                 })
         
+        # === POD/NODE FAILURE TRIAGE ===
+        if include_triage and findings:
+            try:
+                check_timeout()
+                triage_result = perform_pod_node_triage(instance_id, findings, bundle_data)
+                summary['pod_node_triage'] = triage_result
+            except TimeoutError:
+                summary['pod_node_triage'] = {
+                    'triageVersion': '1.0',
+                    'warning': 'Triage skipped due to time constraints. Call with includeTriage=true separately.',
+                    'analyzedAt': datetime.utcnow().isoformat()
+                }
+            except Exception as e:
+                print(f"Warning: Triage analysis failed: {str(e)}")
+                summary['pod_node_triage'] = {
+                    'triageVersion': '1.0',
+                    'error': f'Triage analysis failed: {str(e)}',
+                    'analyzedAt': datetime.utcnow().isoformat()
+                }
+        elif include_triage:
+            summary['pod_node_triage'] = {
+                'triageVersion': '1.0',
+                'info': 'No findings to triage. Node may be healthy.',
+                'analyzedAt': datetime.utcnow().isoformat(),
+                'pod_states_detected': [],
+                'node_conditions_detected': [],
+                'most_likely_root_cause': None,
+                'evidence': [],
+                'coverage_report': {
+                    'files_scanned': bundle_data.get('fileCount', 0),
+                    'categories_checked': list(TRIAGE_CATEGORIES.keys()),
+                    'categories_with_findings': []
+                }
+            }
+        
+        # Add next step guidance
+        if summary.get('pod_node_triage', {}).get('most_likely_root_cause'):
+            root_cause = summary['pod_node_triage']['most_likely_root_cause']
+            summary['nextStep'] = f"Root cause identified: {root_cause['category_name']} ({root_cause['confidence']} confidence). Follow immediate_remediation_steps in pod_node_triage."
+        else:
+            summary['nextStep'] = 'Use search_logs_deep for detailed investigation of specific patterns'
+        
+        # Update execution time
+        summary['executionTimeMs'] = int((time.time() - start_time) * 1000)
+        
         return success_response(summary)
+    
+    except TimeoutError as e:
+        # Return partial summary on timeout
+        return success_response({
+            'instanceId': instance_id,
+            'generatedAt': datetime.utcnow().isoformat(),
+            'executionTimeMs': int((time.time() - start_time) * 1000),
+            'bundleStatus': bundle_data if bundle_data else {'complete': False, 'fileCount': 0, 'totalSize': 'unknown'},
+            'errorSummary': error_data.get('summary', {'critical': 0, 'warning': 0, 'info': 0, 'total': 0}) if error_data else {'critical': 0, 'warning': 0, 'info': 0, 'total': 0},
+            'criticalFindings': [],
+            'warningFindings': [],
+            'affectedComponents': [],
+            'recommendations': [],
+            'artifactLinks': [],
+            'pod_node_triage': {
+                'triageVersion': '1.0',
+                'warning': 'Analysis timed out. Try calling get_error_summary and generate_incident_summary separately.'
+            },
+            'warning': f'Execution timed out: {str(e)}',
+            'nextStep': 'Call get_error_summary first, then generate_incident_summary with includeTriage=false'
+        })
         
     except Exception as e:
         # Return partial summary on error, don't fail
@@ -1885,6 +2714,10 @@ def generate_incident_summary(arguments: Dict) -> Dict:
             'affectedComponents': [],
             'recommendations': [],
             'artifactLinks': [],
+            'pod_node_triage': {
+                'triageVersion': '1.0',
+                'error': f'Summary generation failed: {str(e)}'
+            },
             'error': f'Could not generate complete summary: {str(e)}',
             'nextStep': 'Check if logs exist with validate_bundle_completeness'
         })
