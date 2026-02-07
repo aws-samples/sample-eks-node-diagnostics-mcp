@@ -987,7 +987,8 @@ def start_log_collection(arguments: Dict) -> Dict:
             'instanceId': instance_id,
             's3Bucket': LOGS_BUCKET,
             'estimatedCompletionTime': '3-5 minutes',
-            'nextStep': f'Poll status with get_collection_status(executionId="{execution_id}")'
+            'suggestedPollIntervalSeconds': 15,
+            'nextStep': f'Poll status with get_collection_status(executionId="{execution_id}") every 15 seconds'
         })
         
     except ssm_client.exceptions.AutomationDefinitionNotFoundException:
@@ -1062,7 +1063,8 @@ def get_collection_status(arguments: Dict) -> Dict:
         if status == 'Success':
             result['nextStep'] = f'Validate bundle with validate_bundle_completeness(executionId="{execution_id}")'
         elif status == 'InProgress':
-            result['nextStep'] = 'Continue polling until status is Success or Failed'
+            result['suggestedPollIntervalSeconds'] = 15
+            result['nextStep'] = 'Wait 15 seconds then poll again until status is Success or Failed'
         elif status == 'Failed':
             result['nextStep'] = 'Review failureReason and retry if appropriate'
         
