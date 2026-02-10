@@ -22,13 +22,109 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
 
-# AWS Clients
+# AWS Clients - default region (where Lambda runs)
 ssm_client = boto3.client('ssm')
 s3_client = boto3.client('s3')
+ec2_client = boto3.client('ec2')
+
+# Regional client cache to avoid re-creating clients per invocation
+_regional_clients: Dict[str, Dict[str, Any]] = {}
 
 # Environment
 LOGS_BUCKET = os.environ['LOGS_BUCKET_NAME']
 SSM_AUTOMATION_ROLE_ARN = os.environ.get('SSM_AUTOMATION_ROLE_ARN', '')
+DEFAULT_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+
+def get_regional_client(service: str, region: str) -> Any:
+    """
+    Get or create a boto3 client for a specific region.
+    Caches clients to avoid repeated creation within the same Lambda invocation.
+    """
+    if region == DEFAULT_REGION:
+        # Use the pre-initialized default clients
+        if service == 'ssm':
+            return ssm_client
+        elif service == 's3':
+            return s3_client
+        elif service == 'ec2':
+            return ec2_client
+
+    cache_key = f'{service}:{region}'
+    if cache_key not in _regional_clients:
+        _regional_clients[cache_key] = boto3.client(service, region_name=region)
+    return _regional_clients[cache_key]
+
+
+def detect_instance_region(instance_id: str) -> Optional[str]:
+    """
+    Auto-detect the region of an EC2 instance by querying EC2 DescribeInstances
+    across regions. Tries the default region first, then common EKS regions.
+    
+    Returns the region string or None if not found.
+    Times out after 20 seconds to avoid Lambda timeout issues.
+    """
+    import time
+    start = time.time()
+    DETECTION_TIMEOUT = 20  # seconds - leave headroom for Lambda timeout
+    
+    # Try default region first (fast path)
+    try:
+        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+        if resp['Reservations']:
+            return DEFAULT_REGION
+    except ec2_client.exceptions.ClientError:
+        pass
+    except Exception:
+        pass
+
+    # Try common EKS regions (ordered by popularity)
+    common_regions = [
+        'us-west-2', 'us-east-2', 'eu-west-1', 'eu-central-1',
+        'ap-southeast-1', 'ap-northeast-1', 'ap-south-1',
+        'us-west-1', 'eu-west-2', 'eu-north-1',
+        'ap-southeast-2', 'ap-northeast-2', 'sa-east-1',
+        'ca-central-1', 'me-south-1', 'af-south-1',
+    ]
+    # Remove default region since we already tried it
+    common_regions = [r for r in common_regions if r != DEFAULT_REGION]
+
+    for region in common_regions:
+        # Check timeout to avoid Lambda execution limit
+        if time.time() - start > DETECTION_TIMEOUT:
+            print(f"Warning: Region auto-detection timed out after {DETECTION_TIMEOUT}s, checked {common_regions.index(region)} regions")
+            return None
+        try:
+            regional_ec2 = get_regional_client('ec2', region)
+            resp = regional_ec2.describe_instances(InstanceIds=[instance_id])
+            if resp['Reservations']:
+                print(f"Auto-detected instance {instance_id} in region {region}")
+                return region
+        except Exception:
+            continue
+
+    return None
+
+
+def resolve_region(arguments: Dict, instance_id: str = None) -> str:
+    """
+    Resolve the target region from arguments or auto-detection.
+    Priority: explicit region param > auto-detect from instance > default region.
+    """
+    explicit_region = arguments.get('region')
+    if explicit_region:
+        # Basic validation: AWS region format is like us-east-1, eu-west-2, etc.
+        if not re.match(r'^[a-z]{2}(-[a-z]+-\d+)$', explicit_region):
+            print(f"Warning: Invalid region format '{explicit_region}', falling back to auto-detection")
+        else:
+            return explicit_region
+
+    if instance_id:
+        detected = detect_instance_region(instance_id)
+        if detected:
+            return detected
+
+    return DEFAULT_REGION
 
 # Constants
 DEFAULT_CHUNK_SIZE = 1048576  # 1MB
@@ -357,15 +453,10 @@ ERROR_PATTERNS = {
         # Well-known Application Bugs
         r'Well.*known.*application.*bug',  # IDWellKnownApplicationBug - Well-known application bug detected
         
-        r'(?i)error',
-        r'(?i)fail',
-        r'(?i)denied',
-        r'(?i)refused',
-        r'(?i)timeout',
-        r'(?i)unauthorized',
-        r'(?i)forbidden',
-        r'(?i)backoff',
-        r'(?i)unreachable',
+        # NOTE: Broad catch-all patterns removed to reduce noise.
+        # The specific patterns above cover all actionable error categories.
+        # Generic patterns like (?i)error matched nearly every log line,
+        # drowning out real findings with false positives.
     ],
     Severity.INFO: [
         r'readiness probe failed',
@@ -400,6 +491,16 @@ ERROR_PATTERNS = {
         r'(?i)pending',
     ],
 }
+
+# Pre-compile all ERROR_PATTERNS at module level to avoid recompilation per-file
+COMPILED_ERROR_PATTERNS = {}
+for _severity, _patterns in ERROR_PATTERNS.items():
+    COMPILED_ERROR_PATTERNS[_severity] = []
+    for _pattern in _patterns:
+        try:
+            COMPILED_ERROR_PATTERNS[_severity].append(re.compile(_pattern, re.IGNORECASE))
+        except re.error:
+            pass  # Skip invalid patterns
 
 # =============================================================================
 # POD/NODE FAILURE TRIAGE PATTERNS
@@ -730,9 +831,44 @@ def estimate_progress(execution: Dict) -> int:
     return min(95, int((completed_steps / total_steps) * 100))
 
 
+def store_execution_region(execution_id: str, region: str) -> bool:
+    """Store the region where an SSM execution was started, so subsequent calls can find it.
+    Returns True if stored successfully, False otherwise."""
+    key = f'execution-regions/{execution_id}.json'
+    mapping = {
+        'executionId': execution_id,
+        'region': region,
+        'createdAt': datetime.utcnow().isoformat()
+    }
+    for attempt in range(2):
+        try:
+            s3_client.put_object(
+                Bucket=LOGS_BUCKET,
+                Key=key,
+                Body=json.dumps(mapping),
+                ContentType='application/json'
+            )
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to store execution region mapping (attempt {attempt + 1}): {str(e)}")
+    return False
+
+
+def get_execution_region(execution_id: str) -> Optional[str]:
+    """Retrieve the region where an SSM execution was started."""
+    key = f'execution-regions/{execution_id}.json'
+    result = safe_s3_read(key)
+    if result['success']:
+        try:
+            mapping = json.loads(result['content'])
+            return mapping.get('region')
+        except Exception:
+            pass
+    return None
+
+
 def find_execution_by_idempotency_token(instance_id: str, token: str) -> Optional[Dict]:
-    """Find existing execution by idempotency token."""
-    # Check S3 for idempotency mapping
+    """Find existing execution by idempotency token, using the correct regional SSM client."""
     key = f'idempotency/{instance_id}/{token}.json'
     result = safe_s3_read(key)
     
@@ -741,18 +877,21 @@ def find_execution_by_idempotency_token(instance_id: str, token: str) -> Optiona
             mapping = json.loads(result['content'])
             execution_id = mapping.get('executionId')
             
-            # Verify execution still exists
+            # Look up which region this execution lives in
+            exec_region = get_execution_region(execution_id) or DEFAULT_REGION
+            regional_ssm = get_regional_client('ssm', exec_region)
+            
             try:
-                response = ssm_client.get_automation_execution(
+                response = regional_ssm.get_automation_execution(
                     AutomationExecutionId=execution_id
                 )
                 return {
                     'executionId': execution_id,
                     'status': response['AutomationExecution']['AutomationExecutionStatus']
                 }
-            except:
+            except Exception:
                 return None
-        except:
+        except Exception:
             return None
     
     return None
@@ -874,33 +1013,29 @@ def scan_file_for_errors(key: str) -> List[Dict]:
     # Track patterns found to avoid duplicates
     found_patterns = {}
     
-    for severity, patterns in ERROR_PATTERNS.items():
-        for pattern in patterns:
-            try:
-                regex = re.compile(pattern, re.IGNORECASE)
-                matches = []
-                
-                for i, line in enumerate(lines):
-                    if regex.search(line):
-                        matches.append({
-                            'lineNumber': i + 1,
-                            'line': line[:500]  # Limit line length
-                        })
-                
-                if matches:
-                    pattern_key = f"{filename}:{pattern}"
-                    if pattern_key not in found_patterns:
-                        found_patterns[pattern_key] = True
-                        findings.append({
-                            'file': filename,
-                            'fullKey': key,
-                            'pattern': pattern,
-                            'severity': severity.value,
-                            'count': len(matches),
-                            'sample': matches[0]['line'] if matches else ''
-                        })
-            except re.error:
-                continue
+    for severity, compiled_patterns in COMPILED_ERROR_PATTERNS.items():
+        for regex in compiled_patterns:
+            matches = []
+            
+            for i, line in enumerate(lines):
+                if regex.search(line):
+                    matches.append({
+                        'lineNumber': i + 1,
+                        'line': line[:500]  # Limit line length
+                    })
+            
+            if matches:
+                pattern_key = f"{filename}:{regex.pattern}"
+                if pattern_key not in found_patterns:
+                    found_patterns[pattern_key] = True
+                    findings.append({
+                        'file': filename,
+                        'fullKey': key,
+                        'pattern': regex.pattern,
+                        'severity': severity.value,
+                        'count': len(matches),
+                        'sample': matches[0]['line'] if matches else ''
+                    })
     
     return findings
 
@@ -1625,6 +1760,9 @@ def safe_s3_read(key: str, range_bytes: str = None, max_size: int = 1048576) -> 
         params = {'Bucket': LOGS_BUCKET, 'Key': key}
         if range_bytes:
             params['Range'] = range_bytes
+        elif max_size:
+            # Enforce max_size via byte range if no explicit range given
+            params['Range'] = f'bytes=0-{max_size - 1}'
         
         response = s3_client.get_object(**params)
         content = response['Body'].read()
@@ -1749,26 +1887,18 @@ def lambda_handler(event, context):
     # Tool routing
     tools = {
         # Core Operations (Tier 1)
-        'start_log_collection': start_log_collection,
-        'get_collection_status': get_collection_status,
-        'validate_bundle_completeness': validate_bundle_completeness,
-        'get_error_summary': get_error_summary,
-        'read_log_chunk': read_log_chunk,
+        'collect': start_log_collection,
+        'status': get_collection_status,
+        'validate': validate_bundle_completeness,
+        'errors': get_error_summary,
+        'read': read_log_chunk,
         
         # Advanced Analysis (Tier 2)
-        'search_logs_deep': search_logs_deep,
-        'correlate_events': correlate_events,
-        'get_artifact_reference': get_artifact_reference,
-        'generate_incident_summary': generate_incident_summary,
-        'list_collection_history': list_collection_history,
-        
-        # Legacy compatibility
-        'run_eks_log_collection': start_log_collection,
-        'get_automation_status': get_collection_status,
-        'list_automations': list_collection_history,
-        'list_collected_logs': list_collected_logs,
-        'get_log_content': get_log_content_legacy,
-        'search_log_errors': search_log_errors_legacy,
+        'search': search_logs_deep,
+        'correlate': correlate_events,
+        'artifact': get_artifact_reference,
+        'summarize': generate_incident_summary,
+        'history': list_collection_history,
     }
     
     if tool_name not in tools:
@@ -1786,14 +1916,43 @@ def lambda_handler(event, context):
 
 
 def success_response(data: Dict) -> Dict:
-    """Standard success response format."""
-    return {
-        'statusCode': 200,
-        'body': json.dumps({
+    """Standard success response format with payload size guard."""
+    MAX_PAYLOAD_BYTES = 5_500_000  # ~5.5MB safety margin under Lambda's 6MB limit
+
+    body = json.dumps({
+        'success': True,
+        **data
+    }, default=str)
+
+    if len(body.encode('utf-8')) > MAX_PAYLOAD_BYTES:
+        # Truncate large result arrays to fit within Lambda response limits
+        truncated_data = {k: v for k, v in data.items() if not isinstance(v, list)}
+        for k, v in data.items():
+            if isinstance(v, list):
+                # Progressively trim lists until we fit
+                trimmed = v
+                while trimmed:
+                    candidate = json.dumps({
+                        'success': True,
+                        **truncated_data,
+                        k: trimmed,
+                        '_payloadTruncated': True,
+                        '_originalCount': len(v),
+                        '_returnedCount': len(trimmed),
+                    }, default=str)
+                    if len(candidate.encode('utf-8')) <= MAX_PAYLOAD_BYTES:
+                        return {'statusCode': 200, 'body': candidate}
+                    trimmed = trimmed[:len(trimmed) // 2]
+                truncated_data[k] = []
+        # Fallback: return metadata only
+        body = json.dumps({
             'success': True,
-            **data
+            **truncated_data,
+            '_payloadTruncated': True,
+            '_error': 'Response too large, all result arrays removed',
         }, default=str)
-    }
+
+    return {'statusCode': 200, 'body': body}
 
 
 def error_response(status_code: int, message: str, details: Dict = None) -> Dict:
@@ -1813,20 +1972,49 @@ def error_response(status_code: int, message: str, details: Dict = None) -> Dict
 
 def start_log_collection(arguments: Dict) -> Dict:
     """
-    Start EKS log collection with idempotency support.
+    Start EKS log collection with idempotency and cross-region support.
     
     Inputs:
         instanceId: EC2 instance ID (required)
         idempotencyToken: Optional token to prevent duplicate executions
+        region: AWS region where the instance runs (optional, auto-detected if omitted)
     
     Returns:
-        executionId, estimatedCompletionTime, status
+        executionId, estimatedCompletionTime, status, region
     """
     instance_id = arguments.get('instanceId')
     idempotency_token = arguments.get('idempotencyToken')
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
+    
+    # Validate instance ID format (i-xxxxxxxxxxxxxxxxx)
+    if not re.match(r'^i-[0-9a-f]{8,17}$', instance_id):
+        return error_response(400, f'Invalid instanceId format: {instance_id}. Expected format: i-xxxxxxxxxxxxxxxxx')
+    
+    # Resolve target region (explicit > auto-detect > default)
+    target_region = resolve_region(arguments, instance_id)
+    try:
+        regional_ssm = get_regional_client('ssm', target_region)
+    except Exception as e:
+        return error_response(500, f'Failed to create SSM client for region {target_region}: {str(e)}')
+    
+    print(f"Starting log collection for {instance_id} in region {target_region}")
+    
+    # Verify instance is running and SSM-reachable before starting automation
+    try:
+        regional_ec2 = get_regional_client('ec2', target_region)
+        desc_resp = regional_ec2.describe_instances(InstanceIds=[instance_id])
+        reservations = desc_resp.get('Reservations', [])
+        if reservations and reservations[0].get('Instances'):
+            state = reservations[0]['Instances'][0].get('State', {}).get('Name', 'unknown')
+            if state in ('terminated', 'shutting-down'):
+                return error_response(400, f'Instance {instance_id} is {state}. Cannot collect logs from terminated instances.')
+            if state == 'stopped':
+                return error_response(400, f'Instance {instance_id} is stopped. Start the instance first, then retry.')
+    except Exception as e:
+        # Non-fatal: proceed anyway, SSM will fail with a clearer error if instance is unreachable
+        print(f"Warning: Could not verify instance state: {str(e)}")
     
     # Check for existing execution with same idempotency token
     if idempotency_token:
@@ -1837,44 +2025,60 @@ def start_log_collection(arguments: Dict) -> Dict:
                 'executionId': existing['executionId'],
                 'status': existing['status'],
                 'instanceId': instance_id,
+                'region': target_region,
                 'idempotent': True
             })
     
     try:
-        # Start SSM Automation
+        # Start SSM Automation in the target region
         params = {
             'EKSInstanceId': [instance_id],
             'LogDestination': [LOGS_BUCKET],
             'AutomationAssumeRole': [SSM_AUTOMATION_ROLE_ARN]
         }
         
-        response = ssm_client.start_automation_execution(
+        response = regional_ssm.start_automation_execution(
             DocumentName='AWSSupport-CollectEKSInstanceLogs',
             Parameters=params
         )
         
         execution_id = response['AutomationExecutionId']
         
-        # Store idempotency mapping if token provided
+        # Store idempotency mapping with region info
         if idempotency_token:
             store_idempotency_mapping(instance_id, idempotency_token, execution_id)
         
-        return success_response({
+        # Also store region mapping so subsequent calls know which region to query
+        region_stored = store_execution_region(execution_id, target_region)
+        
+        response_data = {
             'message': 'EKS log collection started',
             'executionId': execution_id,
             'instanceId': instance_id,
+            'region': target_region,
             's3Bucket': LOGS_BUCKET,
             'estimatedCompletionTime': '3-5 minutes',
             'suggestedPollIntervalSeconds': 15,
-            'nextStep': f'Poll status with get_collection_status(executionId="{execution_id}") every 15 seconds'
-        })
+            'nextStep': f'Poll status with status(executionId="{execution_id}") every 15 seconds'
+        }
         
-    except ssm_client.exceptions.AutomationDefinitionNotFoundException:
+        if not region_stored and target_region != DEFAULT_REGION:
+            response_data['warning'] = (
+                f'Region mapping could not be persisted. Pass region="{target_region}" '
+                f'explicitly in subsequent status/validate calls.'
+            )
+        
+        return success_response(response_data)
+        
+    except regional_ssm.exceptions.AutomationDefinitionNotFoundException:
         return error_response(404, 'AWSSupport-CollectEKSInstanceLogs document not found', {
-            'suggestion': 'This document may not be available in your region'
+            'suggestion': f'This SSM document may not be available in region {target_region}. '
+                          f'Check https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/ '
+                          f'for regional availability, or try running from a supported region like us-east-1 or us-west-2.',
+            'region': target_region
         })
     except Exception as e:
-        return error_response(500, f'Failed to start log collection: {str(e)}')
+        return error_response(500, f'Failed to start log collection in {target_region}: {str(e)}')
 
 
 def get_collection_status(arguments: Dict) -> Dict:
@@ -1894,8 +2098,15 @@ def get_collection_status(arguments: Dict) -> Dict:
     if not execution_id:
         return error_response(400, 'executionId is required')
     
+    # Resolve region for this execution
+    target_region = get_execution_region(execution_id) or arguments.get('region', DEFAULT_REGION)
     try:
-        response = ssm_client.get_automation_execution(
+        regional_ssm = get_regional_client('ssm', target_region)
+    except Exception as e:
+        return error_response(500, f'Failed to create SSM client for region {target_region}: {str(e)}')
+    
+    try:
+        response = regional_ssm.get_automation_execution(
             AutomationExecutionId=execution_id
         )
         execution = response['AutomationExecution']
@@ -1939,7 +2150,7 @@ def get_collection_status(arguments: Dict) -> Dict:
         
         # Provide next step guidance
         if status == 'Success':
-            result['nextStep'] = f'Validate bundle with validate_bundle_completeness(executionId="{execution_id}")'
+            result['nextStep'] = f'Validate bundle with validate(executionId="{execution_id}")'
         elif status == 'InProgress':
             result['suggestedPollIntervalSeconds'] = 15
             result['nextStep'] = 'Wait 15 seconds then poll again until status is Success or Failed'
@@ -1948,7 +2159,7 @@ def get_collection_status(arguments: Dict) -> Dict:
         
         return success_response({'automation': result})
         
-    except ssm_client.exceptions.AutomationExecutionNotFoundException:
+    except regional_ssm.exceptions.AutomationExecutionNotFoundException:
         return error_response(404, f'Execution {execution_id} not found')
     except Exception as e:
         return error_response(500, f'Failed to get status: {str(e)}')
@@ -1979,13 +2190,18 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
         else:
             # Get instance ID from execution
             try:
-                exec_response = ssm_client.get_automation_execution(
+                target_region = get_execution_region(execution_id) or arguments.get('region', DEFAULT_REGION)
+                regional_ssm = get_regional_client('ssm', target_region)
+            except Exception as e:
+                return error_response(500, f'Failed to create SSM client for region: {str(e)}')
+            try:
+                exec_response = regional_ssm.get_automation_execution(
                     AutomationExecutionId=execution_id
                 )
                 params = exec_response['AutomationExecution'].get('Parameters', {})
                 instance_id = params.get('EKSInstanceId', [''])[0]
                 prefix = f'eks_{instance_id}'
-            except ssm_client.exceptions.AutomationExecutionNotFoundException:
+            except regional_ssm.exceptions.AutomationExecutionNotFoundException:
                 return error_response(404, f'Execution {execution_id} not found')
             except Exception as e:
                 return error_response(500, f'Failed to get execution details: {str(e)}')
@@ -2028,7 +2244,7 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
                 'instanceId': instance_id,
                 'manifest': [],
                 'info': 'No extracted log files found. Log collection may still be in progress or may have failed.',
-                'nextStep': 'Check log collection status with get_collection_status'
+                'nextStep': 'Check log collection status with status'
             })
         
         total_size = sum(f['size'] for f in all_files)
@@ -2083,7 +2299,7 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
         ]
         
         if is_complete:
-            result['nextStep'] = f'Get error summary with get_error_summary(instanceId="{instance_id}")'
+            result['nextStep'] = f'Get error summary with errors(instanceId="{instance_id}")'
         else:
             result['nextStep'] = 'Bundle may be incomplete. Check SSM Automation status or proceed with available logs.'
         
@@ -2149,7 +2365,7 @@ def get_error_summary(arguments: Dict) -> Dict:
                         'totalFindings': len(findings),
                         'summary': index_data.get('summary', {}),
                         'cached': True,
-                        'nextStep': 'Use search_logs_deep for detailed investigation'
+                        'nextStep': 'Use search for detailed investigation'
                     })
                 except json.JSONDecodeError:
                     # Index file corrupted, fall through to scan
@@ -2167,7 +2383,7 @@ def get_error_summary(arguments: Dict) -> Dict:
             'summary': {'critical': 0, 'warning': 0, 'info': 0},
             'cached': False,
             'warning': f'Could not retrieve error summary: {str(e)}',
-            'nextStep': 'Check if logs exist with validate_bundle_completeness'
+            'nextStep': 'Check if logs exist with validate'
         })
 
 
@@ -2338,6 +2554,8 @@ def search_logs_deep(arguments: Dict) -> Dict:
         return error_response(400, 'instanceId is required')
     if not query:
         return error_response(400, 'query is required')
+    if len(query) > 500:
+        return error_response(400, 'query too long (max 500 characters)')
     
     try:
         # Compile regex
@@ -2369,7 +2587,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
                 'results': [],
                 'truncated': False,
                 'warning': list_result.get('error', 'Failed to list log files'),
-                'nextStep': 'Check if logs exist with validate_bundle_completeness'
+                'nextStep': 'Check if logs exist with validate'
             })
         
         # Filter files to search
@@ -2430,11 +2648,21 @@ def search_logs_deep(arguments: Dict) -> Dict:
                     'matches': matches
                 })
             
-            if sum(len(m['matches']) for m in all_matches) >= max_results * 5:
+            if sum(len(m['matches']) for m in all_matches) >= max_results * 3:
                 break
         
         # Sort by match count
         all_matches.sort(key=lambda x: x['matchCount'], reverse=True)
+        
+        # Trim individual file matches to keep response manageable
+        total_matches_kept = 0
+        for match_group in all_matches:
+            remaining_budget = max(10, max_results * 3 - total_matches_kept)
+            if len(match_group['matches']) > remaining_budget:
+                match_group['matches'] = match_group['matches'][:remaining_budget]
+                match_group['matchCount'] = len(match_group['matches'])
+                match_group['matchesTruncated'] = True
+            total_matches_kept += len(match_group['matches'])
         
         result = {
             'instanceId': instance_id,
@@ -2444,7 +2672,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
             'totalMatches': sum(m['matchCount'] for m in all_matches),
             'results': all_matches,
             'truncated': files_searched < len(files_to_search),
-            'nextStep': 'Use read_log_chunk to get full context around specific matches'
+            'nextStep': 'Use read to get full context around specific matches'
         }
         
         if files_with_errors > 0:
@@ -2463,7 +2691,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
             'results': [],
             'truncated': False,
             'error': f'Search encountered an error: {str(e)}',
-            'nextStep': 'Check if logs exist with validate_bundle_completeness'
+            'nextStep': 'Check if logs exist with validate'
         })
 
 
@@ -2490,24 +2718,37 @@ def correlate_events(arguments: Dict) -> Dict:
         return error_response(400, 'instanceId is required')
     
     try:
-        # Get error summary first
-        error_summary = scan_and_index_errors(instance_id, 'all')
+        # Try cached findings index first (fast path)
+        prefix = f'eks_{instance_id}'
+        index_key = find_findings_index(prefix)
+        findings = []
         
-        # Handle case where scan returns error or no findings
-        if error_summary['statusCode'] != 200:
-            # Return empty correlation instead of failing
-            return success_response({
-                'instanceId': instance_id,
-                'timeWindow': time_window,
-                'timeline': [],
-                'byComponent': {},
-                'correlations': [],
-                'warning': 'Could not retrieve error data for correlation',
-                'nextStep': 'Check if logs exist with validate_bundle_completeness'
-            })
+        if index_key:
+            read_result = safe_s3_read(index_key)
+            if read_result['success']:
+                try:
+                    index_data = json.loads(read_result['content'])
+                    findings = index_data.get('findings', [])
+                except json.JSONDecodeError:
+                    pass
         
-        summary_data = json.loads(error_summary['body'])
-        findings = summary_data.get('findings', [])
+        # Fall back to on-demand scan only if no cached findings
+        if not findings:
+            error_summary = scan_and_index_errors(instance_id, 'all')
+            
+            if error_summary['statusCode'] != 200:
+                return success_response({
+                    'instanceId': instance_id,
+                    'timeWindow': time_window,
+                    'timeline': [],
+                    'byComponent': {},
+                    'correlations': [],
+                    'warning': 'Could not retrieve error data for correlation',
+                    'nextStep': 'Check if logs exist with validate'
+                })
+            
+            summary_data = json.loads(error_summary['body'])
+            findings = summary_data.get('findings', [])
         
         # Handle no findings
         if not findings:
@@ -2518,7 +2759,7 @@ def correlate_events(arguments: Dict) -> Dict:
                 'byComponent': {},
                 'correlations': [],
                 'info': 'No error findings to correlate. This may indicate a healthy node or logs not yet collected.',
-                'nextStep': 'Use search_logs_deep to search for specific patterns'
+                'nextStep': 'Use search to search for specific patterns'
             })
         
         # Build timeline from findings
@@ -2555,7 +2796,7 @@ def correlate_events(arguments: Dict) -> Dict:
             'timeline': timeline[:50],
             'byComponent': by_component,
             'correlations': find_correlations(timeline),
-            'nextStep': 'Use search_logs_deep to investigate specific events'
+            'nextStep': 'Use search to investigate specific events'
         })
         
     except Exception as e:
@@ -2567,7 +2808,7 @@ def correlate_events(arguments: Dict) -> Dict:
             'byComponent': {},
             'correlations': [],
             'error': f'Correlation encountered an error: {str(e)}',
-            'nextStep': 'Check if logs exist with validate_bundle_completeness'
+            'nextStep': 'Check if logs exist with validate'
         })
 
 
@@ -2811,7 +3052,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
             root_cause = summary['pod_node_triage']['most_likely_root_cause']
             summary['nextStep'] = f"Root cause identified: {root_cause['category_name']} ({root_cause['confidence']} confidence). Follow immediate_remediation_steps in pod_node_triage."
         else:
-            summary['nextStep'] = 'Use search_logs_deep for detailed investigation of specific patterns'
+            summary['nextStep'] = 'Use search for detailed investigation of specific patterns'
         
         # Update execution time
         summary['executionTimeMs'] = int((time.time() - start_time) * 1000)
@@ -2836,7 +3077,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
                 'warning': 'Analysis timed out. Try calling get_error_summary and generate_incident_summary separately.'
             },
             'warning': f'Execution timed out: {str(e)}',
-            'nextStep': 'Call get_error_summary first, then generate_incident_summary with includeTriage=false'
+            'nextStep': 'Call errors first, then summarize with includeTriage=false'
         })
         
     except Exception as e:
@@ -2856,7 +3097,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
                 'error': f'Summary generation failed: {str(e)}'
             },
             'error': f'Could not generate complete summary: {str(e)}',
-            'nextStep': 'Check if logs exist with validate_bundle_completeness'
+            'nextStep': 'Check if logs exist with validate'
         })
 
 
@@ -2884,7 +3125,11 @@ def list_collection_history(arguments: Dict) -> Dict:
         if status_filter:
             filters.append({'Key': 'ExecutionStatus', 'Values': [status_filter]})
         
-        response = ssm_client.describe_automation_executions(
+        # Support cross-region listing
+        target_region = arguments.get('region', DEFAULT_REGION)
+        regional_ssm = get_regional_client('ssm', target_region)
+        
+        response = regional_ssm.describe_automation_executions(
             Filters=filters,
             MaxResults=max_results
         )
@@ -2918,89 +3163,3 @@ def list_collection_history(arguments: Dict) -> Dict:
         
     except Exception as e:
         return error_response(500, f'Failed to list history: {str(e)}')
-
-
-# =============================================================================
-# LEGACY COMPATIBILITY FUNCTIONS
-# =============================================================================
-
-def list_collected_logs(arguments: Dict) -> Dict:
-    """Legacy: List collected logs in S3. Gracefully handles missing logs."""
-    instance_id = arguments.get('instanceId', '')
-    
-    try:
-        prefix = f'eks_{instance_id}' if instance_id else 'eks_'
-        
-        # Use safe helper
-        list_result = safe_s3_list(prefix, max_keys=100)
-        
-        if not list_result['success']:
-            return success_response({
-                'logs': [],
-                'count': 0,
-                'bucket': LOGS_BUCKET,
-                'prefix': prefix,
-                'warning': list_result.get('error', 'Failed to list logs'),
-                'suggestion': 'Check if logs have been collected for this instance'
-            })
-        
-        logs = [
-            {
-                'key': obj['key'],
-                'size': obj['size'],
-                'lastModified': obj.get('last_modified')
-            }
-            for obj in list_result['objects']
-        ]
-        
-        return success_response({
-            'logs': logs,
-            'count': len(logs),
-            'bucket': LOGS_BUCKET,
-            'prefix': prefix
-        })
-        
-    except Exception as e:
-        return success_response({
-            'logs': [],
-            'count': 0,
-            'bucket': LOGS_BUCKET,
-            'error': f'Unexpected error: {str(e)}'
-        })
-
-
-def get_log_content_legacy(arguments: Dict) -> Dict:
-    """Legacy: Get log content with truncation (deprecated, use read_log_chunk)."""
-    log_key = arguments.get('logKey')
-    max_bytes = arguments.get('maxBytes', 100000)
-    
-    if not log_key:
-        return error_response(400, 'logKey is required')
-    
-    # Redirect to new function
-    return read_log_chunk({
-        'logKey': log_key,
-        'startByte': 0,
-        'endByte': max_bytes
-    })
-
-
-def search_log_errors_legacy(arguments: Dict) -> Dict:
-    """Legacy: Search for errors (deprecated, use get_error_summary or search_logs_deep)."""
-    instance_id = arguments.get('instanceId')
-    pattern = arguments.get('pattern')
-    log_types = arguments.get('logTypes', '')
-    max_results = arguments.get('maxResults', 50)
-    
-    if not instance_id:
-        return error_response(400, 'instanceId is required')
-    
-    # Use new search function
-    return search_logs_deep({
-        'instanceId': instance_id,
-        'query': pattern or r'(?i)(error|fail|fatal|panic|crash|oom|killed|denied|refused|timeout|exception)',
-        'logTypes': log_types,
-        'maxResults': max_results
-    })
-
-

@@ -163,6 +163,12 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           prefix: 'idempotency/',
           expiration: cdk.Duration.days(7),
         },
+        {
+          id: 'DeleteOldExecutionRegionMappings',
+          enabled: true,
+          prefix: 'execution-regions/',
+          expiration: cdk.Duration.days(7),
+        },
       ],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
@@ -306,15 +312,26 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       resources: ['*'],
     }));
 
-    // SSM Document access
+    // SSM Document access (cross-region support)
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMDocumentAccess',
       effect: iam.Effect.ALLOW,
       actions: ['ssm:GetDocument', 'ssm:DescribeDocument'],
       resources: [
-        `arn:aws:ssm:${cdk.Stack.of(this).region}::document/AWSSupport-CollectEKSInstanceLogs`,
-        `arn:aws:ssm:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:document/*`,
+        `arn:aws:ssm:*::document/AWSSupport-CollectEKSInstanceLogs`,
+        `arn:aws:ssm:*:${cdk.Stack.of(this).account}:document/*`,
       ],
+    }));
+
+    // EC2 DescribeInstances for cross-region instance auto-detection
+    lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'EC2DescribeForRegionDetection',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'ec2:DescribeInstances',
+        'ec2:DescribeRegions',
+      ],
+      resources: ['*'],
     }));
 
     // S3 access
@@ -506,7 +523,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       type: 'AWS::BedrockAgentCore::GatewayTarget',
       properties: {
         GatewayIdentifier: gateway.ref,
-        Name: 'EKSNodeLogTarget',
+        Name: 'NodeLog',
         Description: 'Enhanced EKS Node Log Collection Target',
         TargetConfiguration: {
           Mcp: {
@@ -597,8 +614,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // TIER 1: CORE OPERATIONS
       // =====================================================================
       {
-        Name: 'start_log_collection',
-        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Supports idempotency tokens to prevent duplicate executions.',
+        Name: 'collect',
+        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Supports idempotency tokens to prevent duplicate executions. Supports cross-region: auto-detects instance region or accepts explicit region parameter.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -610,30 +627,38 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'string',
               Description: 'Optional token to prevent duplicate executions. If provided and a matching execution exists, returns the existing executionId.',
             },
+            region: {
+              Type: 'string',
+              Description: 'AWS region where the instance runs (e.g., us-west-2). Optional: auto-detected from instance if omitted.',
+            },
           },
           Required: ['instanceId'],
         },
       },
       {
-        Name: 'get_collection_status',
-        Description: 'Get detailed status of a log collection execution including progress percentage, step details, and failure reasons.',
+        Name: 'status',
+        Description: 'Get detailed status of a log collection execution including progress percentage, step details, and failure reasons. Automatically resolves the region where the execution was started.',
         InputSchema: {
           Type: 'object',
           Properties: {
             executionId: {
               Type: 'string',
-              Description: 'The SSM Automation execution ID returned from start_log_collection',
+              Description: 'The SSM Automation execution ID returned from collect',
             },
             includeStepDetails: {
               Type: 'boolean',
               Description: 'Include individual step status (default: true)',
+            },
+            region: {
+              Type: 'string',
+              Description: 'AWS region of the execution. Optional: auto-resolved from stored execution metadata if omitted.',
             },
           },
           Required: ['executionId'],
         },
       },
       {
-        Name: 'validate_bundle_completeness',
+        Name: 'validate',
         Description: 'Verify all expected files were extracted from the log bundle. Returns manifest with file counts, sizes, and missing patterns.',
         InputSchema: {
           Type: 'object',
@@ -650,7 +675,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'get_error_summary',
+        Name: 'errors',
         Description: 'Get pre-indexed error findings (fast path). Returns categorized errors by severity without scanning raw files.',
         InputSchema: {
           Type: 'object',
@@ -668,7 +693,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'read_log_chunk',
+        Name: 'read',
         Description: 'Read a chunk of a log file using byte-range streaming. NO TRUNCATION. Supports both byte-range and line-based reading for multi-GB files.',
         InputSchema: {
           Type: 'object',
@@ -702,7 +727,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // TIER 2: ADVANCED ANALYSIS
       // =====================================================================
       {
-        Name: 'search_logs_deep',
+        Name: 'search',
         Description: 'Full-text regex search across all logs without truncation. Use for detailed investigation after reviewing error summary.',
         InputSchema: {
           Type: 'object',
@@ -728,7 +753,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'correlate_events',
+        Name: 'correlate',
         Description: 'Cross-file timeline correlation for incident analysis. Groups events by component and identifies patterns.',
         InputSchema: {
           Type: 'object',
@@ -754,7 +779,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'get_artifact_reference',
+        Name: 'artifact',
         Description: 'Get secure presigned URL for large artifacts. Use for files too large to return directly.',
         InputSchema: {
           Type: 'object',
@@ -772,7 +797,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'generate_incident_summary',
+        Name: 'summarize',
         Description: 'Generate AI-ready structured incident summary with critical findings, affected components, and recommendations.',
         InputSchema: {
           Type: 'object',
@@ -790,8 +815,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
       {
-        Name: 'list_collection_history',
-        Description: 'List historical log collections for audit and comparison.',
+        Name: 'history',
+        Description: 'List historical log collections for audit and comparison. Supports cross-region listing.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -807,109 +832,11 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'string',
               Description: 'Filter by status: Success, Failed, InProgress (optional)',
             },
-          },
-        },
-      },
-
-      // =====================================================================
-      // LEGACY COMPATIBILITY (deprecated, use new tools)
-      // =====================================================================
-      {
-        Name: 'run_eks_log_collection',
-        Description: '[DEPRECATED: Use start_log_collection] Start EKS log collection',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            instanceId: {
+            region: {
               Type: 'string',
-              Description: 'The EC2 instance ID',
+              Description: 'AWS region to list executions from (default: Lambda region). Specify to list executions from a different region.',
             },
           },
-          Required: ['instanceId'],
-        },
-      },
-      {
-        Name: 'get_automation_status',
-        Description: '[DEPRECATED: Use get_collection_status] Get automation status',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            executionId: {
-              Type: 'string',
-              Description: 'The execution ID',
-            },
-          },
-          Required: ['executionId'],
-        },
-      },
-      {
-        Name: 'list_automations',
-        Description: '[DEPRECATED: Use list_collection_history] List automations',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            maxResults: {
-              Type: 'integer',
-              Description: 'Maximum results',
-            },
-          },
-        },
-      },
-      {
-        Name: 'list_collected_logs',
-        Description: '[DEPRECATED: Use validate_bundle_completeness] List collected logs',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            instanceId: {
-              Type: 'string',
-              Description: 'Filter by instance ID',
-            },
-          },
-        },
-      },
-      {
-        Name: 'get_log_content',
-        Description: '[DEPRECATED: Use read_log_chunk] Get log content with truncation',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            logKey: {
-              Type: 'string',
-              Description: 'The S3 key of the log file',
-            },
-            maxBytes: {
-              Type: 'integer',
-              Description: 'Maximum bytes to retrieve',
-            },
-          },
-          Required: ['logKey'],
-        },
-      },
-      {
-        Name: 'search_log_errors',
-        Description: '[DEPRECATED: Use get_error_summary or search_logs_deep] Search for errors',
-        InputSchema: {
-          Type: 'object',
-          Properties: {
-            instanceId: {
-              Type: 'string',
-              Description: 'The EC2 instance ID',
-            },
-            pattern: {
-              Type: 'string',
-              Description: 'Regex pattern to search',
-            },
-            logTypes: {
-              Type: 'string',
-              Description: 'Log types to search',
-            },
-            maxResults: {
-              Type: 'integer',
-              Description: 'Maximum results',
-            },
-          },
-          Required: ['instanceId'],
         },
       },
     ];
@@ -941,6 +868,16 @@ def get_content_type(file_name):
         return 'text/yaml'
     return 'application/octet-stream'
 
+def sanitize_archive_path(file_name):
+    """Sanitize archive member path to prevent zip-slip path traversal."""
+    # Normalize and reject any path with .. components
+    normalized = os.path.normpath(file_name)
+    if normalized.startswith('..') or '/../' in normalized or normalized.startswith('/'):
+        print(f"SECURITY: Skipping suspicious archive path: {file_name}")
+        return None
+    # Strip leading ./ if present
+    return normalized.lstrip('./')
+
 def extract_zip(bucket, key, content):
     base_path = key[:-4]
     extract_prefix = f"{base_path}/extracted/"
@@ -949,8 +886,10 @@ def extract_zip(bucket, key, content):
         for file_info in zip_ref.infolist():
             if file_info.is_dir():
                 continue
-            file_name = file_info.filename
-            file_content = zip_ref.read(file_name)
+            file_name = sanitize_archive_path(file_info.filename)
+            if file_name is None:
+                continue
+            file_content = zip_ref.read(file_info.filename)
             extract_key = f"{extract_prefix}{file_name}"
             s3_client.put_object(
                 Bucket=bucket, 
@@ -973,16 +912,19 @@ def extract_targz(bucket, key, content):
         for member in tar_ref.getmembers():
             if not member.isfile():
                 continue
+            file_name = sanitize_archive_path(member.name)
+            if file_name is None:
+                continue
             file_obj = tar_ref.extractfile(member)
             if file_obj is None:
                 continue
             file_content = file_obj.read()
-            extract_key = f"{extract_prefix}{member.name}"
+            extract_key = f"{extract_prefix}{file_name}"
             s3_client.put_object(
                 Bucket=bucket, 
                 Key=extract_key, 
                 Body=file_content, 
-                ContentType=get_content_type(member.name)
+                ContentType=get_content_type(file_name)
             )
             extracted_files.append(extract_key)
             print(f"Extracted: {extract_key}")
@@ -1069,23 +1011,146 @@ from datetime import datetime
 s3_client = boto3.client('s3')
 LOGS_BUCKET = os.environ['LOGS_BUCKET_NAME']
 
-# Error patterns by severity
+# Files worth scanning (log files with actual runtime output).
+# Skip config dumps, static system info, metrics, and package lists
+# which produce massive false positives.
+SCANNABLE_FILE_PATTERNS = [
+    r'kubelet[/.]',
+    r'containerd[/-]log',
+    r'docker[/.]',
+    r'dmesg',
+    r'messages$',
+    r'secure$',
+    r'cloud-init.*\\.log',
+    r'ipamd\\.log',
+    r'aws-routed-eni/.*\\.log',
+    r'kube-proxy.*\\.log',
+    r'coredns.*\\.log',
+    r'var_log/.*\\.log',
+    r'nodeadm',
+    r'sandbox-image',
+]
+SCANNABLE_REGEXES = [re.compile(p, re.IGNORECASE) for p in SCANNABLE_FILE_PATTERNS]
+
+# Files to always skip - these contain config/static data, not errors
+SKIP_FILE_PATTERNS = [
+    r'sysctl',
+    r'ethtool',
+    r'ifconfig',
+    r'conntrack\\.txt',
+    r'pkglist',
+    r'ps\\.txt',
+    r'ps-threads',
+    r'top\\.txt',
+    r'allprocstat',
+    r'mounts\\.txt',
+    r'containerd-config\\.txt',
+    r'containerd-plugins\\.txt',
+    r'containerd-containers\\.txt',
+    r'containerd-images\\.txt',
+    r'containerd-namespaces\\.txt',
+    r'containerd-tasks\\.txt',
+    r'containerd-version\\.txt',
+    r'metrics\\.json',
+    r'modinfo',
+    r'iptables',
+    r'\\.json$',
+    r'\\.yaml$',
+    r'\\.yml$',
+    r'\\.conf$',
+    r'\\.toml$',
+    r'\\.service$',
+]
+SKIP_REGEXES = [re.compile(p, re.IGNORECASE) for p in SKIP_FILE_PATTERNS]
+
+# Precise error patterns - these require actual error context, not config values.
+# Each pattern is a tuple of (regex, description) for better reporting.
 ERROR_PATTERNS = {
     'critical': [
-        r'(?i)(fatal|panic|crash|oom|killed|evict|crashloop|notready)',
-        r'(?i)(out of memory|cannot allocate|no space left)',
-        r'(?i)(kernel panic|segfault|core dumped)',
+        (r'kernel panic', 'kernel panic'),
+        (r'BUG:.*', 'kernel bug'),
+        (r'watchdog: BUG: soft lockup', 'soft lockup'),
+        (r'invoked oom-killer', 'OOM killer invoked'),
+        (r'Out of memory: Kill', 'OOM kill'),
+        (r'Killed process \\d+.*total-vm', 'OOM kill with details'),
+        (r'Memory cgroup out of memory.*process', 'cgroup OOM'),
+        (r'segfault at', 'segfault'),
+        (r'PLEG is not healthy', 'PLEG unhealthy'),
+        (r'failed to run Kubelet:', 'kubelet launch failure'),
+        (r'Unit kubelet.*entered failed state', 'kubelet failed'),
+        (r'Node became not ready', 'node NotReady'),
+        (r'OCI runtime create failed:', 'container runtime failure'),
+        (r'no networks found in /etc/cni/net\\.d', 'CNI missing'),
+        (r'Container runtime network not ready', 'runtime network not ready'),
+        (r'InsufficientFreeAddressesInSubnet', 'IP exhaustion'),
+        (r'Unable to register node', 'node registration failed'),
+        (r'failed to register node', 'node registration failed'),
+        (r'Instances failed to join', 'cluster join failure'),
+        (r'certificate has expired', 'expired certificate'),
+        (r'x509: certificate', 'certificate error'),
+        (r'Unauthorized', 'auth failure'),
+        (r'nodeadm.*(?:failed|error)', 'nodeadm failure'),
+        (r'Failed to pull image', 'image pull failure'),
+        (r'CrashLoopBackOff', 'crash loop'),
+        (r'fork/exec.*resource temporarily unavailable', 'PID exhaustion'),
     ],
     'warning': [
-        r'(?i)(error|fail|denied|refused|timeout|exception)',
-        r'(?i)(unauthorized|forbidden|rejected|dropped)',
-        r'(?i)(backoff|retry|unreachable|connection refused)',
+        (r'(?:Readiness|Liveness|Startup) probe.*failed', 'probe failure'),
+        (r'Back-off restarting failed container', 'container restart backoff'),
+        (r'ImagePullBackOff', 'image pull backoff'),
+        (r'ErrImagePull', 'image pull error'),
+        (r'FailedScheduling', 'scheduling failure'),
+        (r'FailedMount', 'mount failure'),
+        (r'FailedAttachVolume', 'volume attach failure'),
+        (r'Insufficient cpu', 'insufficient CPU'),
+        (r'Insufficient memory', 'insufficient memory'),
+        (r'OOMKilled', 'container OOMKilled'),
+        (r'Evicted', 'pod evicted'),
+        (r'NetworkNotReady', 'network not ready'),
+        (r'dial tcp.*connection refused', 'connection refused'),
+        (r'dial tcp.*i/o timeout', 'connection timeout'),
+        (r'TLS handshake timeout', 'TLS timeout'),
+        (r'no such host', 'DNS resolution failure'),
+        (r'NXDOMAIN', 'DNS NXDOMAIN'),
+        (r'SERVFAIL', 'DNS SERVFAIL'),
+        (r'is not authorized to perform', 'IAM permission denied'),
+        (r'systemd.*Failed to start', 'service start failure'),
+        (r'nfs: server.*not responding', 'NFS not responding'),
     ],
     'info': [
-        r'(?i)(warn|warning|unable|cannot|couldn\\'t|invalid)',
-        r'(?i)(deprecated|missing|not found|expired)',
+        (r'(?i)level=(?:warn|warning)', 'log-level warning'),
+        (r'DEPRECATION:', 'deprecation notice'),
+        (r'context deadline exceeded', 'context deadline'),
+        (r'net_ratelimit:.*callbacks suppressed', 'kernel rate limiting'),
     ],
 }
+
+# Pre-compile all patterns
+COMPILED_PATTERNS = {}
+for _sev, _pats in ERROR_PATTERNS.items():
+    COMPILED_PATTERNS[_sev] = []
+    for _pat, _desc in _pats:
+        try:
+            COMPILED_PATTERNS[_sev].append((re.compile(_pat), _desc))
+        except re.error:
+            pass
+
+def is_scannable(filename):
+    """Check if a file is worth scanning (actual log output, not config/static data)."""
+    # First check skip list
+    for skip_re in SKIP_REGEXES:
+        if skip_re.search(filename):
+            return False
+    # Then check if it matches known log patterns
+    for scan_re in SCANNABLE_REGEXES:
+        if scan_re.search(filename):
+            return True
+    # Default: scan if it looks like a log file
+    if filename.endswith('.log') or filename.endswith('.txt'):
+        # Only scan files in directories that typically contain logs
+        log_dirs = ['kubelet', 'var_log', 'kernel', 'system/messages']
+        return any(d in filename for d in log_dirs)
+    return False
 
 def lambda_handler(event, context):
     print(f"Received event: {json.dumps(event)}")
@@ -1100,6 +1165,7 @@ def lambda_handler(event, context):
     try:
         # List all extracted files
         files_to_scan = []
+        files_skipped = 0
         paginator = s3_client.get_paginator('list_objects_v2')
         
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -1111,12 +1177,17 @@ def lambda_handler(event, context):
                 # Skip very large files
                 if obj['Size'] > 5242880:  # 5MB
                     continue
+                # Only scan actual log files, not config/static data
+                filename = key.split('/extracted/')[-1] if '/extracted/' in key else key
+                if not is_scannable(filename):
+                    files_skipped += 1
+                    continue
                 files_to_scan.append({
                     'key': key,
                     'size': obj['Size']
                 })
         
-        print(f"Scanning {len(files_to_scan)} files for errors")
+        print(f"Scanning {len(files_to_scan)} log files ({files_skipped} non-log files skipped)")
         
         # Scan files
         all_findings = []
@@ -1139,6 +1210,7 @@ def lambda_handler(event, context):
             'indexedAt': datetime.utcnow().isoformat(),
             'prefix': prefix,
             'filesScanned': len(files_to_scan),
+            'filesSkipped': files_skipped,
             'findings': deduplicated[:500],  # Limit stored findings
             'summary': summary,
         }
@@ -1184,25 +1256,26 @@ def scan_file(bucket, key):
             content_str = content.decode('latin-1', errors='ignore')
         
         filename = key.split('/extracted/')[-1] if '/extracted/' in key else key
+        lines = content_str.split('\\n')[:5000]
         
-        for severity, patterns in ERROR_PATTERNS.items():
-            for pattern in patterns:
-                try:
-                    regex = re.compile(pattern)
-                    for i, line in enumerate(content_str.split('\\n')[:3000]):
-                        if regex.search(line):
-                            findings.append({
-                                'file': filename,
-                                'fullKey': key,
-                                'severity': severity,
-                                'pattern': pattern[:50],
-                                'line': i + 1,
-                                'sample': line[:300]
-                            })
-                            if len(findings) > 200:
-                                return findings
-                except:
-                    continue
+        for severity, compiled_list in COMPILED_PATTERNS.items():
+            for regex, description in compiled_list:
+                match_count = 0
+                for i, line in enumerate(lines):
+                    if regex.search(line):
+                        findings.append({
+                            'file': filename,
+                            'fullKey': key,
+                            'severity': severity,
+                            'pattern': description,
+                            'line': i + 1,
+                            'sample': line.strip()[:300]
+                        })
+                        match_count += 1
+                        if match_count > 50 or len(findings) > 200:
+                            break
+                if len(findings) > 200:
+                    return findings
     except Exception as e:
         print(f"Error scanning {key}: {str(e)}")
     
@@ -1212,18 +1285,18 @@ def deduplicate_findings(findings):
     seen = {}
     
     for finding in findings:
-        key = f"{finding.get('file')}:{finding.get('pattern')}"
+        dedup_key = f"{finding.get('file')}:{finding.get('pattern')}"
         
-        if key not in seen:
-            seen[key] = {
+        if dedup_key not in seen:
+            seen[dedup_key] = {
                 **finding,
                 'count': 1,
                 'lines': [finding.get('line')]
             }
         else:
-            seen[key]['count'] += 1
-            if len(seen[key]['lines']) < 10:
-                seen[key]['lines'].append(finding.get('line'))
+            seen[dedup_key]['count'] += 1
+            if len(seen[dedup_key]['lines']) < 10:
+                seen[dedup_key]['lines'].append(finding.get('line'))
     
     severity_order = {'critical': 0, 'warning': 1, 'info': 2}
     result = sorted(
