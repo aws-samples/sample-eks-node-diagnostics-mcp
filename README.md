@@ -1,5 +1,7 @@
 # EKS Node Log MCP
 
+> **⚠️ Proof of Concept** — This project is a POC and has not been tested in production environments. Please deploy and test in a non-production account first. Use at your own risk.
+
 Production-grade MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
 
 ## Overview
@@ -412,52 +414,58 @@ After deployment, configure the MCP Server in DevOps Agent Console with the valu
 
 ## Usage Examples
 
-### Cluster Health Check
+### "My pods keep getting evicted"
 ```
-Give me a health check of my EKS cluster — how many nodes are up, any unhealthy ones?
-```
-
-### Incident Investigation
-```
-I'm seeing pod failures on my cluster. Check the cluster health, collect logs from the
-unhealthiest node, and tell me what errors you find. Cite every finding ID.
+Pods on my production cluster keep getting evicted. Check cluster health, find which
+nodes are under pressure, collect logs from the worst one, and tell me what's causing it.
 ```
 
-### Baseline-Aware Scan
+### "Node went NotReady at 3am"
 ```
-Scan errors on this node but filter out known baseline noise for my cluster.
-```
-
-### Cross-Region Collection
-```
-Collect logs from i-0abc123 which is running in us-west-2
+Node i-0abc123def in us-west-2 went NotReady around 3am last night. Collect its logs
+and correlate what happened in the 5 minutes before it went down. I need the root cause chain.
 ```
 
-### Smart Batch Triage
+### "We're leaking IPs"
 ```
-I suspect multiple nodes are having issues. Preview which unhealthy nodes you'd sample
-and how they group by failure type. Don't collect yet, just show me the plan.
-```
-
-### Node Comparison
-```
-Compare these two nodes — what errors do they share vs what's unique to each?
+Our pods are stuck in ContainerCreating and I think we're out of IPs. Pull the networking
+diagnostics from node i-0abc123def — I need the IPAMD logs, ENI attachments, and iptables rules.
 ```
 
-### Network Deep Dive
+### "Is this error new or has it always been there?"
 ```
-This node is running out of pod IPs. Pull apart its networking — iptables, CNI config,
-route tables, DNS, ENI attachments, and IPAMD status.
-```
-
-### Deep Search
-```
-Search for OOM or memory pressure errors in the logs from this node
+I'm seeing CNI plugin errors on this node. Scan the errors but use baseline subtraction
+for cluster devopsagentcluster — I only want to see findings that are new, not the usual noise.
 ```
 
-### Read Specific Log Section
+### "Multiple nodes crashing after a deploy"
 ```
-Read bytes 1000000-2000000 from the kubelet log file
+After our last deploy, 3 nodes started flapping. Compare nodes i-0abc123, i-0def456,
+and i-0ghi789 — what errors do they all share vs what's unique to each?
+```
+
+### "OOM but I don't know which container"
+```
+Something on node i-0abc123def is getting OOM killed. Search the kubelet and kernel logs
+for OOM, memory pressure, or cgroup limit — show me the exact log lines with timestamps.
+```
+
+### "Triage a 200-node cluster"
+```
+We have a 200-node cluster and something is off. Do a dry run batch collection first —
+show me which nodes you'd sample and why. Then collect from the unhealthy ones.
+```
+
+### "Read the raw kubelet log around the crash"
+```
+Finding F-003 mentions a kubelet restart. Read the raw kubelet log starting at byte
+offset 2500000 — I want to see the 50 lines around that event.
+```
+
+### "Give me the incident summary for the ticket"
+```
+I've reviewed findings F-001 through F-008 from this node. Generate an incident summary
+grounded in those finding IDs — I need it for the post-incident review.
 ```
 
 ---
@@ -545,4 +553,4 @@ cdk destroy
 
 ## License
 
-MIT-0
+This project is licensed under the MIT No Attribution (MIT-0) License. See the [LICENSE](LICENSE) file for details.
