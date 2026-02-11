@@ -25,3 +25,7 @@ npm-debug.log*
 
 # Test coverage
 coverage/
+
+# Deployment-specific outputs (contain account IDs, secrets)
+mcp-config.txt
+cdk-outputs.json
