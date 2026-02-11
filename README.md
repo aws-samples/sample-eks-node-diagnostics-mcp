@@ -1,10 +1,14 @@
 # EKS Node Log MCP
 
+> **⚠️ Proof of Concept (POC):** This project is a proof of concept and should be tested in non-production environments first. Validate thoroughly in a staging or development account before using with production workloads.
+
+> **Ready to deploy?** Jump straight to [Prerequisites](#prerequisites) and [Deployment](#deployment).
+
 MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
 
 ## The Problem
 
-Around 40-50% of EKS production issues originate at the worker node level. When investigating these issues, teams typically send containerd and kubelet logs — but that is rarely enough. Effective root cause analysis also requires iptables rules, CNI configuration, route tables, DNS resolution state, ENI attachment status, conntrack tables, kernel ring buffer (dmesg), and IPAMD logs. These artifacts live on the node's OS and are not accessible through the Kubernetes API or CloudWatch.
+Around 40–50% of EKS production issues originate at the worker node level. When investigating these issues, teams typically send containerd and kubelet logs — but that is rarely enough. Effective root cause analysis also requires iptables rules, CNI configuration, route tables, DNS resolution state, ENI attachment status, conntrack tables, kernel ring buffer (dmesg), and IPAMD logs. These artifacts live on the node's OS and are not accessible through the Kubernetes API or CloudWatch.
 
 This creates a gap: AI agents (DevOps Agent, or any MCP-compatible agent) can reason over logs, but they have no way to collect the full set of node-level evidence needed to diagnose networking failures, OOM kills, node NotReady events, or IP exhaustion issues.
 
@@ -12,30 +16,15 @@ This creates a gap: AI agents (DevOps Agent, or any MCP-compatible agent) can re
 
 This server gives any MCP-compatible agent the ability to:
 
-1. **Collect the full diagnostic bundle** from any EKS worker node via SSM Automation — not just kubelet/containerd, but all 20+ log sources including iptables, routes, CNI config, ENI metadata, IPAMD, dmesg, sysctl settings, and more
-2. **Pre-index errors** with severity classification and stable finding IDs so the agent doesn't have to parse raw logs
-3. **Stream multi-GB files** with byte-range reads — no truncation, no token limits
-4. **Correlate across log sources** to build temporal root cause chains (e.g., IPAMD IP exhaustion → CNI plugin failure → pod stuck in ContainerCreating)
-5. **Run live tcpdump captures** on nodes via SSM Run Command, with decoded packet summaries, protocol stats, and anomaly detection the agent can read directly
-6. **Compare nodes** to isolate what's unique to a failing node vs. common baseline noise
-7. **Batch collect from 1000+ node clusters** with smart statistical sampling
+- **Collect the full diagnostic bundle** from any EKS worker node via SSM Automation — not just kubelet/containerd, but all 20+ log sources including iptables, routes, CNI config, ENI metadata, IPAMD, dmesg, sysctl settings, and more
+- **Pre-index errors** with severity classification and stable finding IDs so the agent doesn't have to parse raw logs
+- **Stream multi-GB files** with byte-range reads — no truncation, no token limits
+- **Correlate across log sources** to build temporal root cause chains (e.g., IPAMD IP exhaustion → CNI plugin failure → pod stuck in ContainerCreating)
+- **Run live tcpdump captures** on nodes via SSM Run Command, with decoded packet summaries, protocol stats, and anomaly detection the agent can read directly
+- **Compare nodes** to isolate what's unique to a failing node vs. common baseline noise
+- **Batch collect** from 1000+ node clusters with smart statistical sampling
 
 The result: an agent can go from "node is NotReady" to a grounded incident report with cited evidence in a single conversation, without a human needing to SSH into the node.
-
-### Key Features
-
-- **Async Task Pattern**: Start log collection and poll for completion with idempotency support
-- **Cross-Region Collection**: Collect logs from nodes in any AWS region from a single deployment
-- **Byte-Range Streaming**: Read multi-GB log files without truncation using line-aligned byte ranges
-- **Pre-Indexed Findings**: Fast error discovery with stable finding IDs (F-001 format) and 5-level severity
-- **Anti-Hallucination Guardrails**: Finding-grounded summaries, citation enforcement, confidence levels, and gap reporting
-- **Cluster-Level Intelligence**: Health overview, node comparison, smart batch collection with statistical sampling
-- **Baseline Subtraction**: Suppress known pre-existing findings per cluster so only new issues surface
-- **Network Diagnostics**: Structured parsing of iptables, CNI config, routes, DNS, ENI, and IPAMD logs
-- **Manifest Validation**: Verify bundle completeness using manifest.json with file inventory
-- **Pagination**: Page through large finding sets without truncation
-- **KMS Encryption**: Server-side encryption for all stored logs
-- **Secure Artifact References**: Presigned URLs for large file downloads
 
 ---
 
@@ -72,6 +61,13 @@ Tool names are kept short to stay under the 64-character limit when prefixed wit
 | `batch_collect` | Smart batch collection with statistical sampling for 1000+ node clusters |
 | `batch_status` | Poll status of multiple collections at once |
 | `network_diagnostics` | Structured networking analysis: iptables, CNI, routes, DNS, ENI, IPAMD |
+
+### Tier 4: Live Packet Capture
+
+| Tool | Description |
+|------|-------------|
+| `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
+| `tcpdump_analyze` | Read decoded packet text, protocol stats (TCP/UDP/ICMP), top talkers, and anomaly detection (high RST, retransmissions, SYN floods) from a completed capture |
 
 ---
 
@@ -111,6 +107,19 @@ Recommended workflow for incident response:
 5. compare_nodes(instanceIds)          → diff findings across nodes
    ↓
 6. network_diagnostics(instanceId)     → structured networking analysis
+```
+
+### Live Packet Capture Workflow
+
+```
+1. tcpdump_capture(instanceId, durationSeconds?, filter?)
+   → returns commandId + task envelope (async)
+   ↓
+2. tcpdump_capture(commandId, instanceId)
+   → poll until status = completed
+   ↓
+3. tcpdump_analyze(instanceId, commandId)
+   → decoded packets, protocol stats, top talkers, anomalies
 ```
 
 ---
@@ -482,6 +491,18 @@ I've reviewed findings F-001 through F-008 from this node. Generate an incident 
 grounded in those finding IDs — I need it for the post-incident review.
 ```
 
+### "Capture traffic to debug connection timeouts"
+```
+Pods on node i-0abc123def can't reach the API server. Run a 2-minute tcpdump filtered
+on port 443, then analyze the capture — show me RST counts, retransmissions, and top IPs.
+```
+
+### "Is something dropping packets?"
+```
+Run tcpdump on i-0abc123def for 60 seconds with no filter. I want to see the full protocol
+breakdown and any anomalies — especially RST rates and ICMP unreachables.
+```
+
 ---
 
 ## Architecture
@@ -489,7 +510,7 @@ grounded in those finding IDs — I need it for the post-incident review.
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  DevOps Agent   │────▶│  MCP Gateway     │────▶│  Lambda         │
-│  (MCP Client)   │     │  (AgentCore)     │     │  (15 tools)     │
+│  (MCP Client)   │     │  (AgentCore)     │     │  (17 tools)     │
 └─────────────────┘     └──────────────────┘     └────────┬────────┘
                                                           │
                         ┌────────────┬────────────────────┼────────────────────┐
