@@ -1,8 +1,7 @@
 # EKS Node Log MCP
 
-> **⚠️ Proof of Concept** — This project is a POC and has not been tested in production environments. Please deploy and test in a non-production account first. Use at your own risk.
 
-Production-grade MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
+MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
 
 ## Overview
 
