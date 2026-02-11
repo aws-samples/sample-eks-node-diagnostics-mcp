@@ -169,6 +169,12 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           prefix: 'execution-regions/',
           expiration: cdk.Duration.days(7),
         },
+        {
+          id: 'ExpireOldBaselines',
+          enabled: true,
+          prefix: 'baselines/',
+          expiration: cdk.Duration.days(90),
+        },
       ],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
@@ -323,13 +329,23 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       ],
     }));
 
-    // EC2 DescribeInstances for cross-region instance auto-detection
+    // EC2 and EKS permissions for cross-region detection and cluster_health
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'EC2DescribeForRegionDetection',
+      sid: 'EC2AndEKSDescribe',
       effect: iam.Effect.ALLOW,
       actions: [
         'ec2:DescribeInstances',
         'ec2:DescribeRegions',
+        'ec2:DescribeNetworkInterfaces',
+        'ec2:DescribeSubnets',
+        'ec2:DescribeSecurityGroups',
+        'ec2:DescribeRouteTables',
+        'eks:DescribeCluster',
+        'eks:ListClusters',
+        'eks:ListNodegroups',
+        'eks:DescribeNodegroup',
+        'ssm:DescribeInstanceInformation',
+        'autoscaling:DescribeAutoScalingGroups',
       ],
       resources: ['*'],
     }));
@@ -358,7 +374,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'ssm-automation-enhanced.lambda_handler',
       role: lambdaExecutionRole,
-      timeout: cdk.Duration.minutes(2),
+      timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       environment: {
         LOGS_BUCKET_NAME: this.logsBucket.bucketName,
@@ -615,7 +631,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // =====================================================================
       {
         Name: 'collect',
-        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Supports idempotency tokens to prevent duplicate executions. Supports cross-region: auto-detects instance region or accepts explicit region parameter.',
+        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Supports idempotency tokens to prevent duplicate executions. Supports cross-region: auto-detects instance region or accepts explicit region parameter. CITATION: When presenting results, always cite the executionId and region returned.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -634,10 +650,31 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           },
           Required: ['instanceId'],
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            executionId: { Type: 'string', Description: 'SSM Automation execution ID for polling' },
+            instanceId: { Type: 'string' },
+            region: { Type: 'string' },
+            status: { Type: 'string' },
+            estimatedCompletionTime: { Type: 'string' },
+            idempotent: { Type: 'boolean', Description: 'True if returning existing execution' },
+            task: {
+              Type: 'object',
+              Description: 'Async task envelope for polling',
+              Properties: {
+                taskId: { Type: 'string', Description: 'Same as executionId — use with status tool' },
+                state: { Type: 'string', Description: 'running|completed|failed|cancelled' },
+                message: { Type: 'string' },
+                progress: { Type: 'integer', Description: '0-100 percent' },
+              },
+            },
+          },
+        },
       },
       {
         Name: 'status',
-        Description: 'Get detailed status of a log collection execution including progress percentage, step details, and failure reasons. Automatically resolves the region where the execution was started.',
+        Description: 'Get detailed status of a log collection execution including progress percentage, step details, and failure reasons. Automatically resolves the region where the execution was started. CITATION: Always cite executionId and status in your response.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -656,10 +693,35 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           },
           Required: ['executionId'],
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            automation: {
+              Type: 'object',
+              Properties: {
+                executionId: { Type: 'string' },
+                status: { Type: 'string', Description: 'InProgress|Success|Failed|Cancelled' },
+                progress: { Type: 'integer', Description: '0-100 percent' },
+                failureReason: { Type: 'string' },
+                stepDetails: { Type: 'array' },
+              },
+            },
+            task: {
+              Type: 'object',
+              Description: 'Normalized task state for async polling',
+              Properties: {
+                taskId: { Type: 'string' },
+                state: { Type: 'string', Description: 'running|completed|failed|cancelled' },
+                message: { Type: 'string' },
+                progress: { Type: 'integer', Description: '0-100 percent' },
+              },
+            },
+          },
+        },
       },
       {
         Name: 'validate',
-        Description: 'Verify all expected files were extracted from the log bundle. Returns manifest with file counts, sizes, and missing patterns.',
+        Description: 'Verify all expected files were extracted from the log bundle. Returns manifest with file counts, sizes, and missing patterns. Uses manifest.json when available for authoritative file inventory. CITATION: Cite fileCount, totalSizeHuman, and any missingPatterns.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -673,10 +735,23 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             },
           },
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            complete: { Type: 'boolean' },
+            fileCount: { Type: 'integer' },
+            totalSize: { Type: 'integer' },
+            totalSizeHuman: { Type: 'string' },
+            missingPatterns: { Type: 'array' },
+            foundPatterns: { Type: 'array' },
+            hasFindingsIndex: { Type: 'boolean' },
+            manifest: { Type: 'array', Description: 'File list with key, fullKey, size, sizeHuman' },
+          },
+        },
       },
       {
         Name: 'errors',
-        Description: 'Get pre-indexed error findings (fast path). Returns categorized errors by severity without scanning raw files.',
+        Description: 'Get pre-indexed error findings (fast path). Returns categorized errors by severity with finding_ids for citation. Each finding has a stable finding_id (F-001 format). CITATION: Always cite finding_id and severity when referencing findings. Use finding_ids with summarize tool.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -686,29 +761,57 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             },
             severity: {
               Type: 'string',
-              Description: 'Filter by severity: critical, warning, info, or all (default: all)',
+              Description: 'Filter by severity: critical, high, medium, low, info, or all (default: all). Legacy "warning" maps to "high".',
+            },
+            response_format: {
+              Type: 'string',
+              Description: '"concise" (default) returns finding_id/severity/pattern/file/count only. "detailed" includes full sample text and line numbers.',
+            },
+            pageSize: {
+              Type: 'integer',
+              Description: 'Number of findings per page (default: 50, max: 200)',
+            },
+            pageToken: {
+              Type: 'string',
+              Description: 'Opaque token for next page (from previous response nextPageToken)',
+            },
+            clusterContext: {
+              Type: 'string',
+              Description: 'EKS cluster name for baseline subtraction. When provided, findings seen 10+ times are annotated as baseline (normal operation).',
             },
           },
           Required: ['instanceId'],
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            findings: { Type: 'array', Description: 'Array of findings with finding_id, severity, pattern, file, count' },
+            totalFindings: { Type: 'integer' },
+            summary: { Type: 'object', Description: 'Counts by severity: critical, high, medium, low, info' },
+            hasMore: { Type: 'boolean' },
+            nextPageToken: { Type: 'string' },
+            coverage_report: { Type: 'object', Description: 'files_scanned, files_skipped, scan_complete' },
+          },
+        },
       },
       {
         Name: 'read',
-        Description: 'Read a chunk of a log file using byte-range streaming. NO TRUNCATION. Supports both byte-range and line-based reading for multi-GB files.',
+        Description: 'Read a chunk of a log file using byte-range streaming. NO TRUNCATION. Supports both byte-range and line-based reading for multi-GB files. Line-aligned: byte reads snap to newline boundaries. CITATION: Cite logKey, startByte, endByte, and totalSize.',
         InputSchema: {
           Type: 'object',
           Properties: {
             logKey: {
               Type: 'string',
-              Description: 'The S3 key of the log file (from validate_bundle_completeness manifest)',
+              Description: 'The S3 key of the log file (from validate manifest)',
             },
             startByte: {
               Type: 'integer',
-              Description: 'Starting byte offset (default: 0)',
+              Description: 'Starting byte offset (default: 0). Snaps forward to next newline.',
             },
             endByte: {
               Type: 'integer',
-              Description: 'Ending byte offset (default: startByte + 1MB)',
+              Description: 'Ending byte offset (default: startByte + 1MB). Snaps forward to next newline.',
             },
             startLine: {
               Type: 'integer',
@@ -721,6 +824,20 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           },
           Required: ['logKey'],
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            logKey: { Type: 'string' },
+            content: { Type: 'string' },
+            startByte: { Type: 'integer', Description: 'Actual start byte (line-aligned)' },
+            endByte: { Type: 'integer', Description: 'Actual end byte (line-aligned)' },
+            totalSize: { Type: 'integer' },
+            hasMore: { Type: 'boolean' },
+            nextChunkToken: { Type: 'string', Description: 'Pass as startByte for next chunk' },
+            truncated: { Type: 'boolean', Description: 'Always false — never truncates' },
+            lineAligned: { Type: 'boolean', Description: 'True when byte reads are snapped to newline boundaries' },
+          },
+        },
       },
 
       // =====================================================================
@@ -728,7 +845,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // =====================================================================
       {
         Name: 'search',
-        Description: 'Full-text regex search across all logs without truncation. Use for detailed investigation after reviewing error summary.',
+        Description: 'Full-text regex search across all logs without truncation. Use for detailed investigation after reviewing error summary. CITATION: Cite finding_id (S-NNN format), file name, and match count for each result group.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -748,13 +865,29 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'integer',
               Description: 'Maximum results per file (default: 100, max: 500)',
             },
+            response_format: {
+              Type: 'string',
+              Description: '"concise" (default) or "detailed" — controls verbosity of match context',
+            },
           },
           Required: ['instanceId', 'query'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            query: { Type: 'string' },
+            filesSearched: { Type: 'integer' },
+            filesWithMatches: { Type: 'integer' },
+            totalMatches: { Type: 'integer' },
+            results: { Type: 'array', Description: 'Array of {finding_id, file, fullKey, matchCount, matches[]}' },
+            coverage_report: { Type: 'object' },
+          },
         },
       },
       {
         Name: 'correlate',
-        Description: 'Cross-file timeline correlation for incident analysis. Groups events by component and identifies patterns.',
+        Description: 'Cross-file timeline correlation for incident analysis. Groups events by component, builds temporal clusters, and identifies potential root cause chains. CITATION: Cite finding_ids, confidence level, and any gaps reported.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -774,13 +907,31 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'array',
               Description: 'Components to include (optional)',
             },
+            response_format: {
+              Type: 'string',
+              Description: '"concise" (default) or "detailed" — controls verbosity of timeline entries',
+            },
           },
           Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            timeline: { Type: 'array' },
+            byComponent: { Type: 'object' },
+            correlations: { Type: 'array' },
+            temporal_clusters: { Type: 'array', Description: 'Groups of events within timeWindow' },
+            potential_root_cause_chain: { Type: 'array', Description: 'Ordered cause→effect chains' },
+            confidence: { Type: 'string', Description: 'high|medium|low|none' },
+            gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+            coverage_report: { Type: 'object' },
+          },
         },
       },
       {
         Name: 'artifact',
-        Description: 'Get secure presigned URL for large artifacts. Use for files too large to return directly.',
+        Description: 'Get secure presigned URL for large artifacts. Use for files too large to return directly. CITATION: Cite the logKey and expiresAt timestamp.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -795,10 +946,19 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           },
           Required: ['logKey'],
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            logKey: { Type: 'string' },
+            presignedUrl: { Type: 'string' },
+            expiresAt: { Type: 'string' },
+            sizeHuman: { Type: 'string' },
+          },
+        },
       },
       {
         Name: 'summarize',
-        Description: 'Generate AI-ready structured incident summary with critical findings, affected components, and recommendations.',
+        Description: 'Generate structured incident summary grounded in indexed findings. Pass finding_ids from errors tool to constrain summary to specific findings. Output includes grounded flag (true = all claims backed by finding_ids). CITATION: Always cite the finding_ids that support each claim. Flag any unresolved finding_ids.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -810,13 +970,31 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'boolean',
               Description: 'Include remediation suggestions (default: true)',
             },
+            finding_ids: {
+              Type: 'array',
+              Description: 'Optional list of finding_ids (F-001 format) from errors tool. When provided, summary is constrained to only these findings.',
+            },
           },
-          Required: ['instanceId'],
+          Required: ['instanceId', 'finding_ids'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            grounded: { Type: 'boolean', Description: 'True if all claims backed by finding_ids' },
+            unresolvedFindingIds: { Type: 'array', Description: 'finding_ids that could not be resolved' },
+            criticalFindings: { Type: 'array' },
+            highFindings: { Type: 'array' },
+            affectedComponents: { Type: 'array' },
+            recommendations: { Type: 'array' },
+            confidence: { Type: 'string' },
+            gaps: { Type: 'array' },
+          },
         },
       },
       {
         Name: 'history',
-        Description: 'List historical log collections for audit and comparison. Supports cross-region listing.',
+        Description: 'List historical log collections for audit and comparison. Supports cross-region listing. CITATION: Cite executionId and status for each entry.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -838,6 +1016,193 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             },
           },
         },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            executions: { Type: 'array' },
+            totalCount: { Type: 'integer' },
+          },
+        },
+      },
+
+      // =====================================================================
+      // TIER 3: CLUSTER-LEVEL INTELLIGENCE
+      // =====================================================================
+      {
+        Name: 'cluster_health',
+        Description: 'Get a comprehensive health overview of an EKS cluster. Enumerates all nodes, checks SSM agent status, instance metadata (type, AZ, AMI, launch time), and flags unhealthy nodes. The entry point before diving into individual node investigation. CITATION: Cite clusterName, node counts, and any unhealthy node instanceIds.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            clusterName: {
+              Type: 'string',
+              Description: 'Name of the EKS cluster to inspect',
+            },
+            region: {
+              Type: 'string',
+              Description: 'AWS region of the cluster (auto-detected if omitted)',
+            },
+            includeSSMStatus: {
+              Type: 'boolean',
+              Description: 'Check SSM agent connectivity for each node (default: true)',
+            },
+          },
+          Required: ['clusterName'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            clusterName: { Type: 'string' },
+            totalNodes: { Type: 'integer' },
+            healthyNodes: { Type: 'integer' },
+            unhealthyNodes: { Type: 'integer' },
+            nodes: { Type: 'array' },
+          },
+        },
+      },
+      {
+        Name: 'compare_nodes',
+        Description: 'Diff error findings and health status between two or more nodes. Surfaces what is unique to a failing node vs. common across all nodes. Saves tokens by returning a structured diff instead of raw summaries. CITATION: Cite instanceIds compared and unique findings per node.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceIds: {
+              Type: 'array',
+              Description: 'List of 2+ EC2 instance IDs to compare (e.g., ["i-aaa", "i-bbb"])',
+            },
+            compareFields: {
+              Type: 'string',
+              Description: 'What to compare: "errors", "config", "all" (default: "all")',
+            },
+          },
+          Required: ['instanceIds'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            commonFindings: { Type: 'array' },
+            uniqueFindings: { Type: 'object', Description: 'Map of instanceId → unique findings' },
+            insight: { Type: 'string' },
+          },
+        },
+      },
+      {
+        Name: 'batch_collect',
+        Description: 'Smart batch log collection with statistical sampling. Triages all nodes in a cluster, groups unhealthy nodes into buckets by failure signature, and collects from representative samples. Handles 1000+ node clusters efficiently. Use dryRun to preview before collecting. CITATION: Cite batchId, node count, and sampling strategy used.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            clusterName: {
+              Type: 'string',
+              Description: 'Name of the EKS cluster',
+            },
+            region: {
+              Type: 'string',
+              Description: 'AWS region of the cluster (auto-detected if omitted)',
+            },
+            filter: {
+              Type: 'string',
+              Description: 'Node filter: "all", "unhealthy", "notready" (default: "unhealthy")',
+            },
+            strategy: {
+              Type: 'string',
+              Description: '"sample" for smart sampling or "all" to collect from every filtered node (default: "sample")',
+            },
+            samplesPerBucket: {
+              Type: 'integer',
+              Description: 'Nodes to sample per failure bucket (default: 3, max: 5)',
+            },
+            maxTotalCollections: {
+              Type: 'integer',
+              Description: 'Hard cap on total collections (default: 15, max: 15)',
+            },
+            groupBy: {
+              Type: 'string',
+              Description: 'Grouping strategy: "auto", "az", "nodegroup", "instance-type", "ami" (default: "auto")',
+            },
+            dryRun: {
+              Type: 'boolean',
+              Description: 'Preview which nodes would be collected without starting (default: false)',
+            },
+          },
+          Required: ['clusterName'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            batchId: { Type: 'string' },
+            executions: { Type: 'array' },
+            totalNodes: { Type: 'integer' },
+            sampledNodes: { Type: 'integer' },
+            strategy: { Type: 'string' },
+            task: {
+              Type: 'object',
+              Description: 'Async task envelope — poll with batch_status using batchId',
+              Properties: {
+                taskId: { Type: 'string', Description: 'Same as batchId' },
+                state: { Type: 'string', Description: 'running|completed|failed' },
+                message: { Type: 'string' },
+                progress: { Type: 'integer', Description: '0-100 percent' },
+              },
+            },
+          },
+        },
+      },
+      {
+        Name: 'batch_status',
+        Description: 'Poll status of multiple log collections at once. Returns consolidated view with allComplete boolean. Use after batch_collect to wait for all collections to finish before running analysis tools. CITATION: Cite allComplete status and any failed executionIds.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            executionIds: {
+              Type: 'array',
+              Description: 'List of SSM execution IDs to poll (from batch_collect response)',
+            },
+            batchId: {
+              Type: 'string',
+              Description: 'Batch ID from batch_collect (alternative to executionIds — loads execution IDs automatically)',
+            },
+          },
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            allComplete: { Type: 'boolean' },
+            executions: { Type: 'array' },
+            successCount: { Type: 'integer' },
+            failedCount: { Type: 'integer' },
+            inProgressCount: { Type: 'integer' },
+          },
+        },
+      },
+      {
+        Name: 'network_diagnostics',
+        Description: 'Extract and structure networking info from collected log bundles. Parses iptables rules, CNI config, route tables, DNS resolution, ENI attachment status, and VPC CNI (aws-node/ipamd) logs. Returns structured data instead of raw text. CITATION: Cite instanceId and each section analyzed.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID to analyze networking for',
+            },
+            sections: {
+              Type: 'string',
+              Description: 'Comma-separated sections: "iptables,cni,routes,dns,eni,ipamd" or "all" (default: "all")',
+            },
+          },
+          Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            sections: { Type: 'object', Description: 'Map of section name → structured data' },
+            assessment: { Type: 'string' },
+            issues: { Type: 'array' },
+            confidence: { Type: 'string', Description: 'high|medium|low|none' },
+            gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+          },
+        },
       },
     ];
   }
@@ -853,6 +1218,7 @@ import zipfile
 import tarfile
 import io
 import os
+from datetime import datetime
 
 s3_client = boto3.client('s3')
 lambda_client = boto3.client('lambda')
@@ -950,6 +1316,49 @@ def trigger_findings_indexer(bucket, prefix, file_count):
     except Exception as e:
         print(f"Failed to trigger findings indexer: {str(e)}")
 
+def generate_manifest(bucket, prefix, extracted_files, archive_key, archive_size):
+    """Generate manifest.json with authoritative file inventory after extraction."""
+    try:
+        file_details = []
+        for file_key in extracted_files:
+            try:
+                head = s3_client.head_object(Bucket=bucket, Key=file_key)
+                relative_path = file_key.split('/extracted/')[-1] if '/extracted/' in file_key else file_key
+                file_details.append({
+                    'key': relative_path,
+                    'fullKey': file_key,
+                    'size': head['ContentLength'],
+                    'contentType': head.get('ContentType', 'application/octet-stream'),
+                })
+            except Exception:
+                file_details.append({
+                    'key': file_key.split('/extracted/')[-1] if '/extracted/' in file_key else file_key,
+                    'fullKey': file_key,
+                    'size': 0,
+                    'contentType': 'unknown',
+                })
+        
+        manifest = {
+            'version': 2,
+            'generatedAt': datetime.utcnow().isoformat() + 'Z',
+            'archiveKey': archive_key,
+            'archiveSize': archive_size,
+            'totalFiles': len(extracted_files),
+            'totalSize': sum(f['size'] for f in file_details),
+            'files': file_details,
+        }
+        
+        manifest_key = f"{prefix}manifest.json"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=manifest_key,
+            Body=json.dumps(manifest, default=str),
+            ContentType='application/json'
+        )
+        print(f"Wrote manifest.json to {manifest_key} ({len(extracted_files)} files)")
+    except Exception as e:
+        print(f"Warning: Failed to generate manifest.json: {str(e)}")
+
 def lambda_handler(event, context):
     print(f"Received event: {json.dumps(event)}")
     
@@ -980,6 +1389,9 @@ def lambda_handler(event, context):
                 extracted_files, prefix = extract_targz(bucket, key, content)
             
             print(f"Successfully extracted {len(extracted_files)} files from {key}")
+            
+            # Generate manifest.json with authoritative file inventory
+            generate_manifest(bucket, prefix, extracted_files, key, len(content))
             
             # Trigger findings indexer
             trigger_findings_indexer(bucket, prefix, len(extracted_files))
@@ -1198,17 +1610,83 @@ def lambda_handler(event, context):
         # Deduplicate
         deduplicated = deduplicate_findings(all_findings)
         
-        # Calculate summary
+        # False positive suppression (Phase 2.6)
+        FALSE_POSITIVE_SUPPRESSIONS = [
+            ('NXDOMAIN', r'health[-.]?check|readiness|liveness', 'Health check DNS lookup'),
+            ('OOMKilled', r'stress[-.]?test|load[-.]?test|chaos', 'Stress test pod'),
+            ('connection refused', r'127\\.0\\.0\\.1:10256.*healthz', 'kube-proxy local healthz'),
+            ('TLS handshake', r'kube-probe|health[-.]?check', 'Probe TLS handshake'),
+        ]
+        suppressed_count = 0
+        filtered = []
+        for f in deduplicated:
+            suppressed = False
+            pat = f.get('pattern', '')
+            ctx = f.get('sample', '')
+            for err_pat, fp_regex, reason in FALSE_POSITIVE_SUPPRESSIONS:
+                if err_pat.lower() in pat.lower():
+                    if re.search(fp_regex, ctx, re.IGNORECASE):
+                        suppressed = True
+                        suppressed_count += 1
+                        break
+            if not suppressed:
+                filtered.append(f)
+        deduplicated = filtered
+        
+        # Assign finding_ids
+        for idx, finding in enumerate(deduplicated):
+            finding['finding_id'] = f"F-{idx + 1:03d}"
+            # Add evidence wrapper (Phase 2.2)
+            finding['evidence'] = {
+                'source_file': finding.get('file', ''),
+                'full_key': finding.get('fullKey', ''),
+                'excerpt': finding.get('sample', '')[:500],
+                'line_range': {'start': finding.get('line', 0), 'end': finding.get('line', 0)},
+            }
+        
+        # Multi-signal confirmation for critical findings (Phase 2.5)
+        pattern_files = {}
+        for f in deduplicated:
+            p = f.get('pattern', '')
+            if p not in pattern_files:
+                pattern_files[p] = set()
+            pattern_files[p].add(f.get('file', ''))
+        for f in deduplicated:
+            if f.get('severity') == 'critical':
+                sources = list(pattern_files.get(f.get('pattern', ''), set()))
+                f['confirmation'] = {
+                    'signals': len(sources),
+                    'confirmed': len(sources) >= 2,
+                    'sources': sources[:5],
+                }
+                if len(sources) < 2:
+                    f['severity_note'] = 'Single-source critical finding. Verify with additional log sources.'
+        
+        # Calculate summary with 5-level severity
         summary = {
             'critical': len([f for f in deduplicated if f.get('severity') == 'critical']),
-            'warning': len([f for f in deduplicated if f.get('severity') == 'warning']),
+            'high': len([f for f in deduplicated if f.get('severity') in ('warning', 'high')]),
+            'medium': len([f for f in deduplicated if f.get('severity') == 'medium']),
+            'low': len([f for f in deduplicated if f.get('severity') == 'low']),
             'info': len([f for f in deduplicated if f.get('severity') == 'info']),
         }
         
-        # Write index file
+        # Build coverage block (Phase 2.2)
+        total_files_in_bundle = len(files_to_scan) + files_skipped
+        coverage = {
+            'files_scanned': len(files_to_scan),
+            'total_files': total_files_in_bundle,
+            'coverage_pct': round(len(files_to_scan) / max(total_files_in_bundle, 1) * 100, 1),
+            'files_skipped': files_skipped,
+            'suppressed_false_positives': suppressed_count,
+        }
+        
+        # Write index file (v2 schema)
         index_data = {
+            'index_version': 'v2',
             'indexedAt': datetime.utcnow().isoformat(),
             'prefix': prefix,
+            'coverage': coverage,
             'filesScanned': len(files_to_scan),
             'filesSkipped': files_skipped,
             'findings': deduplicated[:500],  # Limit stored findings
@@ -1291,17 +1769,27 @@ def deduplicate_findings(findings):
             seen[dedup_key] = {
                 **finding,
                 'count': 1,
-                'lines': [finding.get('line')]
+                'lines': [finding.get('line')],
+                'first_seen': finding.get('sample', '')[:50],
+                'last_seen': finding.get('sample', '')[:50],
             }
         else:
             seen[dedup_key]['count'] += 1
             if len(seen[dedup_key]['lines']) < 10:
                 seen[dedup_key]['lines'].append(finding.get('line'))
+            seen[dedup_key]['last_seen'] = finding.get('sample', '')[:50]
     
-    severity_order = {'critical': 0, 'warning': 1, 'info': 2}
+    # Map old severity names to 5-level
+    severity_map = {'warning': 'high'}
+    for entry in seen.values():
+        old_sev = entry.get('severity', 'info')
+        if old_sev in severity_map:
+            entry['severity'] = severity_map[old_sev]
+    
+    severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
     result = sorted(
         seen.values(),
-        key=lambda x: (severity_order.get(x.get('severity'), 3), -x.get('count', 0))
+        key=lambda x: (severity_order.get(x.get('severity'), 4), -x.get('count', 0))
     )
     
     return result
