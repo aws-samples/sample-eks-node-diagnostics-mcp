@@ -1,3 +1,0 @@
-Jan 15 10:00:00 ip-10-0-1-100 kubelet[1234]: TLS handshake error from 10.0.1.50:443: remote error: tls: bad certificate
-Jan 15 10:00:01 ip-10-0-1-100 kubelet[1234]: Failed to renew certificate: certificate has expired
-Jan 15 10:00:02 ip-10-0-1-100 kubelet[1234]: x509: certificate has expired or is not yet valid

@@ -1,3 +1,0 @@
-Jan 15 10:30:00 ip-10-0-1-100 kernel: memory cgroup out of memory: Kill process 4521 (java) score 1000 or sacrifice child
-Jan 15 10:30:00 ip-10-0-1-100 kernel: Killed process 4521 (java), UID 0, total-vm:8388608kB
-Jan 15 10:30:01 ip-10-0-1-100 containerd[1234]: container exited with code 137
