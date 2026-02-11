@@ -1,0 +1,50 @@
+{
+  "bundle_name": "oom_bundle",
+  "description": "OOM kill scenario: container exceeds memory limit, kernel invokes OOM killer",
+  "findings": [
+    {
+      "finding_id": "F-001",
+      "severity": "critical",
+      "pattern": "OOM killer invoked",
+      "source_file": "var/log/dmesg",
+      "excerpt_contains": "Out of memory: Killed process",
+      "confirmed": true
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "critical",
+      "pattern": "OOMKilled",
+      "source_file": "var/log/pods",
+      "excerpt_contains": "OOMKilled",
+      "confirmed": true
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "high",
+      "pattern": "memory cgroup out of memory",
+      "source_file": "var/log/messages",
+      "excerpt_contains": "memory cgroup out of memory"
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "high",
+      "pattern": "exit code 137",
+      "source_file": "var/log/containers",
+      "excerpt_contains": "exit code 137"
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "medium",
+      "pattern": "MemoryPressure",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "MemoryPressure"
+    }
+  ],
+  "expected_severity_summary": {
+    "critical": 2,
+    "high": 2,
+    "medium": 1,
+    "low": 0,
+    "info": 0
+  }
+}

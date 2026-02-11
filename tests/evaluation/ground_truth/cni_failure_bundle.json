@@ -1,0 +1,55 @@
+{
+  "bundle_name": "cni_failure_bundle",
+  "description": "VPC CNI failure: aws-node pod crash, ENI allocation failures, pod networking broken",
+  "findings": [
+    {
+      "finding_id": "F-001",
+      "severity": "critical",
+      "pattern": "plugin type=\"aws-cni\" failed",
+      "source_file": "var/log/aws-routed-eni",
+      "excerpt_contains": "plugin type=\"aws-cni\" failed"
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "critical",
+      "pattern": "NetworkNotReady",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "NetworkNotReady"
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "high",
+      "pattern": "failed to assign an IP address to container",
+      "source_file": "var/log/aws-routed-eni/ipamd.log",
+      "excerpt_contains": "failed to assign an IP address"
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "high",
+      "pattern": "CrashLoopBackOff",
+      "source_file": "var/log/pods",
+      "excerpt_contains": "aws-node"
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "medium",
+      "pattern": "ENI not found",
+      "source_file": "var/log/aws-routed-eni/ipamd.log",
+      "excerpt_contains": "ENI"
+    },
+    {
+      "finding_id": "F-006",
+      "severity": "medium",
+      "pattern": "failed to setup network for sandbox",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "failed to setup network"
+    }
+  ],
+  "expected_severity_summary": {
+    "critical": 2,
+    "high": 2,
+    "medium": 2,
+    "low": 0,
+    "info": 0
+  }
+}

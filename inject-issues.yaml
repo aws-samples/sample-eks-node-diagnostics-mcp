@@ -1,0 +1,438 @@
+---
+# Namespace for all injected issues
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chaos-testing
+---
+# =============================================================================
+# ISSUE 1: ImagePullBackOff — non-existent ECR image
+# Category F: Image Pull/Auth Issues
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-image-pull
+  namespace: chaos-testing
+  labels:
+    issue-type: image-pull
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bad-image-pull
+  template:
+    metadata:
+      labels:
+        app: bad-image-pull
+    spec:
+      containers:
+      - name: app
+        image: 466162272783.dkr.ecr.us-west-2.amazonaws.com/nonexistent-repo:v999
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 2: CrashLoopBackOff — container exits immediately
+# Category B: Worker Node Issues
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-loop
+  namespace: chaos-testing
+  labels:
+    issue-type: crash-loop
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: crash-loop
+  template:
+    metadata:
+      labels:
+        app: crash-loop
+    spec:
+      containers:
+      - name: crasher
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sh", "-c", "echo 'OOMKilled simulation - memory pressure detected'; exit 137"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 3: OOMKilled — container exceeds memory limit
+# Category B: Worker Node Issues (OOM)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-killed
+  namespace: chaos-testing
+  labels:
+    issue-type: oom
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: oom-killed
+  template:
+    metadata:
+      labels:
+        app: oom-killed
+    spec:
+      containers:
+      - name: oom
+        image: public.ecr.aws/docker/library/python:3.11-slim
+        command: ["python3", "-c", "x = [bytearray(10*1024*1024) for _ in range(100)]"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            memory: 32Mi
+---
+# =============================================================================
+# ISSUE 4: Pending — impossible resource request (scheduling failure)
+# Category E: Scheduling Constraints
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unschedulable-cpu
+  namespace: chaos-testing
+  labels:
+    issue-type: scheduling
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: unschedulable-cpu
+  template:
+    metadata:
+      labels:
+        app: unschedulable-cpu
+    spec:
+      containers:
+      - name: hungry
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: "64"
+            memory: 128Gi
+---
+# =============================================================================
+# ISSUE 5: NodeSelector mismatch — no nodes match
+# Category E: Scheduling Constraints
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-node-selector
+  namespace: chaos-testing
+  labels:
+    issue-type: scheduling
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bad-node-selector
+  template:
+    metadata:
+      labels:
+        app: bad-node-selector
+    spec:
+      nodeSelector:
+        gpu-type: nvidia-a100
+        kubernetes.io/arch: arm64
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 6: FailedMount — non-existent PVC
+# Category A: Volume/CSI Mount Issues
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ghost-volume
+  namespace: chaos-testing
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2-nonexistent
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: failed-mount
+  namespace: chaos-testing
+  labels:
+    issue-type: volume
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: failed-mount
+  template:
+    metadata:
+      labels:
+        app: failed-mount
+    spec:
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: ghost-volume
+---
+# =============================================================================
+# ISSUE 7: DNS resolution failure — bad external dependency
+# Category G: DNS/CoreDNS Issues
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-failure
+  namespace: chaos-testing
+  labels:
+    issue-type: dns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: dns-failure
+  template:
+    metadata:
+      labels:
+        app: dns-failure
+    spec:
+      containers:
+      - name: dns-test
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sh", "-c", "while true; do nslookup this-domain-does-not-exist-xyz123.internal 2>&1; nslookup also-fake-service.chaos-testing.svc.cluster.local 2>&1; sleep 5; done"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 8: CreateContainerConfigError — missing secret reference
+# Category H: Secrets/KMS/Webhook/Admission
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: missing-secret
+  namespace: chaos-testing
+  labels:
+    issue-type: secrets
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: missing-secret
+  template:
+    metadata:
+      labels:
+        app: missing-secret
+    spec:
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: production-db-credentials
+              key: password
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 9: Missing ConfigMap — CreateContainerConfigError
+# Category H: Secrets/KMS/Webhook/Admission
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: missing-configmap
+  namespace: chaos-testing
+  labels:
+    issue-type: config
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: missing-configmap
+  template:
+    metadata:
+      labels:
+        app: missing-configmap
+    spec:
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        envFrom:
+        - configMapRef:
+            name: app-config-that-doesnt-exist
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 10: Readiness/Liveness probe failures
+# Category B: Worker Node Issues
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe-failures
+  namespace: chaos-testing
+  labels:
+    issue-type: probes
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: probe-failures
+  template:
+    metadata:
+      labels:
+        app: probe-failures
+    spec:
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sh", "-c", "sleep 3600"]
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 11: Connection refused — service pointing to wrong port
+# Category C: CNI/Networking Issues
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: broken-service
+  namespace: chaos-testing
+spec:
+  selector:
+    app: probe-failures
+  ports:
+  - port: 80
+    targetPort: 9999
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connection-refused
+  namespace: chaos-testing
+  labels:
+    issue-type: networking
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: connection-refused
+  template:
+    metadata:
+      labels:
+        app: connection-refused
+    spec:
+      containers:
+      - name: client
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sh", "-c", "while true; do wget -q -T 3 -O- http://broken-service.chaos-testing.svc.cluster.local/api 2>&1 || true; sleep 5; done"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+---
+# =============================================================================
+# ISSUE 12: Taint/Toleration mismatch
+# Category E: Scheduling Constraints
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taint-mismatch
+  namespace: chaos-testing
+  labels:
+    issue-type: scheduling
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: taint-mismatch
+  template:
+    metadata:
+      labels:
+        app: taint-mismatch
+    spec:
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "gpu-workload"
+        effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role
+                operator: In
+                values:
+                - gpu
+      containers:
+      - name: app
+        image: public.ecr.aws/docker/library/busybox:latest
+        command: ["sleep", "3600"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi

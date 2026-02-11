@@ -1,0 +1,48 @@
+{
+  "bundle_name": "cert_expiry_bundle",
+  "description": "Certificate expiry: kubelet cert expired, API server connection failures",
+  "findings": [
+    {
+      "finding_id": "F-001",
+      "severity": "critical",
+      "pattern": "certificate has expired",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "certificate has expired"
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "critical",
+      "pattern": "x509: certificate has expired or is not yet valid",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "x509"
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "high",
+      "pattern": "Unable to connect to the server",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "Unable to connect to the server"
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "high",
+      "pattern": "TLS handshake error",
+      "source_file": "var/log/messages",
+      "excerpt_contains": "TLS handshake"
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "medium",
+      "pattern": "NodeNotReady",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "NodeNotReady"
+    }
+  ],
+  "expected_severity_summary": {
+    "critical": 2,
+    "high": 2,
+    "medium": 1,
+    "low": 0,
+    "info": 0
+  }
+}

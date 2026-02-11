@@ -2194,6 +2194,8 @@ def lambda_handler(event, context):
         'batch_collect': batch_collect,
         'batch_status': batch_status,
         'network_diagnostics': network_diagnostics,
+        'tcpdump_capture': tcpdump_capture,
+        'tcpdump_analyze': tcpdump_analyze,
     }
     
     if tool_name not in tools:
@@ -5159,3 +5161,560 @@ def _network_assessment(issues: List[Dict]) -> str:
         sections = set(i['section'] for i in critical)
         return f"CRITICAL — {len(critical)} critical networking issues in: {', '.join(sections)}. Immediate investigation needed."
     return f"WARNING — {len(issues)} non-critical networking issues found. Review recommended."
+
+
+# =============================================================================
+# TCPDUMP CAPTURE VIA SSM RUN COMMAND
+# =============================================================================
+
+def tcpdump_capture(arguments: Dict) -> Dict:
+    """
+    Run tcpdump on an EKS worker node via SSM Run Command for a specified duration,
+    then upload the pcap file to S3.
+
+    Inputs:
+        instanceId: EC2 instance ID (required)
+        durationSeconds: Capture duration in seconds (default: 120, max: 300)
+        interface: Network interface to capture on (default: "any")
+        filter: BPF filter expression (e.g., "port 443", "host 10.0.0.1") (optional)
+        region: AWS region where the instance runs (optional, auto-detected)
+
+    Returns:
+        commandId for async polling, or capture results if already complete
+    """
+    instance_id = arguments.get('instanceId')
+    if not instance_id:
+        return error_response(400, 'instanceId is required')
+
+    if not re.match(r'^i-[0-9a-f]{8,17}$', instance_id):
+        return error_response(400, f'Invalid instanceId format: {instance_id}')
+
+    duration = int(arguments.get('durationSeconds', 120))
+    if duration < 10 or duration > 300:
+        return error_response(400, 'durationSeconds must be between 10 and 300')
+
+    interface = arguments.get('interface', 'any')
+    # Sanitize interface name to prevent injection
+    if not re.match(r'^[a-zA-Z0-9\-\.]+$', interface):
+        return error_response(400, f'Invalid interface name: {interface}')
+
+    bpf_filter = arguments.get('filter', '')
+    # Basic sanitization: reject shell metacharacters
+    if bpf_filter and re.search(r'[;&|`$(){}]', bpf_filter):
+        return error_response(400, 'filter contains invalid characters')
+
+    # Check if this is a status poll for an existing command
+    command_id = arguments.get('commandId')
+    if command_id:
+        return _poll_tcpdump_status(command_id, instance_id, arguments)
+
+    target_region = resolve_region(arguments, instance_id)
+
+    try:
+        regional_ssm = get_regional_client('ssm', target_region)
+    except Exception as e:
+        return error_response(500, f'Failed to create SSM client for region {target_region}: {str(e)}')
+
+    # Build the shell script that runs tcpdump and uploads to S3
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    s3_prefix = f"tcpdump/{instance_id}/{timestamp}"
+    s3_key = f"{s3_prefix}/capture.pcap"
+    s3_key_txt = f"{s3_prefix}/capture_summary.txt"
+    s3_key_stats = f"{s3_prefix}/capture_stats.json"
+    s3_uri = f"s3://{LOGS_BUCKET}/{s3_key}"
+    s3_uri_txt = f"s3://{LOGS_BUCKET}/{s3_key_txt}"
+    s3_uri_stats = f"s3://{LOGS_BUCKET}/{s3_key_stats}"
+
+    filter_clause = f' {bpf_filter}' if bpf_filter else ''
+
+    script = f"""#!/bin/bash
+set -euo pipefail
+
+PCAP_FILE="/tmp/tcpdump_capture_{timestamp}.pcap"
+TXT_FILE="/tmp/tcpdump_summary_{timestamp}.txt"
+STATS_FILE="/tmp/tcpdump_stats_{timestamp}.json"
+
+# Check if tcpdump is available
+if ! command -v tcpdump &>/dev/null; then
+    echo "ERROR: tcpdump not found. Installing..."
+    if command -v yum &>/dev/null; then
+        yum install -y tcpdump 2>/dev/null || {{ echo "FATAL: Failed to install tcpdump"; exit 1; }}
+    elif command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y tcpdump 2>/dev/null || {{ echo "FATAL: Failed to install tcpdump"; exit 1; }}
+    else
+        echo "FATAL: No package manager found to install tcpdump"
+        exit 1
+    fi
+fi
+
+echo "Starting tcpdump capture on interface '{interface}' for {duration}s..."
+echo "Filter: '{bpf_filter or 'none'}'"
+echo "Output: $PCAP_FILE"
+
+# Run tcpdump with timeout
+timeout {duration} tcpdump -i {interface} -w "$PCAP_FILE" -c 100000{filter_clause} 2>&1 || true
+
+# Verify capture file exists and has data
+if [ ! -f "$PCAP_FILE" ]; then
+    echo "FATAL: Capture file not created"
+    exit 1
+fi
+
+FILE_SIZE=$(stat -c%s "$PCAP_FILE" 2>/dev/null || stat -f%z "$PCAP_FILE" 2>/dev/null || echo "0")
+echo "Capture complete. File size: $FILE_SIZE bytes"
+
+if [ "$FILE_SIZE" -eq 0 ]; then
+    echo "WARNING: Capture file is empty — no packets matched the filter"
+fi
+
+# Decode pcap to human-readable text summary (first 2000 packets max)
+echo "Decoding pcap to text summary..."
+tcpdump -nn -r "$PCAP_FILE" 2>/dev/null | head -5000 > "$TXT_FILE" || true
+TXT_SIZE=$(stat -c%s "$TXT_FILE" 2>/dev/null || stat -f%z "$TXT_FILE" 2>/dev/null || echo "0")
+PACKET_COUNT=$(wc -l < "$TXT_FILE" 2>/dev/null || echo "0")
+echo "Decoded $PACKET_COUNT packets to text"
+
+# Generate stats JSON with protocol breakdown and top talkers
+echo "Generating capture statistics..."
+cat > /tmp/gen_stats_{timestamp}.sh << 'STATSEOF'
+#!/bin/bash
+PCAP="$1"
+OUT="$2"
+TOTAL=$(tcpdump -nn -r "$PCAP" 2>/dev/null | wc -l)
+TCP_COUNT=$(tcpdump -nn -r "$PCAP" tcp 2>/dev/null | wc -l)
+UDP_COUNT=$(tcpdump -nn -r "$PCAP" udp 2>/dev/null | wc -l)
+ICMP_COUNT=$(tcpdump -nn -r "$PCAP" icmp 2>/dev/null | wc -l)
+ARP_COUNT=$(tcpdump -nn -r "$PCAP" arp 2>/dev/null | wc -l)
+DNS_COUNT=$(tcpdump -nn -r "$PCAP" 'port 53' 2>/dev/null | wc -l)
+HTTPS_COUNT=$(tcpdump -nn -r "$PCAP" 'port 443' 2>/dev/null | wc -l)
+HTTP_COUNT=$(tcpdump -nn -r "$PCAP" 'port 80' 2>/dev/null | wc -l)
+SYN_COUNT=$(tcpdump -nn -r "$PCAP" 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | wc -l)
+RST_COUNT=$(tcpdump -nn -r "$PCAP" 'tcp[tcpflags] & (tcp-rst) != 0' 2>/dev/null | wc -l)
+RETRANS=$(tcpdump -nn -r "$PCAP" 2>/dev/null | grep -ci 'retransmit\|retrans' || echo "0")
+# Top source IPs
+TOP_SRC=$(tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{{print $3}}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -10 | awk '{{printf "    \\"%s\\": %s,\\n", $2, $1}}' | sed '$ s/,$//')
+# Top destination IPs
+TOP_DST=$(tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{{print $5}}' | sed 's/:$//' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -10 | awk '{{printf "    \\"%s\\": %s,\\n", $2, $1}}' | sed '$ s/,$//')
+cat > "$OUT" << JSONEOF
+{{
+  "totalPackets": $TOTAL,
+  "protocols": {{
+    "tcp": $TCP_COUNT,
+    "udp": $UDP_COUNT,
+    "icmp": $ICMP_COUNT,
+    "arp": $ARP_COUNT
+  }},
+  "ports": {{
+    "dns_53": $DNS_COUNT,
+    "http_80": $HTTP_COUNT,
+    "https_443": $HTTPS_COUNT
+  }},
+  "tcpFlags": {{
+    "syn": $SYN_COUNT,
+    "rst": $RST_COUNT
+  }},
+  "possibleRetransmits": $RETRANS,
+  "topSourceIPs": {{
+$TOP_SRC
+  }},
+  "topDestinationIPs": {{
+$TOP_DST
+  }}
+}}
+JSONEOF
+STATSEOF
+chmod +x /tmp/gen_stats_{timestamp}.sh
+/tmp/gen_stats_{timestamp}.sh "$PCAP_FILE" "$STATS_FILE" 2>/dev/null || echo '{{"error":"stats generation failed"}}' > "$STATS_FILE"
+
+# Upload all artifacts to S3
+echo "Uploading pcap to {s3_uri}..."
+aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet
+echo "Uploading text summary to {s3_uri_txt}..."
+aws s3 cp "$TXT_FILE" "{s3_uri_txt}" --quiet
+echo "Uploading stats to {s3_uri_stats}..."
+aws s3 cp "$STATS_FILE" "{s3_uri_stats}" --quiet
+
+echo "Upload complete."
+echo "S3_KEY={s3_key}"
+echo "S3_KEY_TXT={s3_key_txt}"
+echo "S3_KEY_STATS={s3_key_stats}"
+echo "FILE_SIZE=$FILE_SIZE"
+echo "PACKET_COUNT=$PACKET_COUNT"
+
+# Cleanup
+rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" /tmp/gen_stats_{timestamp}.sh
+echo "DONE"
+"""
+
+    try:
+        response = regional_ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={
+                'commands': [script],
+                'executionTimeout': [str(duration + 120)],  # extra buffer for install + upload
+            },
+            TimeoutSeconds=duration + 180,
+            Comment=f'tcpdump capture for {instance_id} ({duration}s)',
+        )
+
+        cmd_id = response['Command']['CommandId']
+
+        # Store region mapping for status polling
+        try:
+            s3_client.put_object(
+                Bucket=LOGS_BUCKET,
+                Key=f"tcpdump-commands/{cmd_id}.json",
+                Body=json.dumps({
+                    'commandId': cmd_id,
+                    'instanceId': instance_id,
+                    'region': target_region,
+                    's3Key': s3_key,
+                    's3KeyTxt': s3_key_txt,
+                    's3KeyStats': s3_key_stats,
+                    's3Prefix': s3_prefix,
+                    'durationSeconds': duration,
+                    'interface': interface,
+                    'filter': bpf_filter,
+                    'startedAt': timestamp,
+                }),
+            )
+        except Exception:
+            pass  # Non-fatal
+
+        return success_response({
+            'message': f'tcpdump capture started ({duration}s)',
+            'commandId': cmd_id,
+            'instanceId': instance_id,
+            'region': target_region,
+            'durationSeconds': duration,
+            'interface': interface,
+            'filter': bpf_filter or 'none',
+            's3Key': s3_key,
+            's3KeyTxt': s3_key_txt,
+            's3KeyStats': s3_key_stats,
+            's3Bucket': LOGS_BUCKET,
+            'estimatedCompletionSeconds': duration + 30,
+            'nextStep': f'Poll with tcpdump_capture(commandId="{cmd_id}", instanceId="{instance_id}") after ~{duration + 30}s. Once complete, use tcpdump_analyze(instanceId="{instance_id}", commandId="{cmd_id}") to read the decoded packet summary.',
+            'task': {
+                'taskId': cmd_id,
+                'state': 'running',
+                'message': f'tcpdump running for {duration}s on {interface}',
+                'progress': 0,
+            },
+        })
+
+    except Exception as e:
+        return error_response(500, f'Failed to start tcpdump: {str(e)}')
+
+
+def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> Dict:
+    """Poll the status of a tcpdump SSM Run Command."""
+
+    # Try to load stored metadata
+    metadata = {}
+    try:
+        meta_resp = s3_client.get_object(
+            Bucket=LOGS_BUCKET,
+            Key=f"tcpdump-commands/{command_id}.json",
+        )
+        metadata = json.loads(meta_resp['Body'].read().decode('utf-8'))
+    except Exception:
+        pass
+
+    target_region = metadata.get('region') or resolve_region(arguments, instance_id)
+
+    try:
+        regional_ssm = get_regional_client('ssm', target_region)
+        result = regional_ssm.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id,
+        )
+
+        status = result.get('Status', 'Unknown')
+        stdout = result.get('StandardOutputContent', '')
+        stderr = result.get('StandardErrorContent', '')
+
+        # Parse output for S3 key and file size
+        s3_key = metadata.get('s3Key', '')
+        s3_key_txt = metadata.get('s3KeyTxt', '')
+        s3_key_stats = metadata.get('s3KeyStats', '')
+        file_size = 0
+        packet_count = 0
+        for line in stdout.split('\n'):
+            if line.startswith('S3_KEY='):
+                s3_key = line.split('=', 1)[1].strip()
+            if line.startswith('S3_KEY_TXT='):
+                s3_key_txt = line.split('=', 1)[1].strip()
+            if line.startswith('S3_KEY_STATS='):
+                s3_key_stats = line.split('=', 1)[1].strip()
+            if line.startswith('FILE_SIZE='):
+                try:
+                    file_size = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    pass
+            if line.startswith('PACKET_COUNT='):
+                try:
+                    packet_count = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    pass
+
+        if status in ('Success',):
+            # Generate presigned URL for download
+            presigned_url = ''
+            try:
+                presigned_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': LOGS_BUCKET, 'Key': s3_key},
+                    ExpiresIn=3600,
+                )
+            except Exception:
+                pass
+
+            return success_response({
+                'commandId': command_id,
+                'instanceId': instance_id,
+                'status': 'completed',
+                's3Key': s3_key,
+                's3KeyTxt': s3_key_txt,
+                's3KeyStats': s3_key_stats,
+                's3Bucket': LOGS_BUCKET,
+                'fileSizeBytes': file_size,
+                'fileSizeHuman': format_bytes(file_size),
+                'packetCount': packet_count,
+                'presignedUrl': presigned_url,
+                'presignedUrlExpiresIn': '1 hour',
+                'output': stdout[-2000:] if len(stdout) > 2000 else stdout,
+                'nextStep': f'Use tcpdump_analyze(instanceId="{instance_id}", commandId="{command_id}") to read decoded packet data and statistics.',
+                'task': {
+                    'taskId': command_id,
+                    'state': 'completed',
+                    'message': f'tcpdump capture uploaded to s3://{LOGS_BUCKET}/{s3_key}',
+                    'progress': 100,
+                },
+            })
+
+        elif status in ('InProgress', 'Pending', 'Delayed'):
+            elapsed = 0
+            duration = metadata.get('durationSeconds', 120)
+            if metadata.get('startedAt'):
+                try:
+                    start_dt = datetime.strptime(metadata['startedAt'], '%Y%m%dT%H%M%SZ')
+                    elapsed = (datetime.utcnow() - start_dt).total_seconds()
+                except Exception:
+                    pass
+            progress = min(95, int((elapsed / (duration + 30)) * 100)) if duration else 0
+
+            return success_response({
+                'commandId': command_id,
+                'instanceId': instance_id,
+                'status': 'in_progress',
+                'elapsedSeconds': int(elapsed),
+                'durationSeconds': duration,
+                'nextStep': f'Poll again in 15-30 seconds',
+                'task': {
+                    'taskId': command_id,
+                    'state': 'running',
+                    'message': f'tcpdump capture in progress ({int(elapsed)}s / {duration}s)',
+                    'progress': progress,
+                },
+            })
+
+        else:
+            # Failed / TimedOut / Cancelled
+            return error_response(500, f'tcpdump command {status}', {
+                'commandId': command_id,
+                'status': status,
+                'stdout': stdout[-2000:] if stdout else '',
+                'stderr': stderr[-2000:] if stderr else '',
+                'statusDetails': result.get('StatusDetails', ''),
+                'task': {
+                    'taskId': command_id,
+                    'state': 'failed',
+                    'message': f'tcpdump command {status}: {stderr[:200] if stderr else "unknown error"}',
+                    'progress': 0,
+                },
+            })
+
+    except Exception as e:
+        return error_response(500, f'Failed to poll tcpdump status: {str(e)}')
+
+
+def tcpdump_analyze(arguments: Dict) -> Dict:
+    """
+    Read and analyze a completed tcpdump capture from S3.
+    Returns decoded packet text, protocol statistics, and top talkers.
+
+    Inputs:
+        instanceId: EC2 instance ID (required)
+        commandId: SSM Command ID from tcpdump_capture (optional — finds latest if omitted)
+        section: "summary" (first N packets decoded), "stats" (protocol breakdown), "all" (default: "all")
+        maxPackets: Max decoded packet lines to return (default: 500, max: 3000)
+        filter: Text filter to apply on decoded lines (e.g., "SYN", "RST", "10.0.0.5")
+
+    Returns:
+        Decoded packet text, protocol stats, top talkers, and anomaly indicators
+    """
+    instance_id = arguments.get('instanceId')
+    if not instance_id:
+        return error_response(400, 'instanceId is required')
+
+    command_id = arguments.get('commandId')
+    section = arguments.get('section', 'all')
+    max_packets = min(int(arguments.get('maxPackets', 500)), 3000)
+    text_filter = arguments.get('filter', '')
+
+    # Find the capture metadata
+    metadata = {}
+    if command_id:
+        try:
+            meta_resp = s3_client.get_object(
+                Bucket=LOGS_BUCKET,
+                Key=f"tcpdump-commands/{command_id}.json",
+            )
+            metadata = json.loads(meta_resp['Body'].read().decode('utf-8'))
+        except Exception:
+            pass
+
+    # If no commandId, find the latest capture for this instance
+    if not metadata:
+        try:
+            list_resp = safe_s3_list(f"tcpdump-commands/", max_keys=200)
+            if list_resp.get('success'):
+                candidates = []
+                for obj in list_resp.get('objects', []):
+                    try:
+                        r = s3_client.get_object(Bucket=LOGS_BUCKET, Key=obj['key'])
+                        m = json.loads(r['Body'].read().decode('utf-8'))
+                        if m.get('instanceId') == instance_id:
+                            candidates.append(m)
+                    except Exception:
+                        continue
+                if candidates:
+                    # Sort by startedAt descending
+                    candidates.sort(key=lambda x: x.get('startedAt', ''), reverse=True)
+                    metadata = candidates[0]
+        except Exception:
+            pass
+
+    if not metadata:
+        return error_response(404, f'No tcpdump capture found for {instance_id}. Run tcpdump_capture first.')
+
+    s3_key_txt = metadata.get('s3KeyTxt', '')
+    s3_key_stats = metadata.get('s3KeyStats', '')
+    s3_key_pcap = metadata.get('s3Key', '')
+
+    results = {
+        'instanceId': instance_id,
+        'commandId': metadata.get('commandId', command_id or 'unknown'),
+        'captureInfo': {
+            'interface': metadata.get('interface', 'unknown'),
+            'filter': metadata.get('filter', 'none'),
+            'durationSeconds': metadata.get('durationSeconds', 0),
+            'startedAt': metadata.get('startedAt', 'unknown'),
+        },
+    }
+
+    # Read stats
+    if section in ('stats', 'all'):
+        stats = {}
+        if s3_key_stats:
+            try:
+                resp = safe_s3_read(s3_key_stats, max_size=65536)
+                if resp.get('success') and resp.get('content'):
+                    stats = json.loads(resp['content'])
+            except (json.JSONDecodeError, Exception):
+                stats = {'error': 'Could not parse stats JSON'}
+        else:
+            stats = {'error': 'No stats file found — capture may still be in progress'}
+
+        results['statistics'] = stats
+
+        # Anomaly detection from stats
+        anomalies = []
+        if isinstance(stats, dict) and 'totalPackets' in stats:
+            total = stats.get('totalPackets', 0)
+            rst_count = stats.get('tcpFlags', {}).get('rst', 0)
+            syn_count = stats.get('tcpFlags', {}).get('syn', 0)
+            retrans = stats.get('possibleRetransmits', 0)
+
+            if total > 0:
+                rst_pct = (rst_count / total) * 100
+                if rst_pct > 5:
+                    anomalies.append({
+                        'type': 'high_rst_rate',
+                        'severity': 'warning' if rst_pct < 15 else 'critical',
+                        'message': f'{rst_pct:.1f}% of packets are TCP RST ({rst_count}/{total}) — possible connection rejection or firewall drops',
+                    })
+                if retrans > 0:
+                    retrans_pct = (retrans / total) * 100
+                    anomalies.append({
+                        'type': 'retransmissions',
+                        'severity': 'warning' if retrans_pct < 5 else 'critical',
+                        'message': f'{retrans} possible retransmissions detected ({retrans_pct:.1f}%) — network congestion or packet loss',
+                    })
+                if syn_count > 0 and rst_count > syn_count * 0.5:
+                    anomalies.append({
+                        'type': 'syn_rst_ratio',
+                        'severity': 'warning',
+                        'message': f'High RST-to-SYN ratio ({rst_count} RST vs {syn_count} SYN) — many connections being refused',
+                    })
+                icmp_count = stats.get('protocols', {}).get('icmp', 0)
+                if icmp_count > total * 0.1:
+                    anomalies.append({
+                        'type': 'high_icmp',
+                        'severity': 'info',
+                        'message': f'{icmp_count} ICMP packets ({(icmp_count/total)*100:.1f}%) — possible ping flood or unreachable destinations',
+                    })
+
+        results['anomalies'] = anomalies
+
+    # Read decoded text summary
+    if section in ('summary', 'all'):
+        decoded_lines = []
+        if s3_key_txt:
+            try:
+                resp = safe_s3_read(s3_key_txt, max_size=2 * 1024 * 1024)  # 2MB max
+                if resp.get('success') and resp.get('content'):
+                    all_lines = resp['content'].split('\n')
+
+                    # Apply text filter if provided
+                    if text_filter:
+                        pattern = re.compile(re.escape(text_filter), re.IGNORECASE)
+                        all_lines = [l for l in all_lines if pattern.search(l)]
+
+                    total_lines = len(all_lines)
+                    decoded_lines = all_lines[:max_packets]
+
+                    results['decodedPackets'] = {
+                        'lines': decoded_lines,
+                        'totalPackets': total_lines,
+                        'returnedPackets': len(decoded_lines),
+                        'truncated': total_lines > max_packets,
+                        'filter': text_filter or 'none',
+                    }
+                else:
+                    results['decodedPackets'] = {'error': 'Text summary file is empty or unreadable'}
+            except Exception as e:
+                results['decodedPackets'] = {'error': f'Failed to read text summary: {str(e)}'}
+        else:
+            results['decodedPackets'] = {'error': 'No text summary file found — capture may still be in progress'}
+
+    # Presigned URL for pcap download
+    if s3_key_pcap:
+        try:
+            results['pcapDownloadUrl'] = s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': LOGS_BUCKET, 'Key': s3_key_pcap},
+                ExpiresIn=3600,
+            )
+            results['pcapDownloadUrlExpiresIn'] = '1 hour'
+        except Exception:
+            pass
+
+    results['s3Bucket'] = LOGS_BUCKET
+    results['s3KeyPcap'] = s3_key_pcap
+    results['s3KeyTxt'] = s3_key_txt
+    results['s3KeyStats'] = s3_key_stats
+
+    return success_response(results)

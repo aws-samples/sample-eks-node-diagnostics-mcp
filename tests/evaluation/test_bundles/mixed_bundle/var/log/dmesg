@@ -1,0 +1,2 @@
+[  100.000001] Out of memory: Killed process 5000 (python3) total-vm:4194304kB, anon-rss:2097152kB
+[  100.000002] oom_reaper: reaped process 5000 (python3)

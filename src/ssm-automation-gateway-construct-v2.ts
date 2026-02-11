@@ -312,6 +312,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         'ssm:DescribeAutomationExecutions',
         'ssm:StopAutomationExecution',
         'ssm:DescribeInstanceInformation',
+        'ssm:SendCommand',
+        'ssm:GetCommandInvocation',
         'ssm:ListCommands',
         'ssm:ListCommandInvocations',
       ],
@@ -1201,6 +1203,108 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             issues: { Type: 'array' },
             confidence: { Type: 'string', Description: 'high|medium|low|none' },
             gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+          },
+        },
+      },
+      {
+        Name: 'tcpdump_capture',
+        Description: 'Run tcpdump on an EKS worker node via SSM Run Command for a specified duration (default 2 minutes), then upload the pcap file to S3. Returns immediately with a commandId for async polling. Call again with commandId to check status and get the S3 location / presigned download URL. CITATION: Cite commandId, instanceId, and s3Key.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID of the EKS worker node (e.g., i-0123456789abcdef0)',
+            },
+            durationSeconds: {
+              Type: 'integer',
+              Description: 'Capture duration in seconds (default: 120, min: 10, max: 300)',
+            },
+            interface: {
+              Type: 'string',
+              Description: 'Network interface to capture on (default: "any"). Use "eth0", "eni+", etc.',
+            },
+            filter: {
+              Type: 'string',
+              Description: 'BPF filter expression (e.g., "port 443", "host 10.0.0.1 and port 80")',
+            },
+            commandId: {
+              Type: 'string',
+              Description: 'SSM Command ID from a previous tcpdump_capture call — pass this to poll status',
+            },
+            region: {
+              Type: 'string',
+              Description: 'AWS region where the instance runs (optional, auto-detected)',
+            },
+          },
+          Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            commandId: { Type: 'string', Description: 'SSM Run Command ID for polling' },
+            instanceId: { Type: 'string' },
+            status: { Type: 'string', Description: 'in_progress | completed | failed' },
+            s3Key: { Type: 'string', Description: 'S3 key of the uploaded pcap file' },
+            s3Bucket: { Type: 'string' },
+            fileSizeBytes: { Type: 'integer' },
+            fileSizeHuman: { Type: 'string' },
+            presignedUrl: { Type: 'string', Description: 'Presigned download URL (1 hour expiry)' },
+            task: {
+              Type: 'object',
+              Description: 'Async task envelope for polling',
+              Properties: {
+                taskId: { Type: 'string', Description: 'Same as commandId' },
+                state: { Type: 'string', Description: 'running|completed|failed' },
+                message: { Type: 'string' },
+                progress: { Type: 'integer', Description: '0-100 percent' },
+              },
+            },
+          },
+        },
+      },
+      {
+        Name: 'tcpdump_analyze',
+        Description: 'Read and analyze a completed tcpdump capture from S3. Returns decoded packet text (human-readable), protocol statistics (TCP/UDP/ICMP breakdown), top source/destination IPs, and anomaly detection (high RST rate, retransmissions, SYN floods). Use after tcpdump_capture completes. Supports text filtering to search for specific IPs, ports, or flags in the decoded output. CITATION: Cite commandId, packet count, and any anomalies found.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID (e.g., i-0123456789abcdef0)',
+            },
+            commandId: {
+              Type: 'string',
+              Description: 'SSM Command ID from tcpdump_capture. If omitted, returns the latest capture for this instance.',
+            },
+            section: {
+              Type: 'string',
+              Description: '"summary" (decoded packets), "stats" (protocol breakdown + anomalies), "all" (default: "all")',
+            },
+            maxPackets: {
+              Type: 'integer',
+              Description: 'Max decoded packet lines to return (default: 500, max: 3000)',
+            },
+            filter: {
+              Type: 'string',
+              Description: 'Text filter on decoded lines (e.g., "SYN", "RST", "10.0.0.5", "port 443")',
+            },
+          },
+          Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            commandId: { Type: 'string' },
+            captureInfo: { Type: 'object', Description: 'interface, filter, duration, startedAt' },
+            statistics: { Type: 'object', Description: 'totalPackets, protocols (tcp/udp/icmp/arp), ports (dns/http/https), tcpFlags (syn/rst), topSourceIPs, topDestinationIPs' },
+            anomalies: { Type: 'array', Description: 'Detected anomalies: high_rst_rate, retransmissions, syn_rst_ratio, high_icmp' },
+            decodedPackets: { Type: 'object', Description: 'lines (array of decoded packet strings), totalPackets, returnedPackets, truncated, filter' },
+            pcapDownloadUrl: { Type: 'string', Description: 'Presigned URL to download the raw pcap file (1 hour expiry)' },
+            s3KeyPcap: { Type: 'string' },
+            s3KeyTxt: { Type: 'string' },
+            s3KeyStats: { Type: 'string' },
           },
         },
       },

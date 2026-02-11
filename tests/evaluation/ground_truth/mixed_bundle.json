@@ -1,0 +1,62 @@
+{
+  "bundle_name": "mixed_bundle",
+  "description": "Multiple issue types: OOM + DNS failures + disk pressure",
+  "findings": [
+    {
+      "finding_id": "F-001",
+      "severity": "critical",
+      "pattern": "OOM killer invoked",
+      "source_file": "var/log/dmesg",
+      "excerpt_contains": "Out of memory"
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "high",
+      "pattern": "NXDOMAIN",
+      "source_file": "var/log/containers",
+      "excerpt_contains": "NXDOMAIN"
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "high",
+      "pattern": "DiskPressure",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "DiskPressure"
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "high",
+      "pattern": "Evicted",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "Evicted"
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "medium",
+      "pattern": "failed to garbage collect",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "garbage collect"
+    },
+    {
+      "finding_id": "F-006",
+      "severity": "low",
+      "pattern": "connection refused",
+      "source_file": "var/log/containers",
+      "excerpt_contains": "connection refused"
+    },
+    {
+      "finding_id": "F-007",
+      "severity": "info",
+      "pattern": "node allocatable enforced",
+      "source_file": "var/log/kubelet.log",
+      "excerpt_contains": "allocatable"
+    }
+  ],
+  "expected_severity_summary": {
+    "critical": 1,
+    "high": 3,
+    "medium": 1,
+    "low": 1,
+    "info": 1
+  }
+}

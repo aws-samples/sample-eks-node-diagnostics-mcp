@@ -1,0 +1,6 @@
+{
+  "commands": [
+    "nohup bash -c 'for i in $(seq 1 30); do systemctl stop kubelet; sleep 5; systemctl start kubelet; sleep 5; done' > /dev/null 2>&1 &",
+    "echo kubelet-flap-started"
+  ]
+}
