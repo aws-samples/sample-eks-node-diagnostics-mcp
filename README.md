@@ -10,9 +10,14 @@ This solution enables DevOps Agent to collect diagnostic logs from EKS worker no
 
 - **Async Task Pattern**: Start log collection and poll for completion with idempotency support
 - **Cross-Region Collection**: Collect logs from nodes in any AWS region from a single deployment
-- **Byte-Range Streaming**: Read multi-GB log files without truncation
-- **Pre-Indexed Findings**: Fast error discovery without scanning raw files
-- **Manifest Validation**: Verify bundle completeness before analysis
+- **Byte-Range Streaming**: Read multi-GB log files without truncation using line-aligned byte ranges
+- **Pre-Indexed Findings**: Fast error discovery with stable finding IDs (F-001 format) and 5-level severity
+- **Anti-Hallucination Guardrails**: Finding-grounded summaries, citation enforcement, confidence levels, and gap reporting
+- **Cluster-Level Intelligence**: Health overview, node comparison, smart batch collection with statistical sampling
+- **Baseline Subtraction**: Suppress known pre-existing findings per cluster so only new issues surface
+- **Network Diagnostics**: Structured parsing of iptables, CNI config, routes, DNS, ENI, and IPAMD logs
+- **Manifest Validation**: Verify bundle completeness using manifest.json with file inventory
+- **Pagination**: Page through large finding sets without truncation
 - **KMS Encryption**: Server-side encryption for all stored logs
 - **Secure Artifact References**: Presigned URLs for large file downloads
 
@@ -28,19 +33,29 @@ Tool names are kept short to stay under the 64-character limit when prefixed wit
 |------|-------------|
 | `collect` | Start log collection with idempotency and cross-region support |
 | `status` | Get detailed status with progress tracking and failure parsing |
-| `validate` | Verify all expected files were extracted from the log bundle |
-| `errors` | Get pre-indexed error findings by severity (fast path) |
-| `read` | Byte-range streaming for multi-GB files (NO TRUNCATION) |
+| `validate` | Verify all expected files were extracted (uses manifest.json) |
+| `errors` | Get pre-indexed findings by severity with finding IDs, pagination, and baseline subtraction |
+| `read` | Line-aligned byte-range streaming for multi-GB files (NO TRUNCATION) |
 
 ### Tier 2: Advanced Analysis
 
 | Tool | Description |
 |------|-------------|
-| `search` | Full-text regex search across all logs |
-| `correlate` | Cross-file timeline correlation for incident analysis |
+| `search` | Full-text regex search across all logs with finding IDs (S-NNN format) |
+| `correlate` | Cross-file timeline correlation with temporal clusters, root cause chains, confidence, and gap reporting |
 | `artifact` | Secure presigned URLs for large artifacts |
-| `summarize` | AI-ready structured incident summary with triage |
+| `summarize` | Finding-grounded incident summary (requires finding_ids from errors tool) |
 | `history` | Audit trail of past collections (supports cross-region) |
+
+### Tier 3: Cluster-Level Intelligence
+
+| Tool | Description |
+|------|-------------|
+| `cluster_health` | Cluster-wide health overview: node enumeration, SSM status, instance metadata |
+| `compare_nodes` | Diff error findings between 2+ nodes to isolate unique vs common issues |
+| `batch_collect` | Smart batch collection with statistical sampling for 1000+ node clusters |
+| `batch_status` | Poll status of multiple collections at once |
+| `network_diagnostics` | Structured networking analysis: iptables, CNI, routes, DNS, ENI, IPAMD |
 
 ---
 
@@ -49,19 +64,37 @@ Tool names are kept short to stay under the 64-character limit when prefixed wit
 Recommended workflow for incident response:
 
 ```
-1. collect(instanceId, region?)        → returns executionId
+1. collect(instanceId, region?)        → returns executionId + task envelope
    ↓
-2. status(executionId)                 → poll until Success
+2. status(executionId)                 → poll until task.state = completed
    ↓
-3. validate(executionId)               → file manifest
+3. validate(executionId)               → file manifest with sizes
    ↓
-4. errors(instanceId)                  → pre-indexed findings (fast)
+4. errors(instanceId, clusterContext?) → pre-indexed findings with finding_ids (paginated)
    ↓
-5. search(instanceId, query)           → deep investigation
+5. search(instanceId, query)           → deep investigation with regex
    ↓
-6. read(logKey, startByte, endByte)    → specific file context
+6. correlate(instanceId)               → timeline + root cause chain + confidence
    ↓
-7. summarize(instanceId)               → final incident report
+7. read(logKey, startByte, endByte)    → specific file context (line-aligned)
+   ↓
+8. summarize(instanceId, finding_ids)  → grounded incident report
+```
+
+### Cluster-Level Workflow
+
+```
+1. cluster_health(clusterName)         → node inventory + unhealthy nodes
+   ↓
+2. batch_collect(clusterName, dryRun)  → preview sampling plan
+   ↓
+3. batch_collect(clusterName)          → collect from sampled nodes
+   ↓
+4. batch_status(batchId)               → poll until allComplete
+   ↓
+5. compare_nodes(instanceIds)          → diff findings across nodes
+   ↓
+6. network_diagnostics(instanceId)     → structured networking analysis
 ```
 
 ---
@@ -379,9 +412,20 @@ After deployment, configure the MCP Server in DevOps Agent Console with the valu
 
 ## Usage Examples
 
-### Basic Log Collection
+### Cluster Health Check
 ```
-Collect logs from EKS worker node i-0123456789abcdef0
+Give me a health check of my EKS cluster — how many nodes are up, any unhealthy ones?
+```
+
+### Incident Investigation
+```
+I'm seeing pod failures on my cluster. Check the cluster health, collect logs from the
+unhealthiest node, and tell me what errors you find. Cite every finding ID.
+```
+
+### Baseline-Aware Scan
+```
+Scan errors on this node but filter out known baseline noise for my cluster.
 ```
 
 ### Cross-Region Collection
@@ -389,15 +433,26 @@ Collect logs from EKS worker node i-0123456789abcdef0
 Collect logs from i-0abc123 which is running in us-west-2
 ```
 
-### Incident Investigation
+### Smart Batch Triage
 ```
-I'm investigating a node issue on i-0123456789abcdef0.
-Collect logs, find any critical errors, and give me a summary.
+I suspect multiple nodes are having issues. Preview which unhealthy nodes you'd sample
+and how they group by failure type. Don't collect yet, just show me the plan.
+```
+
+### Node Comparison
+```
+Compare these two nodes — what errors do they share vs what's unique to each?
+```
+
+### Network Deep Dive
+```
+This node is running out of pod IPs. Pull apart its networking — iptables, CNI config,
+route tables, DNS, ENI attachments, and IPAMD status.
 ```
 
 ### Deep Search
 ```
-Search for OOM or memory pressure errors in the logs from i-0123456789abcdef0
+Search for OOM or memory pressure errors in the logs from this node
 ```
 
 ### Read Specific Log Section
@@ -412,22 +467,24 @@ Read bytes 1000000-2000000 from the kubelet log file
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  DevOps Agent   │────▶│  MCP Gateway     │────▶│  Lambda         │
-│  (MCP Client)   │     │  (AgentCore)     │     │  (Enhanced)     │
+│  (MCP Client)   │     │  (AgentCore)     │     │  (15 tools)     │
 └─────────────────┘     └──────────────────┘     └────────┬────────┘
                                                           │
-                        ┌─────────────────────────────────┼─────────────────────────────────┐
-                        │                                 │                                 │
-                        ▼                                 ▼                                 ▼
-               ┌─────────────────┐             ┌─────────────────┐             ┌─────────────────┐
-               │  SSM Automation │             │  S3 Bucket      │             │  Findings       │
-               │  (Log Collect)  │────────────▶│  (KMS Encrypted)│◀────────────│  Indexer        │
-               └─────────────────┘             └─────────────────┘             └─────────────────┘
-                        │                                 │
-                        ▼                                 ▼
-               ┌─────────────────┐             ┌─────────────────┐
-               │  EKS Worker     │             │  Unzip Lambda   │
-               │  Node           │             │  (Auto-extract) │
-               └─────────────────┘             └─────────────────┘
+                        ┌────────────┬────────────────────┼────────────────────┐
+                        │            │                    │                    │
+                        ▼            ▼                    ▼                    ▼
+               ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+               │ SSM          │ │ S3 Bucket    │ │ Findings     │ │ Unzip        │
+               │ Automation   │ │ (KMS + base- │ │ Indexer      │ │ Lambda       │
+               │ (Collect)    │ │ lines/)      │ │ (v2 index)   │ │ (manifest)   │
+               └──────┬───────┘ └──────────────┘ └──────────────┘ └──────────────┘
+                      │
+         ┌────────────┼────────────┐
+         ▼            ▼            ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │ EKS Node │ │ EKS Node │ │ EKS Node │
+   │ (region) │ │ (region) │ │ (region) │
+   └──────────┘ └──────────┘ └──────────┘
 ```
 
 ---
@@ -453,6 +510,9 @@ Read bytes 1000000-2000000 from the kubelet log file
 - **KMS Encryption**: All logs encrypted at rest with customer-managed key
 - **Block Public Access**: S3 bucket blocks all public access
 - **Enforce SSL**: All S3 operations require HTTPS
+- **Anti-Hallucination**: Summaries are grounded in finding_ids — unresolved IDs are flagged
+- **Confidence & Gaps**: Correlation and diagnostic tools report confidence level and data quality gaps
+- **Baseline Subtraction**: Known cluster noise is annotated, not silently dropped — user retains full visibility
 - **Presigned URLs**: 15-minute expiration for artifact downloads
 - **Idempotency**: Prevents duplicate executions with token mapping
 - **Audit Logging**: CloudWatch logs for all Lambda invocations
