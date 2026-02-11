@@ -1,11 +1,26 @@
 # EKS Node Log MCP
 
-
 MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS worker nodes using SSM Automation.
 
-## Overview
+## The Problem
 
-This solution enables DevOps Agent to collect diagnostic logs from EKS worker nodes through a secure MCP Gateway. It solves the challenge of running async SSM Automations and retrieving results without requiring direct S3 access for the agent.
+Around 40-50% of EKS production issues originate at the worker node level. When investigating these issues, teams typically send containerd and kubelet logs — but that is rarely enough. Effective root cause analysis also requires iptables rules, CNI configuration, route tables, DNS resolution state, ENI attachment status, conntrack tables, kernel ring buffer (dmesg), and IPAMD logs. These artifacts live on the node's OS and are not accessible through the Kubernetes API or CloudWatch.
+
+This creates a gap: AI agents (DevOps Agent, or any MCP-compatible agent) can reason over logs, but they have no way to collect the full set of node-level evidence needed to diagnose networking failures, OOM kills, node NotReady events, or IP exhaustion issues.
+
+## How This MCP Server Fills the Gap
+
+This server gives any MCP-compatible agent the ability to:
+
+1. **Collect the full diagnostic bundle** from any EKS worker node via SSM Automation — not just kubelet/containerd, but all 20+ log sources including iptables, routes, CNI config, ENI metadata, IPAMD, dmesg, sysctl settings, and more
+2. **Pre-index errors** with severity classification and stable finding IDs so the agent doesn't have to parse raw logs
+3. **Stream multi-GB files** with byte-range reads — no truncation, no token limits
+4. **Correlate across log sources** to build temporal root cause chains (e.g., IPAMD IP exhaustion → CNI plugin failure → pod stuck in ContainerCreating)
+5. **Run live tcpdump captures** on nodes via SSM Run Command, with decoded packet summaries, protocol stats, and anomaly detection the agent can read directly
+6. **Compare nodes** to isolate what's unique to a failing node vs. common baseline noise
+7. **Batch collect from 1000+ node clusters** with smart statistical sampling
+
+The result: an agent can go from "node is NotReady" to a grounded incident report with cited evidence in a single conversation, without a human needing to SSH into the node.
 
 ### Key Features
 
