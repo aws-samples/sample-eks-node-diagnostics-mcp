@@ -942,7 +942,7 @@ def store_idempotency_mapping(instance_id: str, token: str, execution_id: str):
 
 
 # ========================================================================
-# Phase 6.3 — Baseline Subtraction (S3-based)
+# Baseline Subtraction (S3-based)
 # ========================================================================
 
 BASELINE_PREFIX = 'baselines/'
@@ -1107,7 +1107,7 @@ def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
     # Sort by severity
     findings.sort(key=lambda x: SEVERITY_ORDER.get(x.get('severity', 'info'), 4))
     
-    # Phase 2.5: Multi-signal confirmation for CRITICAL findings
+
     # A CRITICAL finding is confirmed if the same pattern appears in 2+ files
     # or if a corroborating pattern exists (e.g., OOM kill + exit code 137)
     critical_patterns = {}
@@ -1125,7 +1125,7 @@ def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
             f['confirmed'] = len(sources) >= 2
             f['signal_sources'] = len(sources)
     
-    # Phase 2.4: Add first_seen/last_seen timestamps from log line timestamps
+    
     now_iso = datetime.utcnow().isoformat()
     for f in findings:
         # Try to extract timestamps from sample match lines
@@ -1168,7 +1168,7 @@ def scan_file_for_errors(key: str) -> List[Dict]:
     lines = content.split('\n')
     filename = key.split('/extracted/')[-1] if '/extracted/' in key else key
     
-    # Phase 2.6: False positive suppression patterns
+ 
     # These patterns indicate the match is informational, not an actual error
     FALSE_POSITIVE_CONTEXTS = [
         re.compile(r'(resolv\.conf|/etc/resolv)', re.IGNORECASE),  # Node resolv.conf is normal
@@ -1192,7 +1192,7 @@ def scan_file_for_errors(key: str) -> List[Dict]:
             
             for i, line in enumerate(lines):
                 if regex.search(line):
-                    # Phase 2.6: Check false positive contexts
+                  
                     is_false_positive = False
                     for fp_re in FALSE_POSITIVE_CONTEXTS:
                         if fp_re.search(line):
@@ -2355,7 +2355,7 @@ def start_log_collection(arguments: Dict) -> Dict:
             'estimatedCompletionTime': '3-5 minutes',
             'suggestedPollIntervalSeconds': 15,
             'nextStep': f'Poll status with status(executionId="{execution_id}") every 15 seconds',
-            # Phase 1: Task envelope for MCP Task pattern
+           
             'task': {
                 'taskId': execution_id,
                 'state': 'running',
@@ -2459,7 +2459,7 @@ def get_collection_status(arguments: Dict) -> Dict:
         elif status == 'Failed':
             result['nextStep'] = 'Review failureReason and retry if appropriate'
         
-        # Phase 1: Map SSM states to MCP Task states
+        
         SSM_TO_TASK_STATE = {
             'Pending': 'running',
             'InProgress': 'running',
@@ -2552,7 +2552,7 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
             if '/extracted/' in obj['key']
         ]
         
-        # Phase 2: Check for manifest.json (authoritative source from unzip lambda)
+        
         manifest_data = None
         manifest_files = [obj for obj in list_result['objects'] if obj['key'].endswith('manifest.json')]
         if manifest_files:
@@ -2616,7 +2616,7 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
             'instanceId': instance_id,
         }
         
-        # Phase 2: Enrich with manifest.json data if available
+        
         if manifest_data and manifest_data.get('version', 1) >= 2:
             result['manifestVersion'] = manifest_data.get('version')
             result['archiveSize'] = manifest_data.get('archiveSize', 0)
@@ -2728,7 +2728,7 @@ def get_error_summary(arguments: Dict) -> Dict:
                         if old_sev == 'warning':
                             f['severity'] = 'high'
                     
-                    # Phase 6.3: Annotate with baseline info
+                    
                     if cluster_context:
                         findings = annotate_findings_with_baselines(findings, cluster_context)
                     
@@ -2785,7 +2785,7 @@ def get_error_summary(arguments: Dict) -> Dict:
                         'index_version': index_data.get('index_version', 'v1'),
                     }
                     
-                    # Phase 6.3: Update baselines with current findings
+                    
                     if cluster_context:
                         update_baselines(cluster_context, findings)
                     
@@ -2820,7 +2820,7 @@ def get_error_summary(arguments: Dict) -> Dict:
         
         # Slow path: scan and index on-demand
         result = scan_and_index_errors(instance_id, severity_filter)
-        # Phase 6.3: Annotate slow-path findings with baselines too
+        
         if cluster_context and result.get('success') and result.get('data', {}).get('findings'):
             result['data']['findings'] = annotate_findings_with_baselines(
                 result['data']['findings'], cluster_context
@@ -2926,7 +2926,6 @@ def read_log_chunk(arguments: Dict) -> Dict:
                 'info': 'File is empty or requested range is invalid'
             })
         
-        # Phase 3.3: Line-aligned byte-range reads
         # Read slightly more than requested to find newline boundaries
         BOUNDARY_SCAN = 4096  # Extra bytes to scan for newline alignment
 
@@ -3087,7 +3086,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
             if any(key.endswith(ext) for ext in ['.tar.gz', '.zip', '.gz', '.bin', '.so']):
                 continue
             
-            # Phase 3.2: No longer skip large files — use chunked reading instead
+            
             if obj['size'] > 52428800:  # Only skip truly huge files >50MB
                 large_file_count += 1
                 continue
@@ -3327,10 +3326,10 @@ def correlate_events(arguments: Dict) -> Dict:
                 by_component[component] = []
             by_component[component].append(event)
         
-        # Phase 4.4: Build temporal clusters
+        
         temporal_clusters = _build_temporal_clusters(timeline, time_window)
         
-        # Phase 4.5: Build potential root cause chain
+        
         root_cause_chain = _build_root_cause_chain(timeline, by_component, temporal_clusters)
         
         # Confidence assessment
@@ -3396,7 +3395,7 @@ def correlate_events(arguments: Dict) -> Dict:
 
 
 def _build_temporal_clusters(timeline: List[Dict], time_window: int) -> List[Dict]:
-    """Phase 4.4: Group events into temporal clusters based on timestamps."""
+    """Group events into temporal clusters based on timestamps."""
     # Separate events with and without timestamps
     timed_events = [e for e in timeline if e.get('timestamp')]
     untimed_events = [e for e in timeline if not e.get('timestamp')]
@@ -3451,7 +3450,7 @@ def _build_temporal_clusters(timeline: List[Dict], time_window: int) -> List[Dic
 
 
 def _build_root_cause_chain(timeline: List[Dict], by_component: Dict, clusters: List[Dict]) -> List[Dict]:
-    """Phase 4.5: Build potential root cause chain from correlated events."""
+    """Build potential root cause chain from correlated events."""
     chain = []
     
     # Heuristic: look for known causal patterns
@@ -3599,7 +3598,7 @@ def get_artifact_reference(arguments: Dict) -> Dict:
 def generate_incident_summary(arguments: Dict) -> Dict:
     """
     Generate AI-ready structured incident summary with Pod/Node failure triage.
-    Phase 4: Requires finding_ids to ground summary in verified evidence.
+    Requires finding_ids to ground summary in verified evidence.
     Falls back to full retrieval if finding_ids not provided (backward compat).
     
     Inputs:
@@ -3666,7 +3665,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         all_findings = error_data.get('findings', [])
         summary_counts = error_data.get('summary', {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0})
         
-        # Phase 4: If finding_ids provided, filter to only those findings
+        # If finding_ids provided, filter to only those findings
         grounded = bool(finding_ids)
         if finding_ids:
             finding_id_set = set(finding_ids)
@@ -4139,7 +4138,7 @@ def cluster_health(arguments: Dict) -> Dict:
             'nodegroupDistribution': ng_distribution,
         }
 
-        # Confidence assessment (Phase 4.3)
+        # Confidence assessment 
         gaps = []
         if not include_ssm:
             gaps.append('SSM status not checked — some unhealthy nodes may be missed')
@@ -4337,7 +4336,7 @@ def compare_nodes(arguments: Dict) -> Dict:
                 'commonFindings': total_findings - unique_count,
             })
 
-        # Confidence assessment (Phase 4.3)
+        # Confidence assessment 
         gaps = []
         nodes_without_index = [iid for iid, findings in node_findings.items()
                                if findings and isinstance(findings[0], dict) and findings[0].get('needsCollection')]
