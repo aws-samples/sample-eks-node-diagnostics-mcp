@@ -5317,9 +5317,9 @@ if [ -n "$CRICTL" ]; then
 import sys,json
 d=json.load(sys.stdin)
 # Try info.pid (containerd 1.x), then status.pid, then info.runtimeSpec.linux.namespaces
-pid = d.get('info',{}).get('pid',0)
+pid = d.get('info',{{}}).get('pid',0)
 if not pid:
-    pid = d.get('status',{}).get('pid',0)
+    pid = d.get('status',{{}}).get('pid',0)
 if not pid:
     # Last resort: look for any 'pid' key recursively
     def find_pid(obj):
@@ -5340,9 +5340,9 @@ print(pid)
                 SANDBOX_PID=$($CRICTL inspectp --output json "$POD_ID" 2>/dev/null | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-pid = d.get('info',{}).get('pid',0)
+pid = d.get('info',{{}}).get('pid',0)
 if not pid:
-    pid = d.get('status',{}).get('pid',0)
+    pid = d.get('status',{{}}).get('pid',0)
 if not pid:
     def find_pid(obj):
         if isinstance(obj, dict):
