@@ -66,7 +66,7 @@ Tool names are kept short to stay under the 64-character limit when prefixed wit
 
 | Tool | Description |
 |------|-------------|
-| `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
+| `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Supports capturing inside a pod/container network namespace — provide `podName` + `podNamespace` (auto-resolves PID via crictl/docker) or raw `containerPid`. Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
 | `tcpdump_analyze` | Read decoded packet text, protocol stats (TCP/UDP/ICMP), top talkers, and anomaly detection (high RST, retransmissions, SYN floods) from a completed capture |
 
 ---
@@ -112,7 +112,7 @@ Recommended workflow for incident response:
 ### Live Packet Capture Workflow
 
 ```
-1. tcpdump_capture(instanceId, durationSeconds?, filter?)
+1. tcpdump_capture(instanceId, durationSeconds?, filter?, podName?, podNamespace?)
    → returns commandId + task envelope (async)
    ↓
 2. tcpdump_capture(commandId, instanceId)
@@ -501,6 +501,20 @@ on port 443, then analyze the capture — show me RST counts, retransmissions, a
 ```
 Run tcpdump on i-0abc123def for 60 seconds with no filter. I want to see the full protocol
 breakdown and any anomalies — especially RST rates and ICMP unreachables.
+```
+
+### "Capture DNS traffic from inside a CoreDNS pod"
+```
+DNS lookups are timing out intermittently. The CoreDNS pod coredns-5d78c9869d-abc12 is
+running on node i-0abc123def in kube-system. Capture UDP port 53 traffic from inside
+the pod's network namespace for 60 seconds, then analyze the capture.
+```
+
+### "Debug VPC CNI pod networking from the pod's perspective"
+```
+Pod my-app-7b9f4c-xyz in namespace production on node i-0abc123def can't reach the
+database. Capture all traffic from inside the pod's namespace for 2 minutes — I want
+to see if SYN packets are leaving and whether RSTs are coming back.
 ```
 
 ---

@@ -1208,7 +1208,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'tcpdump_capture',
-        Description: 'Run tcpdump on an EKS worker node via SSM Run Command for a specified duration (default 2 minutes), then upload the pcap file to S3. Returns immediately with a commandId for async polling. Call again with commandId to check status and get the S3 location / presigned download URL. CITATION: Cite commandId, instanceId, and s3Key.',
+        Description: 'Run tcpdump on an EKS worker node via SSM Run Command for a specified duration (default 2 minutes), then upload the pcap file to S3. Supports capturing inside a pod/container network namespace — provide podName (auto-resolves PID via crictl/docker) or containerPid (raw PID). For K8s DNS debugging: tcpdump_capture(instanceId, podName="coredns-xxx", podNamespace="kube-system", filter="udp port 53"). Returns immediately with a commandId for async polling. Call again with commandId to check status. CITATION: Cite commandId, instanceId, and s3Key.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -1226,7 +1226,19 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             },
             filter: {
               Type: 'string',
-              Description: 'BPF filter expression (e.g., "port 443", "host 10.0.0.1 and port 80")',
+              Description: 'BPF filter expression (e.g., "port 443", "host 10.0.0.1 and port 80", "udp port 53")',
+            },
+            podName: {
+              Type: 'string',
+              Description: 'Kubernetes pod name to capture from (e.g., "coredns-5d78c9869d-abc12"). Auto-resolves to container PID via crictl/docker on the worker node. Pod must be running on the specified instanceId.',
+            },
+            podNamespace: {
+              Type: 'string',
+              Description: 'Kubernetes namespace of the pod (default: "default"). Use "kube-system" for CoreDNS, "amazon-vpc-cni" for VPC CNI pods, etc.',
+            },
+            containerPid: {
+              Type: 'string',
+              Description: 'Raw container PID for nsenter (alternative to podName). Use when you already know the PID from "ps ax | grep <process>" on the worker node.',
             },
             commandId: {
               Type: 'string',

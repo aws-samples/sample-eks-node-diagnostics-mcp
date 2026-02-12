@@ -5203,6 +5203,24 @@ def tcpdump_capture(arguments: Dict) -> Dict:
     if bpf_filter and re.search(r'[;&|`$(){}]', bpf_filter):
         return error_response(400, 'filter contains invalid characters')
 
+    # Container/pod namespace support
+    container_pid = arguments.get('containerPid', '')
+    if container_pid:
+        container_pid = str(container_pid).strip()
+        if not re.match(r'^\d+$', container_pid):
+            return error_response(400, f'Invalid containerPid — must be a numeric PID: {container_pid}')
+
+    pod_name = arguments.get('podName', '').strip()
+    pod_namespace = arguments.get('podNamespace', 'default').strip()
+    if pod_name and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]{0,252}$', pod_name):
+        return error_response(400, f'Invalid podName: {pod_name}')
+    if pod_namespace and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,62}$', pod_namespace):
+        return error_response(400, f'Invalid podNamespace: {pod_namespace}')
+
+    # Can't specify both podName and containerPid
+    if pod_name and container_pid:
+        return error_response(400, 'Specify either podName or containerPid, not both')
+
     # Check if this is a status poll for an existing command
     command_id = arguments.get('commandId')
     if command_id:
@@ -5227,6 +5245,14 @@ def tcpdump_capture(arguments: Dict) -> Dict:
 
     filter_clause = f' {bpf_filter}' if bpf_filter else ''
 
+    # Determine nsenter prefix based on pod or PID
+    use_nsenter = bool(container_pid or pod_name)
+    ns_label = ''
+    if container_pid:
+        ns_label = f' (container PID {container_pid} namespace)'
+    elif pod_name:
+        ns_label = f' (pod {pod_namespace}/{pod_name} namespace)'
+
     script = f"""#!/bin/bash
 set -euo pipefail
 
@@ -5247,12 +5273,205 @@ if ! command -v tcpdump &>/dev/null; then
     fi
 fi
 
-echo "Starting tcpdump capture on interface '{interface}' for {duration}s..."
+NSENTER_PREFIX=""
+"""
+
+    # Add pod PID discovery when podName is provided
+    if pod_name:
+        script += f"""
+# === Resolve pod "{pod_namespace}/{pod_name}" to container PID ===
+echo "Resolving pod {pod_namespace}/{pod_name} to container PID..."
+TARGET_PID=""
+
+# Ensure PATH includes common binary locations (SSM may have minimal PATH)
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# Set containerd endpoint for crictl (EKS standard)
+export CONTAINER_RUNTIME_ENDPOINT="unix:///run/containerd/containerd.sock"
+
+# Find crictl binary (may not be in default SSM PATH)
+CRICTL=""
+for p in /usr/local/bin/crictl /usr/bin/crictl $(which crictl 2>/dev/null); do
+    if [ -x "$p" ]; then CRICTL="$p"; break; fi
+done
+
+# Method 1: crictl (containerd/CRI-O — standard on EKS AL2023 / 1.24+)
+if [ -n "$CRICTL" ]; then
+    echo "Using crictl ($CRICTL) to find pod..."
+    # crictl pods --name does substring match, so filter precisely
+    POD_ID=$($CRICTL pods --namespace '{pod_namespace}' -q 2>/dev/null | while read pid; do
+        PNAME=$($CRICTL inspectp --output json "$pid" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',{{}}).get('metadata',{{}}).get('name',''))" 2>/dev/null || true)
+        if [ "$PNAME" = "{pod_name}" ]; then echo "$pid"; break; fi
+    done)
+    if [ -z "$POD_ID" ]; then
+        # Fallback: simple name match (works when pod name is unique enough)
+        POD_ID=$($CRICTL pods --name '{pod_name}' --namespace '{pod_namespace}' -q 2>/dev/null | head -1)
+    fi
+    if [ -n "$POD_ID" ]; then
+        echo "Found pod ID: $POD_ID"
+        CONTAINER_ID=$($CRICTL ps --pod "$POD_ID" -q 2>/dev/null | head -1)
+        if [ -n "$CONTAINER_ID" ]; then
+            echo "Found container ID: $CONTAINER_ID"
+            # Extract PID using JSON parsing — try multiple paths (containerd versions differ)
+            TARGET_PID=$($CRICTL inspect --output json "$CONTAINER_ID" 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+# Try info.pid (containerd 1.x), then status.pid, then info.runtimeSpec.linux.namespaces
+pid = d.get('info',{}).get('pid',0)
+if not pid:
+    pid = d.get('status',{}).get('pid',0)
+if not pid:
+    # Last resort: look for any 'pid' key recursively
+    def find_pid(obj):
+        if isinstance(obj, dict):
+            if 'pid' in obj and isinstance(obj['pid'], int) and obj['pid'] > 0:
+                return obj['pid']
+            for v in obj.values():
+                r = find_pid(v)
+                if r: return r
+        return 0
+    pid = find_pid(d)
+print(pid)
+" 2>/dev/null || true)
+            echo "crictl: pod=$POD_ID container=$CONTAINER_ID pid=$TARGET_PID"
+            # Validate PID immediately; if invalid, try the pause (sandbox) container instead
+            if [ -n "$TARGET_PID" ] && [ "$TARGET_PID" != "0" ] && [ ! -e "/proc/$TARGET_PID/ns/net" ]; then
+                echo "WARNING: container PID $TARGET_PID has no /proc entry or ns/net — trying sandbox (pause) container..."
+                SANDBOX_PID=$($CRICTL inspectp --output json "$POD_ID" 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+pid = d.get('info',{}).get('pid',0)
+if not pid:
+    pid = d.get('status',{}).get('pid',0)
+if not pid:
+    def find_pid(obj):
+        if isinstance(obj, dict):
+            if 'pid' in obj and isinstance(obj['pid'], int) and obj['pid'] > 0:
+                return obj['pid']
+            for v in obj.values():
+                r = find_pid(v)
+                if r: return r
+        return 0
+    pid = find_pid(d)
+print(pid)
+" 2>/dev/null || true)
+                if [ -n "$SANDBOX_PID" ] && [ "$SANDBOX_PID" != "0" ] && [ -e "/proc/$SANDBOX_PID/ns/net" ]; then
+                    echo "Using sandbox (pause) container PID $SANDBOX_PID instead"
+                    TARGET_PID="$SANDBOX_PID"
+                else
+                    echo "Sandbox PID $SANDBOX_PID also invalid"
+                    TARGET_PID=""
+                fi
+            fi
+        else
+            echo "crictl: pod found but no running containers in pod $POD_ID"
+        fi
+    else
+        echo "crictl: no pod matching name='{pod_name}' namespace='{pod_namespace}'"
+        echo "Available pods on this node:"
+        $CRICTL pods 2>/dev/null | head -10 || true
+    fi
+else
+    echo "crictl not found on this node"
+fi
+
+# Method 2: docker (older EKS AMIs with dockershim)
+if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
+    if command -v docker &>/dev/null; then
+        echo "Trying docker..."
+        DOCKER_ID=$(docker ps --filter "label=io.kubernetes.pod.name={pod_name}" --filter "label=io.kubernetes.pod.namespace={pod_namespace}" -q 2>/dev/null | head -1)
+        if [ -n "$DOCKER_ID" ]; then
+            TARGET_PID=$(docker inspect --format '{{{{.State.Pid}}}}' "$DOCKER_ID" 2>/dev/null || true)
+            echo "docker: container=$DOCKER_ID pid=$TARGET_PID"
+        fi
+    fi
+fi
+
+# Method 3: search /proc cgroups for the pod name (works with containerd/CRI-O)
+if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
+    echo "Trying /proc cgroup scan for pod name..."
+    # Container PIDs have cgroup entries containing the pod UID or pod name
+    for pid_dir in /proc/[0-9]*/cgroup; do
+        pid=$(echo "$pid_dir" | cut -d/ -f3)
+        if grep -q "{pod_name}" "$pid_dir" 2>/dev/null; then
+            # Verify it's a container process (not a host process)
+            if [ -e "/proc/$pid/ns/net" ] && [ "$(readlink /proc/$pid/ns/net)" != "$(readlink /proc/1/ns/net)" ]; then
+                TARGET_PID="$pid"
+                echo "cgroup scan: found pid=$TARGET_PID (cgroup matches pod name)"
+                break
+            fi
+        fi
+    done
+fi
+
+# Method 4: fallback — search /proc for pause or main container process
+if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
+    echo "Trying /proc process scan..."
+    # Look for any process whose network namespace differs from host and whose cgroup contains pod-related strings
+    for pid in $(ps -eo pid --no-headers 2>/dev/null | tr -d ' '); do
+        if [ -e "/proc/$pid/ns/net" ] && [ "$(readlink /proc/$pid/ns/net 2>/dev/null)" != "$(readlink /proc/1/ns/net 2>/dev/null)" ]; then
+            # Check if this PID's cmdline or environ references the pod
+            if grep -q "{pod_name}" /proc/$pid/cmdline 2>/dev/null || grep -q "{pod_name}" /proc/$pid/environ 2>/dev/null; then
+                TARGET_PID="$pid"
+                echo "proc scan: found pid=$TARGET_PID (cmdline/environ matches)"
+                break
+            fi
+        fi
+    done
+fi
+
+if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
+    echo "FATAL: Could not resolve pod {pod_namespace}/{pod_name} to a container PID on this node."
+    echo "Ensure the pod is running on this specific worker node (instance {instance_id})."
+    echo "Use 'kubectl get pod -n {pod_namespace} {pod_name} -o wide' to verify the node."
+    echo ""
+    echo "Debug info:"
+    echo "  crictl binary: ${{CRICTL:-not found}}"
+    echo "  containerd socket: $(ls -la /run/containerd/containerd.sock 2>/dev/null || echo 'not found')"
+    echo "  docker: $(which docker 2>/dev/null || echo 'not found')"
+    echo "  Running containers:"
+    ${{CRICTL:-crictl}} ps 2>/dev/null | head -10 || docker ps 2>/dev/null | head -10 || echo "  (no container runtime accessible)"
+    exit 1
+fi
+
+echo "Resolved pod {pod_namespace}/{pod_name} -> PID $TARGET_PID"
+# Validate PID: /proc/<PID>/ns/net is a SYMLINK, not a directory — use -e (exists) not -d
+if [ ! -e "/proc/$TARGET_PID/ns/net" ]; then
+    # Retry: PID might be a thread group leader; check if /proc/<PID> exists at all
+    if [ ! -d "/proc/$TARGET_PID" ]; then
+        echo "FATAL: PID $TARGET_PID does not exist in /proc (process may have exited)"
+    else
+        echo "FATAL: PID $TARGET_PID exists but /proc/$TARGET_PID/ns/net is missing"
+        echo "  /proc/$TARGET_PID/ns contents: $(ls -la /proc/$TARGET_PID/ns/ 2>/dev/null || echo 'cannot list')"
+    fi
+    exit 1
+fi
+NSENTER_PREFIX="nsenter -n -t $TARGET_PID "
+"""
+    elif container_pid:
+        script += f"""
+# === Validate container PID {container_pid} ===
+if [ ! -e "/proc/{container_pid}/ns/net" ]; then
+    if [ ! -d "/proc/{container_pid}" ]; then
+        echo "FATAL: PID {container_pid} does not exist in /proc (process may have exited)"
+    else
+        echo "FATAL: PID {container_pid} exists but /proc/{container_pid}/ns/net is missing"
+        echo "  /proc/{container_pid}/ns contents: $(ls -la /proc/{container_pid}/ns/ 2>/dev/null || echo 'cannot list')"
+    fi
+    exit 1
+fi
+CONTAINER_COMM=$(cat /proc/{container_pid}/comm 2>/dev/null || echo "unknown")
+echo "Targeting container process: PID {container_pid} ($CONTAINER_COMM)"
+NSENTER_PREFIX="nsenter -n -t {container_pid} "
+"""
+
+    script += f"""
+echo "Starting tcpdump{ns_label} on interface '{interface}' for {duration}s..."
 echo "Filter: '{bpf_filter or 'none'}'"
 echo "Output: $PCAP_FILE"
 
-# Run tcpdump with timeout
-timeout {duration} tcpdump -i {interface} -w "$PCAP_FILE" -c 100000{filter_clause} 2>&1 || true
+# Run tcpdump with timeout (with optional nsenter)
+timeout {duration} ${{NSENTER_PREFIX}}tcpdump -i {interface} -w "$PCAP_FILE" -c 100000{filter_clause} 2>&1 || true
 
 # Verify capture file exists and has data
 if [ ! -f "$PCAP_FILE" ]; then
@@ -5376,6 +5595,9 @@ echo "DONE"
                     'durationSeconds': duration,
                     'interface': interface,
                     'filter': bpf_filter,
+                    'containerPid': container_pid or None,
+                    'podName': pod_name or None,
+                    'podNamespace': pod_namespace if pod_name else None,
                     'startedAt': timestamp,
                 }),
             )
@@ -5383,13 +5605,16 @@ echo "DONE"
             pass  # Non-fatal
 
         return success_response({
-            'message': f'tcpdump capture started ({duration}s)',
+            'message': f'tcpdump capture started ({duration}s){ns_label}',
             'commandId': cmd_id,
             'instanceId': instance_id,
             'region': target_region,
             'durationSeconds': duration,
             'interface': interface,
             'filter': bpf_filter or 'none',
+            'containerPid': container_pid or None,
+            'podName': pod_name or None,
+            'podNamespace': pod_namespace if pod_name else None,
             's3Key': s3_key,
             's3KeyTxt': s3_key_txt,
             's3KeyStats': s3_key_stats,
