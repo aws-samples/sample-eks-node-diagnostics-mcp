@@ -1,0 +1,267 @@
+---
+title: "D8 — kube-proxy Failures and Service Connectivity Issues"
+description: "Comprehensive SOP for diagnosing kube-proxy crashes, IPVS/iptables mode issues, stale endpoints, service unreachable, and ClusterIP/NodePort/headless service failures"
+status: active
+severity: HIGH
+triggers:
+  - "kube-proxy.*CrashLoopBackOff"
+  - "kube-proxy.*error"
+  - "Failed to list.*Endpoints"
+  - "error syncing iptables rules"
+  - "KUBE-SVC chains missing"
+  - "connection refused.*ClusterIP"
+  - "no endpoints available"
+  - "service.*unreachable"
+  - "ipvs.*error"
+  - "kube-proxy.*OOMKilled"
+owner: devops-agent
+objective: "Identify why kube-proxy is failing or service connectivity is broken, covering crash loops, mode misconfiguration, stale rules, version skew, and endpoint issues"
+context: >
+  kube-proxy runs as a DaemonSet on every node and maintains iptables or IPVS rules that map
+  Service ClusterIPs/NodePorts to pod endpoints. When kube-proxy fails, services become unreachable
+  even though individual pod IPs may work fine. This SOP covers the full range of kube-proxy issues:
+  crash loops (OOM, config errors, API server connectivity), iptables mode problems (rule sync failures,
+  stale chains, rule explosion in large clusters), IPVS mode problems (missing kernel modules, scheduler
+  misconfiguration), stale endpoints (pods deleted but rules remain), version skew between kube-proxy
+  and cluster, and service-level connectivity failures (ClusterIP, NodePort, headless, ExternalName).
+  Cross-references D2 for basic iptables sync, D3 for conntrack exhaustion, D5 for DNS/CoreDNS issues.
+---
+
+## Phase 1 — Triage
+
+MUST:
+- Use `collect` tool with instanceId to gather logs from the affected node
+- Use `status` tool with executionId to poll until collection completes
+- Use `errors` tool with instanceId to get pre-indexed findings — look for kube-proxy errors
+- Use `network_diagnostics` tool with instanceId and sections=iptables,kube_proxy to get current iptables/IPVS rules and kube-proxy status
+
+SHOULD:
+- Use `search` tool with instanceId and query=`kube-proxy.*error|kube-proxy.*fatal|kube-proxy.*crash|kube-proxy.*OOM` to find kube-proxy failure evidence
+- Use `search` tool with query=`KUBE-SVC|KUBE-SEP|KUBE-MARK|KUBE-POSTROUTING` to check if service iptables chains exist
+- Use `search` tool with query=`kube-proxy.*mode|mode.*iptables|mode.*ipvs` to determine which proxy mode is configured
+
+MAY:
+- Use `quick_triage` tool with instanceId for a fast overview
+- Use `cluster_health` tool with clusterName to check if kube-proxy issues affect multiple nodes
+- Use `compare_nodes` tool with instanceIds of affected + healthy node to diff kube-proxy state
+
+## Phase 2 — Enrich
+
+Work through these failure domains in order:
+
+### 2A — kube-proxy Pod Health
+
+MUST:
+- Use `search` tool with query=`kube-proxy.*CrashLoopBackOff|kube-proxy.*restart|kube-proxy.*OOMKilled|kube-proxy.*Error` to check pod status
+  - CrashLoopBackOff: check for config errors, missing RBAC, or OOM
+  - OOMKilled: kube-proxy running out of memory (common in large clusters with many services/iptables rules)
+- Use `search` tool with query=`kube-proxy.*version|kube-proxy.*v1\.|image.*kube-proxy` to check kube-proxy version
+  - Version must match cluster Kubernetes version (minor version skew of +/- 1 allowed)
+  - Outdated kube-proxy addon can cause compatibility issues
+
+SHOULD:
+- Use `search` tool with query=`kube-proxy.*config|kube-proxy-config|ConfigMap.*kube-proxy` to check for configuration errors
+- Use `search` tool with query=`kube-proxy.*serviceaccount|kube-proxy.*RBAC|kube-proxy.*forbidden` to check RBAC issues
+
+### 2B — API Server Connectivity from kube-proxy
+
+MUST:
+- Use `search` tool with query=`kube-proxy.*connection refused|kube-proxy.*timeout|kube-proxy.*unauthorized|kube-proxy.*API` to check if kube-proxy can reach the API server
+  - Connection refused/timeout: network issue between node and API server (see A4 SOP)
+  - Unauthorized: service account token expired or RBAC misconfigured
+- Use `search` tool with query=`Failed to list.*Service|Failed to list.*Endpoints|Failed to watch` to check if kube-proxy can list/watch services and endpoints
+  - These failures mean kube-proxy cannot get updates, so rules become stale
+
+### 2C — iptables Mode Issues
+
+MUST:
+- Review `network_diagnostics` iptables section for KUBE-SVC and KUBE-SEP chains
+  - No KUBE-SVC chains at all: kube-proxy never synced or is not running
+  - KUBE-SVC chains exist but point to wrong endpoints: stale rules from deleted pods
+  - Very large number of rules (>10,000): iptables mode performance degradation in large clusters
+- Use `search` tool with query=`error syncing iptables|iptables.*failed|iptables-restore|iptables.*lock` to find iptables sync errors
+  - "iptables-restore: unable to initialize table": iptables binary issue or kernel module missing
+  - "Another app is currently holding the xtables lock": contention with other iptables users (CNI, calico, etc.)
+
+SHOULD:
+- Use `search` tool with query=`syncProxyRules|SyncProxyRulesLatency|sync.*duration` to check sync performance
+  - Sync taking > 1 second: too many rules, consider IPVS mode
+- Use `search` tool with query=`masquerade|MASQUERADE|SNAT` to check masquerade rules for NodePort/LoadBalancer services
+
+### 2D — IPVS Mode Issues
+
+MUST (if IPVS mode detected):
+- Use `search` tool with query=`ipvs.*error|ipvsadm|ip_vs.*module|IPVS` to find IPVS-specific errors
+  - "can't load module ip_vs": IPVS kernel modules not loaded on the node
+  - Required modules: ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, nf_conntrack
+- Use `search` tool with query=`ipvs.*scheduler|scheduler.*rr|scheduler.*lc` to check IPVS scheduler configuration
+
+SHOULD:
+- Use `search` tool with query=`ipvsadm -L|ip_vs_` to check if IPVS entries exist for services
+- Use `search` tool with query=`kube-ipvs0|dummy.*interface` to check if the kube-ipvs0 dummy interface exists
+  - Missing kube-ipvs0: IPVS mode not properly initialized
+
+### 2E — Stale Endpoints and Service Connectivity
+
+MUST:
+- Use `search` tool with query=`no endpoints available|endpoints.*not found|connection refused.*10\.|connection refused.*ClusterIP` to find service connectivity failures
+  - "no endpoints available": service has no ready pods, or kube-proxy has stale endpoint list
+- Use `search` tool with query=`stale.*endpoint|endpoint.*slice|EndpointSlice` to check for stale endpoint issues
+- Use `network_diagnostics` iptables section — look for KUBE-SEP entries pointing to IPs of pods that no longer exist
+
+SHOULD:
+- Use `search` tool with query=`NodePort|nodePort|externalTrafficPolicy|healthCheckNodePort` to check NodePort service configuration
+  - externalTrafficPolicy=Local with no local pods: service returns connection refused on that node
+- Use `search` tool with query=`headless|clusterIP.*None` to check headless service issues
+  - Headless services rely on DNS, not kube-proxy — redirect to D5 DNS SOP if headless service fails
+
+### 2F — Conntrack Interaction
+
+SHOULD:
+- Use `search` tool with query=`nf_conntrack|conntrack.*table|conntrack.*drop` to check if conntrack issues are contributing to service failures
+  - Conntrack table full causes new connections to be dropped even if kube-proxy rules are correct
+  - If found: cross-reference D3 conntrack exhaustion SOP
+
+### Timeline Correlation
+
+MUST:
+- Use `correlate` tool with instanceId and pivotEvent set to the most prominent kube-proxy error to build a timeline
+
+## Phase 3 — Report
+
+MUST:
+- Use `summarize` tool with instanceId and finding_ids from all kube-proxy and service connectivity findings
+- State root cause with specific failure domain:
+  - Pod health: CrashLoopBackOff, OOM, version skew
+  - API connectivity: cannot list/watch services and endpoints
+  - iptables: sync failure, lock contention, rule explosion
+  - IPVS: missing kernel modules, scheduler misconfiguration, missing kube-ipvs0 interface
+  - Stale endpoints: rules pointing to deleted pods
+  - Service config: externalTrafficPolicy=Local with no local pods, headless service DNS issue
+  - Conntrack: table full causing connection drops (cross-ref D3)
+- Recommend specific fix (operator action — not available via MCP tools)
+
+SHOULD:
+- Include kube-proxy version and mode from search results
+- Include evidence of missing/stale rules from network_diagnostics
+- Include sync latency if available
+
+MAY:
+- Recommend IPVS mode for clusters with > 1,000 services to avoid iptables performance issues
+- Recommend updating kube-proxy addon to match cluster version
+- Recommend NodeLocal DNSCache for headless service DNS performance
+
+## Guardrails
+
+escalation_conditions:
+  - "kube-proxy CrashLoopBackOff on all nodes — cluster-wide service outage"
+  - "kube-proxy cannot reach API server — check cluster endpoint and network"
+  - "iptables-restore failing due to kernel module issue — node OS problem"
+  - "IPVS mode switch caused service disruption — rollback to iptables mode"
+  - "Stale endpoints persisting after kube-proxy restart — possible API server or etcd issue"
+
+safety_ratings:
+  - "Log collection (collect), search, errors, network_diagnostics, correlate, compare_nodes: GREEN (read-only)"
+  - "Restart kube-proxy DaemonSet: YELLOW — operator action, not available via MCP tools"
+  - "Switch kube-proxy mode (iptables to IPVS): RED — disruptive, operator action, requires off-hours"
+  - "Update kube-proxy addon version: YELLOW — operator action, not available via MCP tools"
+
+## Common Issues
+
+- symptoms: "search returns kube-proxy CrashLoopBackOff or OOMKilled"
+  diagnosis: "kube-proxy pod crashing. OOM common in large clusters (>1000 services) with iptables mode. Check kube-proxy logs for config errors."
+  resolution: "Operator action: if OOM, increase kube-proxy memory limits or switch to IPVS mode. If config error, fix kube-proxy-config ConfigMap."
+
+- symptoms: "search returns Failed to list Services or Failed to watch Endpoints"
+  diagnosis: "kube-proxy cannot reach API server or RBAC is misconfigured. Rules become stale."
+  resolution: "Operator action: check network connectivity to API server, verify kube-proxy service account has correct ClusterRole binding."
+
+- symptoms: "network_diagnostics shows no KUBE-SVC chains in iptables"
+  diagnosis: "kube-proxy is not running or never synced rules on this node."
+  resolution: "Operator action: check kube-proxy DaemonSet status, restart kube-proxy pods (kubectl -n kube-system rollout restart ds kube-proxy)."
+
+- symptoms: "search returns iptables-restore error or xtables lock contention"
+  diagnosis: "iptables binary issue or lock contention with CNI (calico, cilium) or other iptables users."
+  resolution: "Operator action: check for concurrent iptables users, increase iptables lock timeout, or switch to IPVS mode."
+
+- symptoms: "search returns syncProxyRules taking > 1 second"
+  diagnosis: "Too many iptables rules. iptables mode has O(n) performance — degrades with many services."
+  resolution: "Operator action: switch to IPVS mode for O(1) lookup performance. See AWS docs for IPVS setup: install ipvsadm, load kernel modules, update kube-proxy addon config."
+
+- symptoms: "IPVS mode configured but search returns 'can't load module ip_vs'"
+  diagnosis: "IPVS kernel modules not loaded on the worker node."
+  resolution: "Operator action: install ipvsadm package, load kernel modules (ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, nf_conntrack), persist in /etc/modules-load.d/ipvs.conf."
+
+- symptoms: "search returns 'no endpoints available' for a service"
+  diagnosis: "Service has no ready pods, or kube-proxy has stale endpoint list. Check if pods are running and ready."
+  resolution: "Operator action: verify pods are running and passing readiness probes. If pods are ready but endpoints missing, restart kube-proxy."
+
+- symptoms: "NodePort service returns connection refused on some nodes but works on others"
+  diagnosis: "externalTrafficPolicy=Local set on the service, and the node has no local pods for that service."
+  resolution: "Operator action: change to externalTrafficPolicy=Cluster (adds extra hop but works on all nodes), or ensure pods are scheduled on all nodes via DaemonSet."
+
+- symptoms: "kube-proxy version does not match cluster Kubernetes version"
+  diagnosis: "Version skew between kube-proxy addon and cluster. Can cause compatibility issues with API changes."
+  resolution: "Operator action: update kube-proxy addon to match cluster version via 'aws eks update-addon --cluster-name <name> --addon-name kube-proxy --addon-version <version>'."
+
+## Examples
+
+```
+# Step 1: Collect logs
+collect(instanceId="i-0abc123def456")
+status(executionId="<id-from-step-1>")
+
+# Step 2: Get kube-proxy findings
+errors(instanceId="i-0abc123def456")
+
+# Step 3: Full network diagnostics including iptables and kube-proxy
+network_diagnostics(instanceId="i-0abc123def456", sections="iptables,kube_proxy")
+
+# Step 4: Check kube-proxy pod health
+search(instanceId="i-0abc123def456", query="kube-proxy.*CrashLoopBackOff|kube-proxy.*OOMKilled|kube-proxy.*error")
+
+# Step 5: Check kube-proxy mode and version
+search(instanceId="i-0abc123def456", query="kube-proxy.*mode|mode.*iptables|mode.*ipvs|kube-proxy.*version")
+
+# Step 6: Check API server connectivity
+search(instanceId="i-0abc123def456", query="kube-proxy.*connection refused|Failed to list.*Service|Failed to watch")
+
+# Step 7: Check iptables sync
+search(instanceId="i-0abc123def456", query="error syncing iptables|iptables.*lock|syncProxyRules")
+
+# Step 8: Check IPVS (if applicable)
+search(instanceId="i-0abc123def456", query="ipvs.*error|ip_vs.*module|ipvsadm|kube-ipvs0")
+
+# Step 9: Check stale endpoints
+search(instanceId="i-0abc123def456", query="no endpoints available|stale.*endpoint|connection refused.*ClusterIP")
+
+# Step 10: Correlate timeline
+correlate(instanceId="i-0abc123def456", pivotEvent="kube-proxy", timeWindow=300)
+
+# Step 11: Generate summary
+summarize(instanceId="i-0abc123def456", finding_ids=["F-001","F-002","F-003"])
+```
+
+## Output Format
+
+```yaml
+root_cause: "<pod_crash|api_connectivity|iptables_sync|ipvs_modules|stale_endpoints|version_skew|service_config> — <specific detail>"
+kube_proxy_mode: "<iptables|ipvs>"
+kube_proxy_version: "<version from search>"
+evidence:
+  - type: network_diagnostics
+    content: "<iptables rules / kube_proxy status>"
+  - type: search
+    content: "<kube-proxy error messages, sync latency, missing modules>"
+  - type: correlate
+    content: "<timeline of kube-proxy failures and service impact>"
+severity: HIGH
+mitigation:
+  immediate: "Operator: <specific fix based on root cause>"
+  long_term: "Keep kube-proxy addon updated, consider IPVS for large clusters, monitor sync latency"
+cross_reference:
+  - "D2 for basic iptables sync issues"
+  - "D3 if conntrack exhaustion contributing to service failures"
+  - "D5 if headless service DNS resolution failing"
+  - "I1 if kube-proxy version skew detected"
+```

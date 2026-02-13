@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
@@ -46,6 +47,12 @@ export interface SsmAutomationGatewayV2Props {
    * @default false (requires CloudTrail to be configured separately)
    */
   readonly enableS3DataEvents?: boolean;
+
+  /**
+   * Name for the SOP S3 bucket. If not provided, a default name is generated.
+   * @default '{stackName}-sops-{accountId}'
+   */
+  readonly sopBucketName?: string;
 }
 
 /**
@@ -70,6 +77,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
   public readonly ssmAutomationRole: iam.Role;
   public readonly gatewayExecutionRole: iam.Role;
   public readonly encryptionKey?: kms.Key;
+  public readonly sopBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: SsmAutomationGatewayV2Props = {}) {
     super(scope, id);
@@ -214,6 +222,28 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         },
       },
     }));
+
+    // ========================================================================
+    // S3 BUCKET - SOP Storage
+    // ========================================================================
+
+    this.sopBucket = new s3.Bucket(this, 'SOPBucket', {
+      bucketName: props.sopBucketName ?? `${cdk.Stack.of(this).stackName.toLowerCase()}-sops-${cdk.Stack.of(this).account}`,
+      versioned: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
+    // Auto-deploy runbooks from local sops/runbooks/ to S3 on every cdk deploy
+    new s3deploy.BucketDeployment(this, 'RunbookDeployment', {
+      sources: [s3deploy.Source.asset(path.join(__dirname, '..', 'sops', 'runbooks'))],
+      destinationBucket: this.sopBucket,
+      destinationKeyPrefix: 'runbooks/',
+      prune: true, // Remove S3 objects not in the local source
+      memoryLimit: 256,
+    });
 
     // ========================================================================
     // UNZIP LAMBDA FUNCTION
@@ -371,6 +401,9 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
     }));
 
+    // SOP bucket read access (for list_sops / get_sop)
+    this.sopBucket.grantRead(lambdaExecutionRole);
+
     this.ssmAutomationFunction = new lambda.Function(this, 'SSMAutomationFunction', {
       functionName: `${cdk.Stack.of(this).stackName}-ssm-automation`,
       runtime: lambda.Runtime.PYTHON_3_11,
@@ -381,6 +414,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       environment: {
         LOGS_BUCKET_NAME: this.logsBucket.bucketName,
         SSM_AUTOMATION_ROLE_ARN: this.ssmAutomationRole.roleArn,
+        SOP_BUCKET_NAME: this.sopBucket.bucketName,
       },
       code: lambda.Code.fromAsset(path.join(__dirname, 'lambda')),
       logRetention: logs.RetentionDays.TWO_WEEKS,
@@ -620,6 +654,12 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         exportName: `${cdk.Stack.of(this).stackName}-EncryptionKeyArn`,
       });
     }
+
+    new cdk.CfnOutput(this, 'SOPBucketName', {
+      description: 'S3 bucket for Standard Operating Procedures',
+      value: this.sopBucket.bucketName,
+      exportName: `${cdk.Stack.of(this).stackName}-SOPBucketName`,
+    });
   }
 
 
@@ -1219,7 +1259,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'network_diagnostics',
-        Description: 'Extract and structure ALL networking info from collected log bundles in ONE call. Parses iptables rules, CNI config, route tables, DNS resolution, ENI attachment status, and VPC CNI (aws-node/ipamd) logs. Returns structured data — do NOT manually read iproute.txt, iptables.txt, or other networking files. CITATION: Cite instanceId and each section analyzed.',
+        Description: 'Extract and structure ALL networking info from collected log bundles in ONE call. Parses iptables rules, CNI config/env vars, route tables, DNS resolution, ENI attachment status, VPC CNI (aws-node/ipamd) logs, and kube-proxy mode/conntrack/IPVS status. Returns structured data with an eksNetworkingContext section containing guardrails to prevent misinterpretation. IMPORTANT EKS NETWORKING RULES: (1) Empty host route table / no default gateway is NORMAL on multi-ENI EKS nodes — secondary ENIs handle pod traffic via policy routing and SNAT. (2) Missing SNAT/MASQUERADE in iptables is EXPECTED when AWS_VPC_K8S_CNI_EXTERNALSNAT=true — NAT gateway handles egress. (3) iptables FORWARD policy DROP breaks pod networking on custom AMIs. (4) Transient "no available IP" after pod deletion is normal — IP_COOLDOWN_PERIOD (default 30s) cache. (5) Pods with hostNetwork=true use node IP directly, no SNAT. (6) nm-cloud-setup (routing table 30200/30400) is INCOMPATIBLE with VPC CNI. (7) ENABLE_PREFIX_DELEGATION changes ENI slot behavior (/28 = 16 IPs per slot). (8) ENABLE_POD_ENI enables trunk ENI for security groups per pod — extra ENIs are expected. (9) NETWORK_POLICY_ENFORCING_MODE=strict means default deny for new pods. (10) systemd-udev MACAddressPolicy=persistent breaks veth MAC on Ubuntu 22.04+. (11) kube-proxy IPVS mode: KUBE-SVC iptables chains will NOT exist — use "ipvsadm -L" instead. Requires ip_vs kernel modules. (12) kube-proxy nftables mode: rules NOT visible via iptables-save — use "nft list ruleset". (13) "nf_conntrack: table full, dropping packet" = conntrack exhaustion — increase conntrack.min in kube-proxy-config ConfigMap. Each entry ~300 bytes. (14) kube-proxy version must be within 1 minor version of cluster control plane. (15) On RHEL 8.6+ (nftables-based OS), iptables mode kube-proxy may not work — use IPVS mode. Always read eksNetworkingContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -1229,7 +1269,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             },
             sections: {
               Type: 'string',
-              Description: 'Comma-separated sections: "iptables,cni,routes,dns,eni,ipamd" or "all" (default: "all")',
+              Description: 'Comma-separated sections: "iptables,cni,routes,dns,eni,ipamd,kube_proxy" or "all" (default: "all")',
             },
           },
           Required: ['instanceId'],
@@ -1239,6 +1279,37 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           Properties: {
             instanceId: { Type: 'string' },
             sections: { Type: 'object', Description: 'Map of section name → structured data' },
+            eksNetworkingContext: { Type: 'object', Description: 'EKS-specific guardrails and context. MUST read guardrails array before diagnosing any networking issue. Contains cross-referenced findings (e.g., externalSnat, customNetworking, prefixDelegation, kubeProxyMode flags).' },
+            assessment: { Type: 'string' },
+            issues: { Type: 'array' },
+            confidence: { Type: 'string', Description: 'high|medium|low|none' },
+            gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+          },
+        },
+      },
+      {
+        Name: 'storage_diagnostics',
+        Description: 'Extract and structure ALL storage/volume/CSI info from collected log bundles in ONE call. Parses kubelet volume mount errors (FailedMount, FailedAttachVolume, Multi-Attach), EBS CSI driver logs (controller + node), EFS CSI driver logs, PV/PVC/StorageClass status, and instance EBS attachment capacity. Returns structured data with an eksStorageContext section containing guardrails to prevent misinterpretation. IMPORTANT EKS STORAGE RULES: (1) Multi-Attach error with ~6 minute delay after pod termination is NORMAL K8s behavior (maxWaitForUnmountDuration), NOT a CSI bug — check Node.Status.VolumesInUse. (2) EBS attachment slots are SHARED with ENIs on pre-Gen7 instances (m5/c5/r5) — VPC CNI ENIs consume EBS slots. Fix: prefix delegation, --reserved-volume-attachments, or Gen7+. (3) IMDSv2 hop limit must be >=2 for containerized CSI drivers. (4) ebs.csi.aws.com/agent-not-ready taint prevents scheduling before CSI is ready. (5) XFS "wrong fs type, bad superblock" on AL2 with newer xfsprogs — fix: --legacy-xfs=true. (6) EFS PV/PVC capacity is MEANINGLESS — EFS is elastic, capacity field is required by K8s but not enforced. (7) EFS dynamic provisioning = access points (up to 1000 per FS). EFS file system must be pre-created. (8) StorageClass kubernetes.io/aws-ebs uses deprecated in-tree driver — CSI migration translates at runtime. (9) EC2 API throttling from CSI sidecars with high --worker-threads affects ALL instances in account/region. (10) Network policies in strict mode can block CSI driver communication (EC2 API 443, NFS 2049). (11) For cross-VPC EFS mounts, botocore must be installed for DNS resolution fallback. Always read eksStorageContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID to analyze storage/volumes for',
+            },
+            sections: {
+              Type: 'string',
+              Description: 'Comma-separated sections: "kubelet,ebs_csi,efs_csi,pv_pvc,instance" or "all" (default: "all")',
+            },
+          },
+          Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            sections: { Type: 'object', Description: 'Map of section name → structured data' },
+            eksStorageContext: { Type: 'object', Description: 'EKS-specific storage guardrails and context. MUST read guardrails array before diagnosing any storage/volume/CSI issue. Contains cross-referenced findings (e.g., instance type, ENI count, CSINode allocatable).' },
             assessment: { Type: 'string' },
             issues: { Type: 'array' },
             confidence: { Type: 'string', Description: 'high|medium|low|none' },
@@ -1360,6 +1431,47 @@ export class SsmAutomationGatewayV2Construct extends Construct {
           },
         },
       },
+      // =====================================================================
+      // SOP MANAGEMENT TOOLS
+      // =====================================================================
+      {
+        Name: 'list_sops',
+        Description: 'List all available Standard Operating Procedures (SOPs) in the S3 bucket. Returns name, size, and last modified date for each SOP.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {},
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            sops: { Type: 'array', Description: 'Array of {name, size, lastModified}' },
+            count: { Type: 'integer' },
+            bucket: { Type: 'string' },
+          },
+        },
+      },
+      {
+        Name: 'get_sop',
+        Description: 'Get a specific Standard Operating Procedure (SOP) by name. Returns the full content of the SOP file. Use list_sops first to discover available SOPs.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            sopName: {
+              Type: 'string',
+              Description: 'The name/key of the SOP file to retrieve (e.g., "runbooks/pod-crashloop.md")',
+            },
+          },
+          Required: ['sopName'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            sop: { Type: 'object', Description: '{name, content, size, lastModified, contentType}' },
+          },
+        },
+      },
+      // =====================================================================
+
     ];
   }
 

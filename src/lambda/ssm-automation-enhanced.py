@@ -24,6 +24,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 from botocore.exceptions import ClientError
 
+
 # AWS Clients - default region (where Lambda runs)
 ssm_client = boto3.client('ssm')
 s3_client = boto3.client('s3')
@@ -2161,6 +2162,61 @@ def safe_s3_list(prefix: str, max_keys: int = 1000) -> Dict:
         }
 
 
+def list_sops(arguments: Dict) -> Dict:
+    """List all SOPs in the SOP S3 bucket."""
+    sop_bucket = os.environ.get('SOP_BUCKET_NAME', '')
+    if not sop_bucket:
+        return error_response(400, 'SOP_BUCKET_NAME not configured')
+
+    try:
+        s3 = boto3.client('s3')
+        response = s3.list_objects_v2(Bucket=sop_bucket)
+        if 'Contents' not in response:
+            return success_response({'sops': [], 'count': 0, 'bucket': sop_bucket})
+
+        sops = []
+        for obj in response['Contents']:
+            sops.append({
+                'name': obj['Key'],
+                'size': obj['Size'],
+                'lastModified': obj['LastModified'].isoformat(),
+            })
+        return success_response({'sops': sops, 'count': len(sops), 'bucket': sop_bucket})
+    except Exception as e:
+        return error_response(500, f'Failed to list SOPs: {str(e)}')
+
+
+def get_sop(arguments: Dict) -> Dict:
+    """Get a specific SOP by name from the SOP S3 bucket."""
+    sop_bucket = os.environ.get('SOP_BUCKET_NAME', '')
+    if not sop_bucket:
+        return error_response(400, 'SOP_BUCKET_NAME not configured')
+
+    sop_name = arguments.get('sopName')
+    if not sop_name:
+        return error_response(400, 'sopName is required')
+
+    try:
+        s3 = boto3.client('s3')
+        response = s3.get_object(Bucket=sop_bucket, Key=sop_name)
+        content = response['Body'].read().decode('utf-8')
+        return success_response({
+            'sop': {
+                'name': sop_name,
+                'content': content,
+                'size': response['ContentLength'],
+                'lastModified': response['LastModified'].isoformat(),
+                'contentType': response.get('ContentType', 'text/plain'),
+            }
+        })
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return error_response(404, f'SOP "{sop_name}" not found. Use list_sops to see available SOPs.')
+        return error_response(500, f'Failed to get SOP: {str(e)}')
+    except Exception as e:
+        return error_response(500, f'Failed to get SOP: {str(e)}')
+
+
 def lambda_handler(event, context):
     """Main Lambda handler - routes to appropriate tool function."""
     print(f"Received event: {json.dumps(event)}")
@@ -2199,8 +2255,11 @@ def lambda_handler(event, context):
         'batch_collect': batch_collect,
         'batch_status': batch_status,
         'network_diagnostics': network_diagnostics,
+        'storage_diagnostics': storage_diagnostics,
         'tcpdump_capture': tcpdump_capture,
         'tcpdump_analyze': tcpdump_analyze,
+        'list_sops': list_sops,
+        'get_sop': get_sop,
     }
     
     if tool_name not in tools:
@@ -4926,11 +4985,11 @@ def batch_status(arguments: Dict) -> Dict:
 def network_diagnostics(arguments: Dict) -> Dict:
     """
     Extract and structure networking info from collected log bundles.
-    Parses iptables, CNI config, routes, DNS, ENI, and ipamd logs.
+    Parses iptables, CNI config, routes, DNS, ENI, ipamd logs, and kube-proxy.
 
     Inputs:
         instanceId: EC2 instance ID (required)
-        sections: comma-separated: "iptables,cni,routes,dns,eni,ipamd" or "all" (default: "all")
+        sections: comma-separated: "iptables,cni,routes,dns,eni,ipamd,kube_proxy" or "all" (default: "all")
 
     Returns:
         Structured networking diagnostics per section
@@ -4940,9 +4999,9 @@ def network_diagnostics(arguments: Dict) -> Dict:
         return error_response(400, 'instanceId is required')
 
     sections_str = arguments.get('sections', 'all')
-    valid_sections = {'iptables', 'cni', 'routes', 'dns', 'eni', 'ipamd'}
+    valid_sections = {'iptables', 'cni', 'routes', 'dns', 'eni', 'ipamd', 'kube_proxy'}
     if sections_str == 'all':
-        sections = ['iptables', 'cni', 'routes', 'dns', 'eni', 'ipamd']
+        sections = ['iptables', 'cni', 'routes', 'dns', 'eni', 'ipamd', 'kube_proxy']
     else:
         sections = [s.strip() for s in sections_str.split(',')]
         invalid = [s for s in sections if s not in valid_sections]
@@ -5010,6 +5069,18 @@ def network_diagnostics(arguments: Dict) -> Dict:
                 keys = find_files(['aws-node'])[:3]
             section_file_map['ipamd'] = keys
             for k in keys: files_to_fetch.add(k); fetch_sizes[k] = 524288
+        if 'kube_proxy' in sections:
+            keys = find_files(['kube-proxy', 'kube_proxy', 'kubeproxy'])[:5]
+            section_file_map['kube_proxy'] = keys
+            for k in keys: files_to_fetch.add(k); fetch_sizes[k] = 524288
+            # Also grab conntrack/sysctl files for cross-reference
+            ct_keys = find_files(['conntrack', 'nf_conntrack', 'sysctl'])[:3]
+            section_file_map['kube_proxy_conntrack'] = ct_keys
+            for k in ct_keys: files_to_fetch.add(k); fetch_sizes[k] = 65536
+            # Grab modinfo/modules for IPVS kernel module detection
+            mod_keys = find_files(['modinfo', 'modules', 'lsmod'])[:3]
+            section_file_map['kube_proxy_modules'] = mod_keys
+            for k in mod_keys: files_to_fetch.add(k); fetch_sizes[k] = 65536
 
         # Parallel S3 reads
         file_contents = {}
@@ -5035,7 +5106,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
         # IPTABLES
         # =====================================================================
         if 'iptables' in sections:
-            ipt_data = {'raw': None, 'chainCount': 0, 'ruleCount': 0, 'natRules': [], 'kubeProxyRules': [], 'issues': []}
+            ipt_data = {'raw': None, 'chainCount': 0, 'ruleCount': 0, 'natRules': [], 'kubeProxyRules': [], 'snatRules': [], 'dnatRules': [], 'issues': []}
             ipt_files = find_files(['iptables', 'ip-tables', 'iptable'])
             for f in ipt_files[:3]:
                 content = read_file_content(f)
@@ -5043,8 +5114,28 @@ def network_diagnostics(arguments: Dict) -> Dict:
                     lines = content.split('\n')
                     ipt_data['ruleCount'] = sum(1 for l in lines if l.strip() and not l.startswith('#') and not l.startswith('*') and not l.startswith(':'))
                     ipt_data['chainCount'] = sum(1 for l in lines if l.startswith(':'))
-                    ipt_data['natRules'] = [l.strip() for l in lines if 'DNAT' in l or 'SNAT' in l or 'MASQUERADE' in l][:20]
-                    ipt_data['kubeProxyRules'] = [l.strip() for l in lines if 'KUBE-' in l][:20]
+                    ipt_data['natRules'] = [l.strip() for l in lines if 'DNAT' in l or 'SNAT' in l or 'MASQUERADE' in l][:30]
+                    ipt_data['snatRules'] = [l.strip() for l in lines if 'SNAT' in l or 'MASQUERADE' in l][:20]
+                    ipt_data['dnatRules'] = [l.strip() for l in lines if 'DNAT' in l][:20]
+                    ipt_data['kubeProxyRules'] = [l.strip() for l in lines if 'KUBE-' in l][:30]
+                    # AWS VPC CNI specific chains
+                    ipt_data['awsCniChains'] = [l.strip() for l in lines if 'AWS-SNAT' in l or 'AWS-CONNMARK' in l or 'PREROUTING' in l][:20]
+
+                    # --- FORWARD policy check (EKS guardrail) ---
+                    # Custom AMIs often set iptables FORWARD policy to DROP which breaks pod networking.
+                    # AWS docs: "If using a custom AMI, make sure to set the iptables forward policy to ACCEPT under kubelet.service"
+                    forward_policy_lines = [l.strip() for l in lines if ':FORWARD' in l]
+                    ipt_data['forwardPolicy'] = forward_policy_lines[:5] if forward_policy_lines else []
+                    has_forward_drop = any('DROP' in l for l in forward_policy_lines)
+                    if has_forward_drop:
+                        ipt_data['issues'].append(
+                            'iptables FORWARD policy is DROP — this breaks pod networking on EKS. '
+                            'Custom AMIs must set FORWARD policy to ACCEPT under kubelet.service. '
+                            'Fix: add "ExecStartPre=/sbin/iptables -P FORWARD ACCEPT" to kubelet.service.'
+                        )
+                        issues_found.append({'section': 'iptables', 'severity': 'critical',
+                                             'message': 'iptables FORWARD policy is DROP (breaks pod networking on custom AMIs)'})
+
                     # Check for issues
                     if ipt_data['ruleCount'] == 0:
                         ipt_data['issues'].append('No iptables rules found — kube-proxy may not be running')
@@ -5052,6 +5143,18 @@ def network_diagnostics(arguments: Dict) -> Dict:
                     if not any('KUBE-SERVICES' in l for l in lines):
                         ipt_data['issues'].append('KUBE-SERVICES chain missing — kube-proxy not configured')
                         issues_found.append({'section': 'iptables', 'severity': 'warning', 'message': 'KUBE-SERVICES chain missing'})
+
+                    # Check VPC CNI SNAT — cross-reference with CNI config for external SNAT
+                    has_snat = any('SNAT' in l or 'MASQUERADE' in l for l in lines)
+                    has_aws_snat_chain = any('AWS-SNAT-CHAIN' in l for l in lines)
+                    ipt_data['_snat_present'] = has_snat  # internal flag for cross-reference
+                    if not has_snat:
+                        # Defer severity — will be adjusted after CNI section if external SNAT is enabled
+                        ipt_data['issues'].append('No SNAT/MASQUERADE rules found in iptables (see eksNetworkingContext for interpretation)')
+                        issues_found.append({'section': 'iptables', 'severity': 'info',
+                                             'message': 'No SNAT rules — may be expected if AWS_VPC_K8S_CNI_EXTERNALSNAT=true (NAT gateway handles SNAT)'})
+                    if has_aws_snat_chain:
+                        ipt_data['vpcCniSnat'] = 'AWS-SNAT-CHAIN present (VPC CNI managing SNAT)'
                     ipt_data['sourceFile'] = f
                     break
             results['iptables'] = ipt_data
@@ -5086,6 +5189,106 @@ def network_diagnostics(arguments: Dict) -> Dict:
                 issues_found.append({'section': 'cni', 'severity': 'critical', 'message': 'IP target settings are 0'})
             if env.get('AWS_VPC_K8S_CNI_EXTERNALSNAT', '').lower() == 'true':
                 cni_data['issues'].append('External SNAT enabled — ensure NAT gateway is configured')
+
+            # --- Prefix delegation + zero warm targets check ---
+            if env.get('ENABLE_PREFIX_DELEGATION', '').lower() == 'true':
+                warm_prefix = env.get('WARM_PREFIX_TARGET', '')
+                warm_ip = env.get('WARM_IP_TARGET', '')
+                min_ip = env.get('MINIMUM_IP_TARGET', '')
+                if warm_prefix == '0' or (warm_ip == '0' and min_ip == '0'):
+                    cni_data['issues'].append(
+                        'ENABLE_PREFIX_DELEGATION=true but warm targets are 0 — this is NOT supported. '
+                        'Pod IP assignment will be extremely slow as IPAMD maintains no prefixes in warm pool. '
+                        'Set WARM_PREFIX_TARGET>=1 or WARM_IP_TARGET/MINIMUM_IP_TARGET > 0.'
+                    )
+                    issues_found.append({'section': 'cni', 'severity': 'critical',
+                                         'message': 'Prefix delegation enabled with zero warm targets (unsupported config)'})
+
+            # --- ENABLE_POD_ENI (trunk ENI / security groups per pod) ---
+            if env.get('ENABLE_POD_ENI', '').lower() == 'true':
+                sgp_mode = env.get('POD_SECURITY_GROUP_ENFORCING_MODE', 'strict')
+                cni_data['securityGroupsPerPod'] = {
+                    'enabled': True,
+                    'enforcingMode': sgp_mode,
+                    'note': (
+                        'Trunk ENI enabled for security groups per pod. '
+                        f'Enforcing mode: {sgp_mode}. '
+                        'In "strict" mode, SGP pods bypass VPC CNI SNAT — traffic uses branch ENI directly. '
+                        'In "standard" mode, SGP pods use VPC CNI SNAT like regular pods.'
+                    )
+                }
+
+            # --- Network policy enforcing mode ---
+            np_mode = env.get('NETWORK_POLICY_ENFORCING_MODE', '')
+            if np_mode:
+                cni_data['networkPolicyMode'] = np_mode
+                if np_mode.lower() == 'strict':
+                    cni_data['issues'].append(
+                        'NETWORK_POLICY_ENFORCING_MODE=strict: New pods will have DEFAULT DENY until a '
+                        'NetworkPolicy explicitly allows traffic. This can cause connectivity issues for '
+                        'pods without matching NetworkPolicy rules.'
+                    )
+                    issues_found.append({'section': 'cni', 'severity': 'warning',
+                                         'message': 'Network policy strict mode — new pods default deny'})
+
+            # --- ENABLE_NFTABLES detection ---
+            nftables_env = env.get('ENABLE_NFTABLES', '')
+            if nftables_env:
+                cni_data['nftablesMode'] = nftables_env
+                # Note: In v1.13.1+ ENABLE_NFTABLES is deprecated (auto-detected from kubelet)
+
+            # --- IP_COOLDOWN_PERIOD ---
+            cooldown = env.get('IP_COOLDOWN_PERIOD', '')
+            if cooldown:
+                cni_data['ipCooldownPeriod'] = cooldown
+
+            # --- AWS_VPC_K8S_CNI_EXCLUDE_SNAT_CIDRS ---
+            exclude_snat = env.get('AWS_VPC_K8S_CNI_EXCLUDE_SNAT_CIDRS', '')
+            if exclude_snat:
+                cni_data['excludeSnatCidrs'] = exclude_snat
+
+            # --- AWS_VPC_K8S_CNI_RANDOMIZESNAT ---
+            randomize_snat = env.get('AWS_VPC_K8S_CNI_RANDOMIZESNAT', '')
+            if randomize_snat:
+                cni_data['randomizeSnat'] = randomize_snat
+
+            # --- DISABLE_NETWORK_RESOURCE_PROVISIONING ---
+            if env.get('DISABLE_NETWORK_RESOURCE_PROVISIONING', '').lower() == 'true':
+                cni_data['issues'].append(
+                    'DISABLE_NETWORK_RESOURCE_PROVISIONING=true: VPC CNI uses IMDS-only mode. '
+                    'ENI/IP management is handled externally. This is an advanced config.'
+                )
+
+            # --- AWS_MANAGE_ENIS_NON_SCHEDULABLE ---
+            if env.get('AWS_MANAGE_ENIS_NON_SCHEDULABLE', '').lower() == 'true':
+                cni_data['manageEnisNonSchedulable'] = True
+
+            # --- Missing ENABLE_IPv4/ENABLE_IPv6 (known crash bug in v1.10.x) ---
+            has_enable_ipv4 = 'ENABLE_IPv4' in env or 'ENABLE_IPV4' in env
+            has_enable_ipv6 = 'ENABLE_IPv6' in env or 'ENABLE_IPV6' in env
+            if not has_enable_ipv4 and not has_enable_ipv6 and env:
+                cni_data['issues'].append(
+                    'Neither ENABLE_IPv4 nor ENABLE_IPv6 env vars found. '
+                    'VPC CNI v1.10.x+ requires these — missing them can cause aws-node crash (SIGSEGV). '
+                    'Ensure the full CNI manifest is applied, not just the image tag update.'
+                )
+
+            # Capture key env vars for guardrails cross-reference
+            cni_data['_parsedFlags'] = {
+                'externalSnat': env.get('AWS_VPC_K8S_CNI_EXTERNALSNAT', '').lower() == 'true',
+                'customNetworking': env.get('AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG', '').lower() == 'true',
+                'prefixDelegation': env.get('ENABLE_PREFIX_DELEGATION', '').lower() == 'true',
+                'podEni': env.get('ENABLE_POD_ENI', '').lower() == 'true',
+                'sgpMode': env.get('POD_SECURITY_GROUP_ENFORCING_MODE', 'strict'),
+                'networkPolicyMode': env.get('NETWORK_POLICY_ENFORCING_MODE', ''),
+                'nftables': env.get('ENABLE_NFTABLES', ''),
+                'ipCooldown': env.get('IP_COOLDOWN_PERIOD', '30'),
+                'excludeSnatCidrs': env.get('AWS_VPC_K8S_CNI_EXCLUDE_SNAT_CIDRS', ''),
+                'warmEniTarget': env.get('WARM_ENI_TARGET', '1'),
+                'warmIpTarget': env.get('WARM_IP_TARGET', ''),
+                'minimumIpTarget': env.get('MINIMUM_IP_TARGET', ''),
+            }
+
             cni_data['sourceFiles'] = cni_files[:5]
             results['cni'] = cni_data
 
@@ -5094,7 +5297,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
         # =====================================================================
         if 'routes' in sections:
             route_data = {'routes': [], 'defaultGateway': None, 'interfaces': [], 'issues': []}
-            route_files = find_files(['ip-route', 'ip_route', 'route-table', 'routes'])
+            route_files = find_files(['iproute', 'ip-route', 'ip_route', 'route-table', 'routes'])
             for f in route_files[:3]:
                 content = read_file_content(f)
                 if content:
@@ -5107,7 +5310,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
                             route_data['defaultGateway'] = line
 
             # Parse interfaces
-            iface_files = find_files(['ifconfig', 'ip-addr', 'ip_addr', 'interfaces'])
+            iface_files = find_files(['ifconfig', 'ip-addr', 'ip_addr', 'ipaddr', 'interfaces'])
             for f in iface_files[:2]:
                 content = read_file_content(f)
                 if content:
@@ -5126,9 +5329,46 @@ def network_diagnostics(arguments: Dict) -> Dict:
                                     'ip': ip_match.group(1),
                                 })
 
+            # On EKS nodes with VPC CNI, pod traffic uses secondary ENIs with SNAT.
+            # A missing default gateway on the host route table is NOT necessarily
+            # a critical issue — downgrade to info if multiple ENIs are present.
+            has_multiple_enis = len(route_data['interfaces']) >= 2
             if not route_data['defaultGateway']:
-                route_data['issues'].append('No default gateway found')
-                issues_found.append({'section': 'routes', 'severity': 'critical', 'message': 'No default gateway'})
+                if has_multiple_enis:
+                    route_data['issues'].append('No default gateway on host route table (expected on EKS nodes with VPC CNI — secondary ENIs handle pod traffic via SNAT)')
+                    issues_found.append({'section': 'routes', 'severity': 'info', 'message': 'No host default gateway (VPC CNI uses secondary ENI SNAT)'})
+                else:
+                    route_data['issues'].append('No default gateway found')
+                    issues_found.append({'section': 'routes', 'severity': 'critical', 'message': 'No default gateway'})
+
+            # --- nm-cloud-setup detection (breaks VPC CNI ip rules) ---
+            # NetworkManager-cloud-setup overwrites ip rules installed for pods.
+            # Symptom: routing table 30200 or 30400 present.
+            has_nm_cloud_setup = any('30200' in r or '30400' in r for r in route_data['routes'])
+            if has_nm_cloud_setup:
+                route_data['nmCloudSetup'] = True
+                route_data['issues'].append(
+                    'Routing table 30200 or 30400 detected — nm-cloud-setup (NetworkManager-cloud-setup) '
+                    'is likely active. This service is INCOMPATIBLE with VPC CNI and overwrites pod ip rules, '
+                    'breaking pod networking. Fix: disable/remove nm-cloud-setup service. '
+                    'See: https://github.com/aws/amazon-vpc-cni-k8s/blob/master/docs/troubleshooting.md'
+                )
+                issues_found.append({'section': 'routes', 'severity': 'critical',
+                                     'message': 'nm-cloud-setup detected (routing table 30200/30400) — breaks VPC CNI pod networking'})
+
+            # --- VPC CNI policy routing detection ---
+            # VPC CNI creates per-ENI route tables and ip rules like:
+            #   "from <pod-ip> lookup eni-X" and "to <pod-ip> lookup main"
+            # These are NORMAL and expected.
+            policy_routes = [r for r in route_data['routes'] if 'lookup' in r and ('eni-' in r or 'from' in r)]
+            if policy_routes:
+                route_data['vpcCniPolicyRoutes'] = len(policy_routes)
+                route_data['_note'] = (
+                    'VPC CNI uses policy routing: each secondary ENI has its own route table. '
+                    'ip rules like "from <pod-ip> lookup eni-X" are NORMAL — they route pod egress '
+                    'traffic through the correct ENI. Do NOT flag these as suspicious.'
+                )
+
             route_data['routeCount'] = len(route_data['routes'])
             route_data['routes'] = route_data['routes'][:50]  # Cap output
             results['routes'] = route_data
@@ -5262,7 +5502,15 @@ def network_diagnostics(arguments: Dict) -> Dict:
                     ipamd_data['ipAllocationIssues'].extend(ip_issues[:20])
 
             if ipamd_data['ipAllocationIssues']:
+                # EKS guardrail: After pod deletion, VPC CNI has a configurable IP cooldown cache.
+                # Transient "no available IP" messages during this window are NORMAL.
+                cooldown_period = results.get('cni', {}).get('_parsedFlags', {}).get('ipCooldown', '30')
                 ipamd_data['issues'].append(f"{len(ipamd_data['ipAllocationIssues'])} IP allocation issues found — possible subnet IP exhaustion")
+                ipamd_data['issues'].append(
+                    f'NOTE: Transient "no available IP" after pod deletion is normal — VPC CNI has a '
+                    f'{cooldown_period}-second IP cooldown cache (IP_COOLDOWN_PERIOD={cooldown_period}) '
+                    f'to let kube-proxy finish updating iptables rules before recycling the IP.'
+                )
                 issues_found.append({'section': 'ipamd', 'severity': 'critical', 'message': 'IP allocation failures detected'})
             if ipamd_data['errors']:
                 ipamd_data['issues'].append(f"{len(ipamd_data['errors'])} errors in IPAMD logs")
@@ -5270,8 +5518,456 @@ def network_diagnostics(arguments: Dict) -> Dict:
             results['ipamd'] = ipamd_data
 
         # =====================================================================
+        # KUBE-PROXY (proxy mode, conntrack, version, IPVS, errors)
+        # =====================================================================
+        if 'kube_proxy' in sections:
+            kp_data = {'proxyMode': 'unknown', 'config': {}, 'conntrack': {}, 'ipvs': {},
+                       'errors': [], 'syncErrors': [], 'versionInfo': None, 'issues': []}
+
+            kp_files = find_files(['kube-proxy', 'kube_proxy', 'kubeproxy'])
+            for f in kp_files[:5]:
+                content = read_file_content(f, max_size=524288)
+                if content:
+                    lines = content.split('\n')
+
+                    # --- Detect proxy mode ---
+                    for line in lines:
+                        ll = line.lower()
+                        if 'using ipvs proxier' in ll or 'ipvs proxier' in ll:
+                            kp_data['proxyMode'] = 'ipvs'
+                            break
+                        elif 'using nftables proxier' in ll or 'nftables proxier' in ll:
+                            kp_data['proxyMode'] = 'nftables'
+                            break
+                        elif 'using iptables proxier' in ll or 'iptables proxier' in ll:
+                            kp_data['proxyMode'] = 'iptables'
+                            break
+
+                    # --- Parse kube-proxy config (from ConfigMap dump or args) ---
+                    for line in lines:
+                        stripped = line.strip()
+                        # ConfigMap-style key: value
+                        if 'mode:' in stripped and ('iptables' in stripped or 'ipvs' in stripped or 'nftables' in stripped):
+                            mode_match = re.search(r'mode:\s*["\']?(\w+)', stripped)
+                            if mode_match:
+                                kp_data['config']['mode'] = mode_match.group(1)
+                                if kp_data['proxyMode'] == 'unknown':
+                                    kp_data['proxyMode'] = mode_match.group(1)
+                        if 'scheduler:' in stripped:
+                            sched_match = re.search(r'scheduler:\s*["\']?(\w+)', stripped)
+                            if sched_match:
+                                kp_data['config']['ipvsScheduler'] = sched_match.group(1)
+                        if 'syncPeriod:' in stripped:
+                            sync_match = re.search(r'syncPeriod:\s*["\']?(\S+)', stripped)
+                            if sync_match:
+                                kp_data['config']['syncPeriod'] = sync_match.group(1)
+                        if 'minSyncPeriod:' in stripped:
+                            msync_match = re.search(r'minSyncPeriod:\s*["\']?(\S+)', stripped)
+                            if msync_match:
+                                kp_data['config']['minSyncPeriod'] = msync_match.group(1)
+                        if 'maxPerCore:' in stripped:
+                            mpc_match = re.search(r'maxPerCore:\s*(\d+)', stripped)
+                            if mpc_match:
+                                kp_data['conntrack']['maxPerCore'] = int(mpc_match.group(1))
+                        if 'conntrack' in stripped and 'min:' in stripped:
+                            cmin_match = re.search(r'min:\s*(\d+)', stripped)
+                            if cmin_match:
+                                kp_data['conntrack']['min'] = int(cmin_match.group(1))
+
+                    # --- Detect kube-proxy version ---
+                    for line in lines:
+                        ver_match = re.search(r'kube-proxy\s+v?(\d+\.\d+\.\d+)', line)
+                        if ver_match:
+                            kp_data['versionInfo'] = ver_match.group(1)
+                            break
+                    if not kp_data['versionInfo']:
+                        for line in lines:
+                            ver_match = re.search(r'v(\d+\.\d+\.\d+)-eksbuild', line)
+                            if ver_match:
+                                kp_data['versionInfo'] = ver_match.group(1)
+                                break
+
+                    # --- Parse errors and sync failures ---
+                    error_lines = []
+                    sync_errors = []
+                    conntrack_errors = []
+                    for line in lines:
+                        ll = line.lower()
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        # Conntrack table full
+                        if 'nf_conntrack' in ll and ('table full' in ll or 'dropping packet' in ll):
+                            conntrack_errors.append(stripped[:200])
+                        # Sync errors
+                        if 'failed to sync' in ll or 'sync rules failed' in ll or 'syncrules' in ll.replace(' ', ''):
+                            sync_errors.append(stripped[:200])
+                        # General errors (skip Prometheus metric lines)
+                        if ('error' in ll or 'failed' in ll) and '{' not in stripped:
+                            error_lines.append(stripped[:200])
+                        # Conntrack cleanup failures
+                        if 'conntrack' in ll and ('failed' in ll or 'error' in ll):
+                            conntrack_errors.append(stripped[:200])
+                        # Watch/list failures (API server connectivity)
+                        if 'failed to list' in ll or 'failed to watch' in ll:
+                            sync_errors.append(stripped[:200])
+
+                    kp_data['errors'] = error_lines[:30]
+                    kp_data['syncErrors'] = sync_errors[:20]
+                    if conntrack_errors:
+                        kp_data['conntrack']['errors'] = conntrack_errors[:20]
+                    kp_data['errorCount'] = len(error_lines)
+                    kp_data['syncErrorCount'] = len(sync_errors)
+                    kp_data['sourceFile'] = f
+                    break  # Use first file with content
+
+            # --- Parse conntrack/sysctl files for nf_conntrack_max ---
+            ct_files = find_files(['conntrack', 'nf_conntrack', 'sysctl'])
+            for f in ct_files[:3]:
+                content = read_file_content(f, max_size=65536)
+                if content:
+                    # Look for nf_conntrack_max value
+                    for line in content.split('\n'):
+                        if 'nf_conntrack_max' in line:
+                            val_match = re.search(r'(\d+)', line)
+                            if val_match:
+                                kp_data['conntrack']['nfConntrackMax'] = int(val_match.group(1))
+                        if 'nf_conntrack_count' in line:
+                            val_match = re.search(r'(\d+)', line)
+                            if val_match:
+                                kp_data['conntrack']['nfConntrackCount'] = int(val_match.group(1))
+
+            # --- Parse modules files for IPVS kernel module detection ---
+            mod_files = find_files(['modinfo', 'modules', 'lsmod'])
+            for f in mod_files[:3]:
+                content = read_file_content(f, max_size=65536)
+                if content:
+                    ipvs_modules = ['ip_vs', 'ip_vs_rr', 'ip_vs_wrr', 'ip_vs_sh', 'ip_vs_lc',
+                                    'ip_vs_wlc', 'ip_vs_lblc', 'ip_vs_sed', 'ip_vs_nq', 'nf_conntrack']
+                    loaded = []
+                    missing = []
+                    for mod in ipvs_modules:
+                        if mod in content:
+                            loaded.append(mod)
+                        else:
+                            missing.append(mod)
+                    if loaded:
+                        kp_data['ipvs']['loadedModules'] = loaded
+                    if missing:
+                        kp_data['ipvs']['missingModules'] = missing
+
+            # --- Issue detection ---
+            # Conntrack table full
+            ct_max = kp_data['conntrack'].get('nfConntrackMax', 0)
+            ct_count = kp_data['conntrack'].get('nfConntrackCount', 0)
+            ct_errors = kp_data['conntrack'].get('errors', [])
+            if ct_errors:
+                kp_data['issues'].append(
+                    f'{len(ct_errors)} conntrack errors found (table full / dropping packets). '
+                    f'Current nf_conntrack_max={ct_max}. Each entry uses ~300 bytes of memory. '
+                    'Fix: increase conntrack.min in kube-proxy-config ConfigMap, then restart kube-proxy DaemonSet.'
+                )
+                issues_found.append({'section': 'kube_proxy', 'severity': 'critical',
+                                     'message': f'Conntrack table full errors ({len(ct_errors)} occurrences)'})
+            elif ct_max > 0 and ct_count > 0 and ct_count > ct_max * 0.8:
+                kp_data['issues'].append(
+                    f'Conntrack table is {int(ct_count/ct_max*100)}% full ({ct_count}/{ct_max}). '
+                    'Risk of packet drops. Consider increasing conntrack.min in kube-proxy-config.'
+                )
+                issues_found.append({'section': 'kube_proxy', 'severity': 'warning',
+                                     'message': f'Conntrack table {int(ct_count/ct_max*100)}% full'})
+
+            # IPVS mode without required kernel modules
+            if kp_data['proxyMode'] == 'ipvs':
+                missing_mods = kp_data.get('ipvs', {}).get('missingModules', [])
+                critical_mods = [m for m in missing_mods if m in ('ip_vs', 'ip_vs_rr', 'nf_conntrack')]
+                if critical_mods:
+                    kp_data['issues'].append(
+                        f'kube-proxy is in IPVS mode but critical kernel modules are missing: {", ".join(critical_mods)}. '
+                        'IPVS will not function correctly. Fix: modprobe the missing modules and add them to /etc/modules-load.d/ipvs.conf.'
+                    )
+                    issues_found.append({'section': 'kube_proxy', 'severity': 'critical',
+                                         'message': f'IPVS mode missing kernel modules: {", ".join(critical_mods)}'})
+
+            # Sync errors (API server connectivity)
+            if kp_data['syncErrorCount'] > 10:
+                kp_data['issues'].append(
+                    f'{kp_data["syncErrorCount"]} sync/watch errors in kube-proxy logs. '
+                    'kube-proxy cannot sync iptables/ipvs rules from API server. '
+                    'Check: API server connectivity, node network, kube-proxy service account permissions.'
+                )
+                issues_found.append({'section': 'kube_proxy', 'severity': 'warning',
+                                     'message': f'{kp_data["syncErrorCount"]} kube-proxy sync errors'})
+
+            # No kube-proxy logs found at all
+            if not kp_files:
+                kp_data['issues'].append(
+                    'No kube-proxy log files found in the bundle. kube-proxy may not be running, '
+                    'or logs are not captured by the EKS log collector. Check: kubectl get ds kube-proxy -n kube-system.'
+                )
+                issues_found.append({'section': 'kube_proxy', 'severity': 'warning',
+                                     'message': 'No kube-proxy logs found in bundle'})
+
+            # Cross-reference: iptables mode on nftables-based OS (RHEL 8.6+)
+            nftables_env = results.get('cni', {}).get('_parsedFlags', {}).get('nftables', '')
+            if kp_data['proxyMode'] == 'iptables' and nftables_env.lower() == 'true':
+                kp_data['issues'].append(
+                    'kube-proxy is in iptables mode but the host OS uses nftables (ENABLE_NFTABLES=true). '
+                    'iptables rules may not be visible to nftables and vice versa. '
+                    'Consider switching kube-proxy to IPVS mode for RHEL 8.6+ / nftables-based systems.'
+                )
+                issues_found.append({'section': 'kube_proxy', 'severity': 'warning',
+                                     'message': 'kube-proxy iptables mode on nftables-based OS'})
+
+            # Store internal flags for cross-reference
+            kp_data['_parsedFlags'] = {
+                'proxyMode': kp_data['proxyMode'],
+                'hasConntrackErrors': len(ct_errors) > 0,
+                'conntrackMax': ct_max,
+                'conntrackCount': ct_count,
+                'ipvsMode': kp_data['proxyMode'] == 'ipvs',
+            }
+
+            results['kube_proxy'] = kp_data
+
+        # =====================================================================
         # OVERALL SUMMARY
         # =====================================================================
+
+        # --- EKS Networking Guardrails: Cross-reference sections to prevent false positives ---
+        eks_context = {
+            '_purpose': 'EKS-specific networking context to prevent misinterpretation of findings. '
+                        'EKS worker nodes use VPC CNI which fundamentally changes how networking works '
+                        'compared to traditional Linux hosts. DO NOT diagnose EKS nodes like bare-metal servers.',
+            'guardrails': [],
+            'logPaths': {
+                'ipamd': '/var/log/aws-routed-eni/ipamd.log',
+                'cniPlugin': '/var/log/aws-routed-eni/plugin.log',
+                'ipamState': '/var/run/aws-node/ipam.json',
+                'ipamdDebugEndpoint': 'curl http://localhost:61679/v1/enis',
+                'ipamdPodsEndpoint': 'curl http://localhost:61679/v1/pods',
+                'ipamdMetrics': 'curl http://localhost:61678/metrics',
+            }
+        }
+
+        # Cross-reference: external SNAT + missing iptables SNAT rules
+        cni_flags = results.get('cni', {}).get('_parsedFlags', {})
+        cni_env = results.get('cni', {}).get('envVars', {})
+        external_snat = cni_flags.get('externalSnat', False)
+        ipt_snat_present = results.get('iptables', {}).get('_snat_present', True)
+
+        if external_snat:
+            eks_context['externalSnat'] = True
+            exclude_cidrs = cni_flags.get('excludeSnatCidrs', '')
+            snat_note = (
+                'AWS_VPC_K8S_CNI_EXTERNALSNAT=true: VPC CNI does NOT add SNAT/MASQUERADE rules to iptables. '
+                'The off-VPC IP rule is also NOT applied. '
+                'Pod egress traffic is NATed by the VPC NAT Gateway instead. Missing SNAT rules in iptables is EXPECTED.'
+            )
+            if exclude_cidrs:
+                snat_note += f' Additionally, SNAT is excluded for CIDRs: {exclude_cidrs}.'
+            eks_context['guardrails'].append(snat_note)
+            # Downgrade any SNAT-related iptables issues to info
+            for issue in issues_found:
+                if issue.get('section') == 'iptables' and 'SNAT' in issue.get('message', ''):
+                    issue['severity'] = 'info'
+                    issue['message'] += ' [EXPECTED: external SNAT enabled, NAT gateway handles egress]'
+        elif not ipt_snat_present and not external_snat and 'iptables' in results:
+            eks_context['guardrails'].append(
+                'No SNAT rules found and AWS_VPC_K8S_CNI_EXTERNALSNAT is not true. '
+                'Pod egress traffic may fail. Check if NAT gateway is configured or if VPC CNI SNAT is expected.'
+            )
+
+        # Cross-reference: custom networking
+        custom_networking = cni_flags.get('customNetworking', False)
+        if custom_networking:
+            eks_context['customNetworking'] = True
+            eks_context['guardrails'].append(
+                'AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true: Custom networking is enabled. '
+                'Pods do NOT get IPs from the primary ENI subnet. They use ENIConfig CRDs to specify '
+                'which subnet/security group to use. Empty primary ENI secondary IPs is EXPECTED.'
+            )
+
+        # Cross-reference: prefix delegation
+        enable_prefix = cni_flags.get('prefixDelegation', False)
+        if enable_prefix:
+            eks_context['prefixDelegation'] = True
+            eks_context['guardrails'].append(
+                'ENABLE_PREFIX_DELEGATION=true: VPC CNI assigns /28 IPv4 prefixes (16 IPs each) instead of individual IPs. '
+                'ENI slot usage looks different — each slot holds 16 IPs. Fewer ENIs with more IPs per ENI is normal. '
+                'WARM_PREFIX_TARGET controls pre-allocation. Setting WARM_PREFIX_TARGET=0 or both '
+                'WARM_IP_TARGET=0 and MINIMUM_IP_TARGET=0 is NOT supported with prefix delegation.'
+            )
+
+        # Cross-reference: security groups per pod (trunk ENI)
+        pod_eni = cni_flags.get('podEni', False)
+        if pod_eni:
+            sgp_mode = cni_flags.get('sgpMode', 'strict')
+            eks_context['securityGroupsPerPod'] = True
+            eks_context['guardrails'].append(
+                f'ENABLE_POD_ENI=true: Trunk ENI enabled for security groups per pod. '
+                f'Enforcing mode: {sgp_mode}. '
+                f'In "strict" mode, SGP pods bypass VPC CNI SNAT — traffic uses branch ENI directly. '
+                f'In "standard" mode, SGP pods use VPC CNI SNAT like regular pods. '
+                f'Trunk ENI changes ENI attachment behavior — do NOT flag extra ENIs as anomalous.'
+            )
+
+        # Cross-reference: network policy strict mode
+        np_mode = cni_flags.get('networkPolicyMode', '')
+        if np_mode.lower() == 'strict':
+            eks_context['networkPolicyStrict'] = True
+            eks_context['guardrails'].append(
+                'NETWORK_POLICY_ENFORCING_MODE=strict: New pods have DEFAULT DENY until a NetworkPolicy '
+                'explicitly allows traffic. If pods cannot communicate, check for missing NetworkPolicy rules '
+                'before investigating CNI/routing issues. Network policies are NOT supported on GPU instances, '
+                'Fargate, Windows nodes, or pods with hostNetwork=true.'
+            )
+
+        # Cross-reference: nm-cloud-setup
+        if results.get('routes', {}).get('nmCloudSetup'):
+            eks_context['guardrails'].append(
+                'nm-cloud-setup (NetworkManager-cloud-setup) DETECTED via routing table 30200/30400. '
+                'This service is INCOMPATIBLE with VPC CNI — it overwrites ip rules installed for pods, '
+                'breaking pod networking. This is a KNOWN ISSUE on RHEL8 AMIs. '
+                'Fix: disable nm-cloud-setup.service and nm-cloud-setup.timer.'
+            )
+
+        # Cross-reference: nftables vs iptables-legacy
+        nftables_env = cni_flags.get('nftables', '')
+        if nftables_env:
+            eks_context['guardrails'].append(
+                f'ENABLE_NFTABLES={nftables_env}: VPC CNI iptables mode is explicitly set. '
+                'VPC CNI uses iptables-legacy by default. If the host OS uses nftables (RHEL 8.x+, Ubuntu 21.x+) '
+                'but VPC CNI uses iptables-legacy, rules may not be visible to each other. '
+                'In v1.13.1+, ENABLE_NFTABLES is deprecated — iptables mode is auto-detected from kubelet.'
+            )
+
+        # Route table context (already handled in routes section, reinforce here)
+        has_multiple_enis = len(results.get('routes', {}).get('interfaces', [])) >= 2
+        if has_multiple_enis:
+            eks_context['guardrails'].append(
+                'Multiple ENIs detected: On EKS nodes with VPC CNI, the host route table may appear empty or '
+                'have no default gateway. This is NORMAL — secondary ENIs handle pod traffic via SNAT. '
+                'VPC CNI creates per-ENI route tables with policy routing rules (ip rule from <pod-ip> lookup eni-X). '
+                'Do NOT flag missing default gateway as a critical issue on multi-ENI EKS nodes.'
+            )
+
+        # VPC CNI pod networking architecture context
+        eks_context['guardrails'].append(
+            'VPC CNI pod networking architecture: Each pod gets a secondary IP from an ENI. '
+            'Inside the pod, default gateway is 169.254.1.1 (link-local) with a static ARP entry pointing to host veth. '
+            'On the host, per-pod /32 routes point to veth interfaces. Each ENI has its own route table. '
+            'Policy routing rules (ip rule) direct pod traffic to the correct ENI route table. '
+            'This is fundamentally different from traditional Linux routing.'
+        )
+
+        # hostNetwork context
+        eks_context['guardrails'].append(
+            'Pods with hostNetwork=true use the node primary IP directly (no SNAT/DNAT translation). '
+            'kube-proxy, aws-node (VPC CNI), and CoreDNS typically run with hostNetwork=true. '
+            'Their traffic will NOT appear in VPC CNI SNAT chains.'
+        )
+
+        # IP cooldown context (use configured value)
+        cooldown_val = cni_flags.get('ipCooldown', '30')
+        eks_context['guardrails'].append(
+            f'After pod deletion, VPC CNI holds the IP in a {cooldown_val}-second cooldown cache '
+            f'(IP_COOLDOWN_PERIOD={cooldown_val}) before returning it to the warm pool. '
+            'This allows kube-proxy to finish updating iptables rules. Transient "no available IP" or "IP not in datastore" '
+            'messages during this window are NORMAL and self-resolving.'
+        )
+
+        # WARM_ENI_TARGET / WARM_IP_TARGET context
+        warm_eni = cni_flags.get('warmEniTarget', '1')
+        warm_ip = cni_flags.get('warmIpTarget', '')
+        min_ip = cni_flags.get('minimumIpTarget', '')
+        if warm_ip or min_ip:
+            eks_context['guardrails'].append(
+                f'WARM_IP_TARGET={warm_ip}, MINIMUM_IP_TARGET={min_ip}: Fine-grained IP warm pool control. '
+                'Use only for small clusters or low pod churn. High values increase EC2 API calls which can get '
+                'throttled, preventing new ENIs/IPs from being attached to ANY instance in the cluster. '
+                'Default WARM_ENI_TARGET=1 is recommended for most clusters.'
+            )
+
+        # iptables FORWARD policy context
+        eks_context['guardrails'].append(
+            'iptables FORWARD policy must be ACCEPT for pod networking to work. Custom AMIs often set it to DROP. '
+            'Fix: add "ExecStartPre=/sbin/iptables -P FORWARD ACCEPT" to kubelet.service. '
+            'The EKS-optimized AMI sets this correctly by default.'
+        )
+
+        # systemd-udev MACAddressPolicy context
+        eks_context['guardrails'].append(
+            'systemd-udev: Linux distributions with systemd-udev may set MACAddressPolicy=persistent '
+            'in /usr/lib/systemd/network/99-default.link. This can change the MAC address of host veth interfaces '
+            'after they are moved to the host namespace, breaking the static ARP entry in pods. '
+            'Known to affect Ubuntu 22.04+. Fix: set MACAddressPolicy=none.'
+        )
+
+        # --- kube-proxy guardrails ---
+        kp_flags = results.get('kube_proxy', {}).get('_parsedFlags', {})
+        kp_mode = kp_flags.get('proxyMode', 'unknown')
+
+        # Proxy mode context
+        if kp_mode == 'ipvs':
+            eks_context['kubeProxyMode'] = 'ipvs'
+            eks_context['guardrails'].append(
+                'kube-proxy is in IPVS mode: Uses hash tables instead of linear iptables rules for service routing. '
+                'Recommended for clusters with 1000+ services. Requires ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, '
+                'nf_conntrack kernel modules. Validate with "sudo ipvsadm -L". In IPVS mode, KUBE-SVC iptables '
+                'chains will NOT exist — this is EXPECTED, not a sign of broken kube-proxy.'
+            )
+        elif kp_mode == 'nftables':
+            eks_context['kubeProxyMode'] = 'nftables'
+            eks_context['guardrails'].append(
+                'kube-proxy is in nftables mode (alpha/beta): Uses nftables instead of iptables for service routing. '
+                'Rules are NOT visible via iptables-save — use "nft list ruleset" instead. '
+                'Missing KUBE-SERVICES chains in iptables output is EXPECTED in nftables mode.'
+            )
+        elif kp_mode == 'iptables':
+            eks_context['kubeProxyMode'] = 'iptables'
+            eks_context['guardrails'].append(
+                'kube-proxy is in iptables mode (default): Creates KUBE-SERVICES, KUBE-SVC-*, KUBE-SEP-* chains. '
+                'For clusters with 1000+ services, iptables mode causes latency due to sequential rule processing. '
+                'Consider IPVS mode for large clusters. On RHEL 8.6+ / nftables-based OS, iptables mode may not '
+                'work correctly — switch to IPVS mode.'
+            )
+
+        # Conntrack context
+        ct_max = kp_flags.get('conntrackMax', 0)
+        if ct_max > 0:
+            eks_context['guardrails'].append(
+                f'Conntrack table: nf_conntrack_max={ct_max}. Formula: max(conntrack.min, conntrack.maxPerCore * num_cores). '
+                'Each entry uses ~300 bytes of memory. "nf_conntrack: table full, dropping packet" in dmesg means '
+                'the table is exhausted — increase conntrack.min in kube-proxy-config ConfigMap and restart kube-proxy. '
+                'High-traffic nodes (load balancers, ingress controllers) are most susceptible.'
+            )
+
+        # kube-proxy version skew context
+        kp_version = results.get('kube_proxy', {}).get('versionInfo')
+        if kp_version:
+            eks_context['guardrails'].append(
+                f'kube-proxy version: {kp_version}. kube-proxy must be within 1 minor version of the cluster '
+                'control plane version. Version skew beyond this can cause service routing failures. '
+                'After cluster upgrade, update kube-proxy add-on to match.'
+            )
+
+        # kube-proxy static stability context
+        eks_context['guardrails'].append(
+            'kube-proxy static stability: During API server disconnections, existing kube-proxy rules '
+            'continue to function. In-cluster service routing remains available. kube-proxy pods continue '
+            'running. New services/endpoints will NOT be reflected until API server connectivity is restored.'
+        )
+
+        # Clean up internal flags from results
+        if 'iptables' in results and '_snat_present' in results['iptables']:
+            del results['iptables']['_snat_present']
+        if 'cni' in results and '_parsedFlags' in results['cni']:
+            # Keep _parsedFlags in results for agent reference but rename to parsedFlags
+            results['cni']['parsedFlags'] = results['cni'].pop('_parsedFlags')
+        if 'kube_proxy' in results and '_parsedFlags' in results['kube_proxy']:
+            results['kube_proxy']['parsedFlags'] = results['kube_proxy'].pop('_parsedFlags')
+
         total_issues = len(issues_found)
         critical_issues = sum(1 for i in issues_found if i.get('severity') == 'critical')
         warning_issues = sum(1 for i in issues_found if i.get('severity') == 'warning')
@@ -5304,6 +6000,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
             'instanceId': instance_id,
             'sections': sections,
             'diagnostics': results,
+            'eksNetworkingContext': eks_context,
             'issuesSummary': {
                 'total': total_issues,
                 'critical': critical_issues,
@@ -5313,7 +6010,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
             'confidence': confidence,
             'gaps': gaps,
             'overallAssessment': _network_assessment(issues_found),
-            'nextStep': 'Use search tool to dig deeper into specific networking errors, or correlate to build a timeline.' if issues_found else 'No networking issues detected in the bundle.',
+            'nextStep': 'Review eksNetworkingContext guardrails before concluding on any networking issue. Use search tool only if you need a SPECIFIC pattern not already surfaced.' if issues_found else 'No networking issues detected in the bundle.',
         })
 
     except Exception as e:
@@ -5330,6 +6027,683 @@ def _network_assessment(issues: List[Dict]) -> str:
         return f"CRITICAL — {len(critical)} critical networking issues in: {', '.join(sections)}. Immediate investigation needed."
     return f"WARNING — {len(issues)} non-critical networking issues found. Review recommended."
 
+
+
+# =============================================================================
+# STORAGE / VOLUME MOUNT / CSI DIAGNOSTICS
+# =============================================================================
+
+def storage_diagnostics(arguments: Dict) -> Dict:
+    """
+    Extract and structure storage/volume/CSI info from collected log bundles.
+    Parses kubelet volume mount errors, EBS/EFS CSI driver logs, PV/PVC status,
+    and cross-references with instance type and ENI config.
+
+    Inputs:
+        instanceId: EC2 instance ID (required)
+        sections: comma-separated: "kubelet,ebs_csi,efs_csi,pv_pvc,instance" or "all" (default: "all")
+
+    Returns:
+        Structured storage diagnostics per section with eksStorageContext guardrails
+    """
+    instance_id = arguments.get('instanceId')
+    if not instance_id:
+        return error_response(400, 'instanceId is required')
+
+    sections_str = arguments.get('sections', 'all')
+    valid_sections = {'kubelet', 'ebs_csi', 'efs_csi', 'pv_pvc', 'instance'}
+    if sections_str == 'all':
+        sections = ['kubelet', 'ebs_csi', 'efs_csi', 'pv_pvc', 'instance']
+    else:
+        sections = [s.strip() for s in sections_str.split(',')]
+        invalid = [s for s in sections if s not in valid_sections]
+        if invalid:
+            return error_response(400, f"Invalid section(s): {', '.join(invalid)}. Valid: {', '.join(sorted(valid_sections))}")
+
+    results = {}
+    issues_found = []
+
+    try:
+        # Find extracted bundle files
+        bundle_files = []
+        search_result = safe_s3_list(f"eks_{instance_id}", max_keys=500)
+        if search_result.get('success'):
+            bundle_files = [obj['key'] for obj in search_result.get('objects', []) if '/extracted/' in obj.get('key', '')]
+
+        if not bundle_files:
+            return error_response(404, f'No extracted log bundle found for {instance_id}. Run collect first.')
+
+        def find_files(patterns):
+            matched = []
+            for f in bundle_files:
+                fname = f.lower()
+                for p in patterns:
+                    if p in fname:
+                        matched.append(f)
+                        break
+            return matched
+
+        # Pre-fetch files
+        files_to_fetch = set()
+        fetch_sizes = {}
+
+        if 'kubelet' in sections:
+            keys = find_files(['kubelet'])[:5]
+            for k in keys:
+                files_to_fetch.add(k)
+                fetch_sizes[k] = 524288
+        if 'ebs_csi' in sections:
+            keys = find_files(['ebs-csi', 'ebs_csi', 'aws-ebs-csi'])[:5]
+            for k in keys:
+                files_to_fetch.add(k)
+                fetch_sizes[k] = 524288
+        if 'efs_csi' in sections:
+            keys = find_files(['efs-csi', 'efs_csi', 'aws-efs-csi'])[:5]
+            for k in keys:
+                files_to_fetch.add(k)
+                fetch_sizes[k] = 524288
+        if 'pv_pvc' in sections:
+            keys = find_files(['persistentvolume', 'pv', 'pvc', 'storageclass', 'csinode', 'volumeattachment'])[:8]
+            for k in keys:
+                files_to_fetch.add(k)
+                fetch_sizes[k] = 262144
+
+        file_contents = {}
+        def _fetch(key):
+            r = safe_s3_read(key, max_size=fetch_sizes.get(key, 262144))
+            return key, r.get('content', '') if r.get('success') else None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for key, content in executor.map(_fetch, list(files_to_fetch)):
+                file_contents[key] = content
+
+        def read_content(key, max_size=262144):
+            cached = file_contents.get(key)
+            if cached is not None:
+                return cached
+            r = safe_s3_read(key, max_size=max_size)
+            return r.get('content', '') if r.get('success') else None
+
+
+        # =================================================================
+        # KUBELET VOLUME MOUNT ERRORS
+        # =================================================================
+        if 'kubelet' in sections:
+            kubelet_data = {
+                'volumeErrors': [], 'mountErrors': [], 'attachErrors': [],
+                'multiAttachErrors': [], 'fsErrors': [], 'csiErrors': [],
+                'issues': []
+            }
+            kubelet_files = find_files(['kubelet'])
+            for f in kubelet_files[:5]:
+                content = read_content(f, max_size=524288)
+                if not content:
+                    continue
+                for line in content.split('\n'):
+                    ll = line.lower()
+                    stripped = line.strip()[:300]
+
+                    # FailedMount / FailedAttachVolume
+                    if 'failedmount' in ll or 'failed to mount' in ll:
+                        kubelet_data['mountErrors'].append(stripped)
+                    if 'failedattachvolume' in ll or 'failed to attach' in ll:
+                        kubelet_data['attachErrors'].append(stripped)
+
+                    # Multi-Attach error (6-min delay is NORMAL K8s behavior)
+                    if 'multi-attach' in ll:
+                        kubelet_data['multiAttachErrors'].append(stripped)
+
+                    # Filesystem errors
+                    if ('wrong fs type' in ll or 'bad superblock' in ll or
+                            'mount: ' in ll and 'failed' in ll):
+                        kubelet_data['fsErrors'].append(stripped)
+
+                    # CSI-related kubelet errors
+                    if 'csi' in ll and ('error' in ll or 'failed' in ll):
+                        kubelet_data['csiErrors'].append(stripped)
+
+                    # Generic volume errors
+                    if 'volume' in ll and ('error' in ll or 'failed' in ll or 'timeout' in ll):
+                        kubelet_data['volumeErrors'].append(stripped)
+
+            # Cap arrays
+            for key in ['volumeErrors', 'mountErrors', 'attachErrors', 'multiAttachErrors', 'fsErrors', 'csiErrors']:
+                kubelet_data[key] = kubelet_data[key][:25]
+
+            # Guardrail: Multi-Attach 6-minute delay
+            if kubelet_data['multiAttachErrors']:
+                kubelet_data['issues'].append(
+                    f"{len(kubelet_data['multiAttachErrors'])} Multi-Attach errors found. "
+                    "IMPORTANT: After unclean pod termination, Kubernetes waits ~6 minutes before "
+                    "force-detaching an EBS volume (maxWaitForUnmountDuration). This is NORMAL K8s "
+                    "behavior, NOT a CSI driver bug. Check Node.Status.VolumesInUse to see if the "
+                    "old node still reports the volume."
+                )
+                issues_found.append({'section': 'kubelet', 'severity': 'warning',
+                                     'message': 'Multi-Attach errors (6-min delay is normal K8s behavior after unclean termination)'})
+
+            # Guardrail: XFS superblock error on older kernels
+            xfs_errors = [e for e in kubelet_data['fsErrors'] if 'wrong fs type' in e.lower() or 'bad superblock' in e.lower()]
+            if xfs_errors:
+                kubelet_data['issues'].append(
+                    "Filesystem mount errors detected (wrong fs type / bad superblock). "
+                    "If using XFS on Amazon Linux 2 with newer xfsprogs, this is a KNOWN ISSUE. "
+                    "Fix: set --legacy-xfs=true on the EBS CSI node DaemonSet. "
+                    "Also check: mkfs options, volume was formatted with a compatible filesystem."
+                )
+                issues_found.append({'section': 'kubelet', 'severity': 'critical',
+                                     'message': 'Filesystem mount errors (check XFS compatibility / --legacy-xfs)'})
+
+            if kubelet_data['mountErrors'] and not kubelet_data['multiAttachErrors']:
+                issues_found.append({'section': 'kubelet', 'severity': 'critical',
+                                     'message': f"{len(kubelet_data['mountErrors'])} FailedMount errors in kubelet logs"})
+            if kubelet_data['attachErrors']:
+                issues_found.append({'section': 'kubelet', 'severity': 'critical',
+                                     'message': f"{len(kubelet_data['attachErrors'])} FailedAttachVolume errors in kubelet logs"})
+
+            kubelet_data['sourceFiles'] = kubelet_files[:5]
+            results['kubelet'] = kubelet_data
+
+
+        # =================================================================
+        # EBS CSI DRIVER
+        # =================================================================
+        if 'ebs_csi' in sections:
+            ebs_data = {
+                'controllerErrors': [], 'nodeErrors': [], 'attachLimitIssues': [],
+                'throttlingErrors': [], 'iamErrors': [], 'issues': []
+            }
+            ebs_files = find_files(['ebs-csi', 'ebs_csi', 'aws-ebs-csi'])
+            # Also check container logs for ebs-csi pods
+            if not ebs_files:
+                ebs_files = find_files(['ebs-csi'])
+            for f in ebs_files[:5]:
+                content = read_content(f, max_size=524288)
+                if not content:
+                    continue
+                is_controller = 'controller' in f.lower()
+                for line in content.split('\n'):
+                    ll = line.lower()
+                    stripped = line.strip()[:300]
+
+                    # EC2 API throttling
+                    if 'throttl' in ll or 'requestlimitexceeded' in ll or 'rate exceeded' in ll:
+                        ebs_data['throttlingErrors'].append(stripped)
+
+                    # Volume attach limit
+                    if 'attach' in ll and ('limit' in ll or 'maximum' in ll or 'capacity' in ll):
+                        ebs_data['attachLimitIssues'].append(stripped)
+
+                    # IAM / permission errors
+                    if ('accessdenied' in ll or 'unauthorized' in ll or
+                            'not authorized' in ll or 'forbidden' in ll):
+                        ebs_data['iamErrors'].append(stripped)
+
+                    # General errors
+                    if 'error' in ll or 'failed' in ll:
+                        if is_controller:
+                            ebs_data['controllerErrors'].append(stripped)
+                        else:
+                            ebs_data['nodeErrors'].append(stripped)
+
+            # Cap arrays
+            for key in ebs_data:
+                if isinstance(ebs_data[key], list) and key != 'issues':
+                    ebs_data[key] = ebs_data[key][:20]
+
+            # Guardrail: EC2 API throttling
+            if ebs_data['throttlingErrors']:
+                ebs_data['issues'].append(
+                    f"{len(ebs_data['throttlingErrors'])} EC2 API throttling errors. "
+                    "High worker-threads in CSI sidecars (external-provisioner, external-attacher) "
+                    "can cause EC2 API throttling that affects ALL instances in the account/region, "
+                    "not just this node. Reduce --worker-threads or --kube-api-qps in sidecar containers."
+                )
+                issues_found.append({'section': 'ebs_csi', 'severity': 'critical',
+                                     'message': 'EC2 API throttling in EBS CSI (affects entire account/region)'})
+
+            # Guardrail: IAM permissions
+            if ebs_data['iamErrors']:
+                ebs_data['issues'].append(
+                    f"{len(ebs_data['iamErrors'])} IAM/permission errors. "
+                    "EBS CSI driver needs AmazonEBSCSIDriverPolicy. Use EKS Pod Identity or IRSA "
+                    "(NOT instance profile). For encrypted volumes, add KMS permissions: "
+                    "kms:CreateGrant, kms:Decrypt, kms:GenerateDataKeyWithoutPlaintext."
+                )
+                issues_found.append({'section': 'ebs_csi', 'severity': 'critical',
+                                     'message': 'IAM permission errors in EBS CSI driver'})
+
+            # Guardrail: Attach limit
+            if ebs_data['attachLimitIssues']:
+                ebs_data['issues'].append(
+                    f"{len(ebs_data['attachLimitIssues'])} volume attachment limit issues. "
+                    "ENIs consume EBS attachment slots on pre-Gen7 instances (shared limit). "
+                    "With VPC CNI prefix delegation, fewer ENIs are used, freeing EBS slots. "
+                    "Gen7+ instances (m7i, c7g, etc.) have DEDICATED EBS attachment limits separate from ENIs. "
+                    "Use --reserved-volume-attachments or --volume-attach-limit on CSI node to adjust. "
+                    "K8s 1.34+ supports MutableCSINodeAllocatableCount for dynamic limit updates."
+                )
+                issues_found.append({'section': 'ebs_csi', 'severity': 'warning',
+                                     'message': 'EBS volume attachment limit issues (check ENI vs EBS slot sharing)'})
+
+            if ebs_data['controllerErrors'] or ebs_data['nodeErrors']:
+                total = len(ebs_data['controllerErrors']) + len(ebs_data['nodeErrors'])
+                issues_found.append({'section': 'ebs_csi', 'severity': 'warning',
+                                     'message': f'{total} errors in EBS CSI driver logs'})
+
+            ebs_data['sourceFiles'] = ebs_files[:5]
+            results['ebs_csi'] = ebs_data
+
+
+        # =================================================================
+        # EFS CSI DRIVER
+        # =================================================================
+        if 'efs_csi' in sections:
+            efs_data = {
+                'controllerErrors': [], 'nodeErrors': [], 'mountErrors': [],
+                'accessPointIssues': [], 'dnsErrors': [], 'issues': []
+            }
+            efs_files = find_files(['efs-csi', 'efs_csi', 'aws-efs-csi'])
+            if not efs_files:
+                efs_files = find_files(['efs-csi'])
+            for f in efs_files[:5]:
+                content = read_content(f, max_size=524288)
+                if not content:
+                    continue
+                is_controller = 'controller' in f.lower()
+                for line in content.split('\n'):
+                    ll = line.lower()
+                    stripped = line.strip()[:300]
+
+                    # Mount failures
+                    if 'mount' in ll and ('failed' in ll or 'error' in ll or 'timeout' in ll):
+                        efs_data['mountErrors'].append(stripped)
+
+                    # Access point issues
+                    if 'accesspoint' in ll or 'access_point' in ll or 'access point' in ll:
+                        if 'error' in ll or 'failed' in ll or 'not found' in ll:
+                            efs_data['accessPointIssues'].append(stripped)
+
+                    # DNS resolution failures (botocore fallback)
+                    if 'dns' in ll or 'resolve' in ll or 'nslookup' in ll:
+                        if 'error' in ll or 'failed' in ll or 'timeout' in ll:
+                            efs_data['dnsErrors'].append(stripped)
+
+                    # General errors
+                    if 'error' in ll or 'failed' in ll:
+                        if is_controller:
+                            efs_data['controllerErrors'].append(stripped)
+                        else:
+                            efs_data['nodeErrors'].append(stripped)
+
+            for key in efs_data:
+                if isinstance(efs_data[key], list) and key != 'issues':
+                    efs_data[key] = efs_data[key][:20]
+
+            # Guardrail: EFS mount timeout
+            if efs_data['mountErrors']:
+                efs_data['issues'].append(
+                    f"{len(efs_data['mountErrors'])} EFS mount errors. "
+                    "Common causes: (1) Security group missing NFS port 2049 inbound rule, "
+                    "(2) No mount target in the node's AZ/subnet, "
+                    "(3) Network policy blocking NFS traffic (port 2049), "
+                    "(4) For cross-VPC mounts, botocore must be installed for DNS resolution fallback."
+                )
+                issues_found.append({'section': 'efs_csi', 'severity': 'critical',
+                                     'message': 'EFS mount errors (check SG port 2049, mount target AZ, network policy)'})
+
+            # Guardrail: Access point issues
+            if efs_data['accessPointIssues']:
+                efs_data['issues'].append(
+                    f"{len(efs_data['accessPointIssues'])} access point issues. "
+                    "EFS dynamic provisioning creates access points automatically. "
+                    "Each EFS file system supports up to 1000 access points. "
+                    "The EFS file system itself must be pre-created — CSI driver only creates access points."
+                )
+                issues_found.append({'section': 'efs_csi', 'severity': 'warning',
+                                     'message': 'EFS access point issues'})
+
+            # Guardrail: DNS errors (cross-VPC)
+            if efs_data['dnsErrors']:
+                efs_data['issues'].append(
+                    f"{len(efs_data['dnsErrors'])} DNS resolution errors. "
+                    "For cross-VPC EFS mounts, install botocore in the CSI driver container "
+                    "to enable mount target IP resolution fallback when DNS fails."
+                )
+                issues_found.append({'section': 'efs_csi', 'severity': 'warning',
+                                     'message': 'EFS DNS resolution errors (check cross-VPC botocore fallback)'})
+
+            efs_data['sourceFiles'] = efs_files[:5]
+            results['efs_csi'] = efs_data
+
+
+        # =================================================================
+        # PV / PVC / STORAGECLASS STATUS
+        # =================================================================
+        if 'pv_pvc' in sections:
+            pv_data = {
+                'persistentVolumes': [], 'persistentVolumeClaims': [],
+                'storageClasses': [], 'csiNodes': [], 'volumeAttachments': [],
+                'issues': []
+            }
+            pv_files = find_files(['persistentvolume', 'pv', 'pvc', 'storageclass', 'csinode', 'volumeattachment'])
+            for f in pv_files[:8]:
+                content = read_content(f, max_size=262144)
+                if not content:
+                    continue
+                fname = f.lower()
+
+                # Try JSON parse for kubectl output
+                try:
+                    data = json.loads(content)
+                    items = data.get('items', [data]) if isinstance(data, dict) else []
+                    for item in items[:50]:
+                        kind = item.get('kind', '')
+                        meta = item.get('metadata', {})
+                        spec = item.get('spec', {})
+                        status = item.get('status', {})
+                        name = meta.get('name', 'unknown')
+
+                        if kind == 'PersistentVolume' or 'persistentvolume' in fname:
+                            pv_entry = {
+                                'name': name,
+                                'capacity': spec.get('capacity', {}).get('storage', ''),
+                                'accessModes': spec.get('accessModes', []),
+                                'reclaimPolicy': spec.get('persistentVolumeReclaimPolicy', ''),
+                                'storageClass': spec.get('storageClassName', ''),
+                                'phase': status.get('phase', ''),
+                                'csiDriver': spec.get('csi', {}).get('driver', ''),
+                                'volumeHandle': spec.get('csi', {}).get('volumeHandle', '')[:50],
+                            }
+                            pv_data['persistentVolumes'].append(pv_entry)
+                            # Check for stuck PVs
+                            if status.get('phase') == 'Released':
+                                pv_data['issues'].append(f"PV {name} is Released but not reclaimed (reclaimPolicy={spec.get('persistentVolumeReclaimPolicy', '')})")
+                                issues_found.append({'section': 'pv_pvc', 'severity': 'warning', 'message': f'PV {name} stuck in Released phase'})
+
+                        elif kind == 'PersistentVolumeClaim' or 'pvc' in fname:
+                            pvc_entry = {
+                                'name': name,
+                                'namespace': meta.get('namespace', ''),
+                                'storageClass': spec.get('storageClassName', ''),
+                                'accessModes': spec.get('accessModes', []),
+                                'requestedStorage': spec.get('resources', {}).get('requests', {}).get('storage', ''),
+                                'phase': status.get('phase', ''),
+                                'volumeName': spec.get('volumeName', ''),
+                            }
+                            pv_data['persistentVolumeClaims'].append(pvc_entry)
+                            if status.get('phase') == 'Pending':
+                                pv_data['issues'].append(f"PVC {meta.get('namespace', '')}/{name} is Pending — no PV bound")
+                                issues_found.append({'section': 'pv_pvc', 'severity': 'critical', 'message': f'PVC {name} stuck in Pending phase'})
+
+                        elif kind == 'StorageClass' or 'storageclass' in fname:
+                            pv_data['storageClasses'].append({
+                                'name': name,
+                                'provisioner': spec.get('provisioner', item.get('provisioner', '')),
+                                'reclaimPolicy': spec.get('reclaimPolicy', item.get('reclaimPolicy', '')),
+                                'volumeBindingMode': spec.get('volumeBindingMode', item.get('volumeBindingMode', '')),
+                                'allowVolumeExpansion': item.get('allowVolumeExpansion', False),
+                            })
+                            # Guardrail: in-tree provisioner migration
+                            provisioner = spec.get('provisioner', item.get('provisioner', ''))
+                            if provisioner == 'kubernetes.io/aws-ebs':
+                                pv_data['issues'].append(
+                                    f"StorageClass {name} uses in-tree provisioner kubernetes.io/aws-ebs. "
+                                    "CSI migration translates this to ebs.csi.aws.com at runtime. "
+                                    "If CSI migration feature gates are disabled, volumes will use the deprecated in-tree driver."
+                                )
+                                issues_found.append({'section': 'pv_pvc', 'severity': 'info',
+                                                     'message': f'StorageClass {name} uses in-tree provisioner (CSI migration active)'})
+
+                        elif kind == 'CSINode' or 'csinode' in fname:
+                            drivers = spec.get('drivers', [])
+                            for drv in drivers:
+                                pv_data['csiNodes'].append({
+                                    'name': name,
+                                    'driver': drv.get('name', ''),
+                                    'allocatable': drv.get('allocatable', {}).get('count'),
+                                    'topologyKeys': drv.get('topologyKeys', []),
+                                })
+
+                        elif kind == 'VolumeAttachment' or 'volumeattachment' in fname:
+                            pv_data['volumeAttachments'].append({
+                                'name': name,
+                                'attacher': spec.get('attacher', ''),
+                                'nodeName': spec.get('nodeName', ''),
+                                'pvName': spec.get('source', {}).get('persistentVolumeName', ''),
+                                'attached': status.get('attached', False),
+                            })
+                            if not status.get('attached', False):
+                                pv_data['issues'].append(f"VolumeAttachment {name} not attached to {spec.get('nodeName', '')}")
+                                issues_found.append({'section': 'pv_pvc', 'severity': 'warning',
+                                                     'message': f'VolumeAttachment {name} not attached'})
+                except (json.JSONDecodeError, TypeError):
+                    # Not JSON — try line-based parsing for kubectl text output
+                    pass
+
+            # Cap arrays
+            for key in ['persistentVolumes', 'persistentVolumeClaims', 'storageClasses', 'csiNodes', 'volumeAttachments']:
+                pv_data[key] = pv_data[key][:30]
+
+            pv_data['sourceFiles'] = pv_files[:8]
+            results['pv_pvc'] = pv_data
+
+
+        # =================================================================
+        # INSTANCE TYPE / EBS ATTACHMENT CAPACITY
+        # =================================================================
+        if 'instance' in sections:
+            inst_data = {'instanceType': None, 'ebsLimits': {}, 'eniCount': 0, 'issues': []}
+            try:
+                target_region = resolve_region(arguments, instance_id)
+                regional_ec2 = get_regional_client('ec2', target_region)
+                desc = regional_ec2.describe_instances(InstanceIds=[instance_id])
+                reservations = desc.get('Reservations', [])
+                if reservations and reservations[0].get('Instances'):
+                    inst = reservations[0]['Instances'][0]
+                    inst_type = inst.get('InstanceType', '')
+                    inst_data['instanceType'] = inst_type
+
+                    # Count ENIs
+                    eni_resp = regional_ec2.describe_network_interfaces(
+                        Filters=[{'Name': 'attachment.instance-id', 'Values': [instance_id]}]
+                    )
+                    eni_count = len(eni_resp.get('NetworkInterfaces', []))
+                    inst_data['eniCount'] = eni_count
+
+                    # Check if Gen7+ (dedicated EBS limits)
+                    is_gen7_plus = False
+                    gen_match = re.match(r'^[a-z]+(\d+)', inst_type)
+                    if gen_match:
+                        gen_num = int(gen_match.group(1))
+                        is_gen7_plus = gen_num >= 7
+                    inst_data['isGen7Plus'] = is_gen7_plus
+
+                    if is_gen7_plus:
+                        inst_data['ebsLimits']['note'] = (
+                            f'{inst_type} is Gen7+ — has DEDICATED EBS volume attachment limits '
+                            'separate from ENI limits. ENIs do NOT consume EBS attachment slots.'
+                        )
+                    else:
+                        inst_data['ebsLimits']['note'] = (
+                            f'{inst_type} is pre-Gen7 — EBS and ENI share attachment slots. '
+                            f'Currently {eni_count} ENIs attached, each consuming an EBS slot. '
+                            'With VPC CNI prefix delegation, fewer ENIs are needed, freeing EBS slots.'
+                        )
+                        if eni_count >= 3:
+                            inst_data['issues'].append(
+                                f'{eni_count} ENIs attached on pre-Gen7 instance {inst_type}. '
+                                'Each ENI consumes an EBS attachment slot. If volume attach fails, '
+                                'consider: (1) Enable prefix delegation to reduce ENI count, '
+                                '(2) Use --reserved-volume-attachments on CSI node, '
+                                '(3) Upgrade to Gen7+ instance type with dedicated EBS limits.'
+                            )
+                            issues_found.append({'section': 'instance', 'severity': 'info',
+                                                 'message': f'{eni_count} ENIs on pre-Gen7 {inst_type} (shared EBS/ENI slots)'})
+
+                    # Check IMDS hop limit for CSI driver
+                    metadata_options = inst.get('MetadataOptions', {})
+                    hop_limit = metadata_options.get('HttpPutResponseHopLimit', 1)
+                    inst_data['imdsHopLimit'] = hop_limit
+                    if hop_limit < 2:
+                        inst_data['issues'].append(
+                            f'IMDSv2 hop limit is {hop_limit} (must be >=2 for containerized CSI drivers). '
+                            'EBS CSI node DaemonSet runs in a container and needs 2 hops to reach IMDS. '
+                            'Fix: aws ec2 modify-instance-metadata-options --instance-id {instance_id} '
+                            '--http-put-response-hop-limit 2'
+                        )
+                        issues_found.append({'section': 'instance', 'severity': 'critical',
+                                             'message': f'IMDSv2 hop limit={hop_limit} (needs >=2 for CSI drivers in containers)'})
+
+            except Exception as e:
+                inst_data['issues'].append(f'Could not query instance info: {str(e)}')
+
+            results['instance'] = inst_data
+
+        # =================================================================
+        # EKS STORAGE CONTEXT (guardrails)
+        # =================================================================
+        eks_context = {
+            '_purpose': 'EKS-specific storage context to prevent misinterpretation of volume/CSI findings. '
+                        'Read guardrails array before concluding on any storage issue.',
+            'guardrails': [],
+            'logPaths': {
+                'kubeletVolumeManager': 'journalctl -u kubelet | grep -i volume',
+                'ebsCsiController': '/var/log/containers/*ebs-csi-controller*',
+                'ebsCsiNode': '/var/log/containers/*ebs-csi-node*',
+                'efsCsiController': '/var/log/containers/*efs-csi-controller*',
+                'efsCsiNode': '/var/log/containers/*efs-csi-node*',
+                'csiNodeInfo': 'kubectl get csinodes -o yaml',
+                'volumeAttachments': 'kubectl get volumeattachments -o yaml',
+            }
+        }
+
+        # Always-present guardrails
+        eks_context['guardrails'].extend([
+            'Multi-Attach error with ~6 minute delay after pod termination is NORMAL Kubernetes behavior. '
+            'K8s waits maxWaitForUnmountDuration (default 6min) before force-detaching EBS volumes. '
+            'This is NOT a CSI driver bug. Check Node.Status.VolumesInUse on the old node.',
+
+            'EBS volume attachment slots are SHARED with ENIs on pre-Gen7 instances (m5, c5, r5, etc.). '
+            'VPC CNI attaches secondary ENIs for pod IPs — each ENI consumes an EBS slot. '
+            'If volume attach fails with "maximum number of volumes already attached", check ENI count. '
+            'Fix: enable prefix delegation (fewer ENIs), use --reserved-volume-attachments, or upgrade to Gen7+.',
+
+            'IMDSv2 hop limit must be >=2 for EBS/EFS CSI drivers running in containers. '
+            'With hop limit=1, CSI node DaemonSet cannot reach IMDS for instance metadata. '
+            'Fix: modify-instance-metadata-options --http-put-response-hop-limit 2.',
+
+            'ebs.csi.aws.com/agent-not-ready:NoExecute taint prevents pods from scheduling before '
+            'the EBS CSI node DaemonSet is ready. If pods are stuck Pending with this taint, '
+            'check that the EBS CSI node DaemonSet is running and healthy on the node.',
+
+            'XFS "wrong fs type, bad superblock" on Amazon Linux 2 with newer xfsprogs is a KNOWN ISSUE. '
+            'Fix: set --legacy-xfs=true on the EBS CSI node DaemonSet args.',
+
+            'EFS storage capacity in PV/PVC is MEANINGLESS — EFS is elastic and ignores the capacity value. '
+            'The capacity field is required by Kubernetes but NOT enforced by EFS. '
+            'Do NOT flag EFS PV/PVC capacity mismatches as issues.',
+
+            'EFS dynamic provisioning creates access points (up to 1000 per file system). '
+            'The EFS file system itself must be pre-created — CSI driver only manages access points. '
+            'Each PV maps to one access point.',
+
+            'StorageClass with provisioner kubernetes.io/aws-ebs uses the deprecated in-tree driver. '
+            'CSI migration feature gates translate this to ebs.csi.aws.com at runtime. '
+            'If CSI migration is disabled, volumes use the old in-tree path. '
+            'Kubelet MUST be drained before changing CSI migration feature gates.',
+
+            'EC2 API throttling from CSI sidecars (external-provisioner, external-attacher) with high '
+            '--worker-threads can prevent volume operations across the ENTIRE account/region, not just one node. '
+            'Symptoms: CreateVolume/AttachVolume/DetachVolume timeouts across multiple nodes simultaneously.',
+
+            'Network policies in strict mode can block CSI driver communication. '
+            'EBS CSI controller needs to reach EC2 API (HTTPS 443). '
+            'EFS CSI node needs NFS port 2049 to mount targets. '
+            'Ensure NetworkPolicy allows egress for CSI driver pods.',
+
+            'For cross-VPC EFS mounts, install botocore in the EFS CSI driver container. '
+            'Without botocore, DNS resolution for mount targets in other VPCs will fail. '
+            'The driver falls back to botocore-based mount target IP resolution.',
+        ])
+
+        # Cross-reference: instance type context
+        inst_type = results.get('instance', {}).get('instanceType', '')
+        is_gen7 = results.get('instance', {}).get('isGen7Plus', False)
+        eni_count = results.get('instance', {}).get('eniCount', 0)
+        if inst_type and not is_gen7 and eni_count >= 2:
+            eks_context['guardrails'].append(
+                f'Instance {inst_type} (pre-Gen7) has {eni_count} ENIs attached. '
+                f'Each ENI consumes an EBS attachment slot. Available EBS slots are reduced. '
+                'This is the #1 cause of "maximum volumes attached" errors on EKS nodes with VPC CNI.'
+            )
+
+        # Cross-reference: CSINode allocatable count
+        csi_nodes = results.get('pv_pvc', {}).get('csiNodes', [])
+        for cn in csi_nodes:
+            if cn.get('driver') == 'ebs.csi.aws.com' and cn.get('allocatable') is not None:
+                eks_context['ebsCsiAllocatable'] = cn['allocatable']
+                eks_context['guardrails'].append(
+                    f'CSINode reports ebs.csi.aws.com allocatable count = {cn["allocatable"]}. '
+                    'This is the max EBS volumes this node can attach as reported by the CSI driver. '
+                    'If this seems low, check --volume-attach-limit and --reserved-volume-attachments flags.'
+                )
+                break
+
+        # Clean up and return
+        total_issues = len(issues_found)
+        critical_issues = sum(1 for i in issues_found if i.get('severity') == 'critical')
+        warning_issues = sum(1 for i in issues_found if i.get('severity') == 'warning')
+
+        sections_with_data = sum(1 for s in sections if s in results and results[s])
+        if sections_with_data >= 3 and critical_issues > 0:
+            confidence = 'high'
+        elif sections_with_data >= 2 and total_issues > 0:
+            confidence = 'medium'
+        elif sections_with_data >= 1:
+            confidence = 'low'
+        else:
+            confidence = 'none'
+
+        gaps = []
+        if not bundle_files:
+            gaps.append('No extracted bundle found — collect and wait for completion first')
+        for s in sections:
+            if s not in results:
+                gaps.append(f'No data found for section: {s}')
+            elif s in results and not any(v for k, v in results[s].items() if k not in ('issues', 'sourceFiles')):
+                gaps.append(f'Section {s} returned empty data')
+
+        return success_response({
+            'instanceId': instance_id,
+            'sections': sections,
+            'diagnostics': results,
+            'eksStorageContext': eks_context,
+            'issuesSummary': {
+                'total': total_issues,
+                'critical': critical_issues,
+                'warning': warning_issues,
+                'issues': issues_found,
+            },
+            'confidence': confidence,
+            'gaps': gaps,
+            'overallAssessment': _storage_assessment(issues_found),
+            'nextStep': 'Review eksStorageContext guardrails before concluding on any storage issue.' if issues_found else 'No storage issues detected in the bundle.',
+        })
+
+    except Exception as e:
+        return error_response(500, f'storage_diagnostics failed: {str(e)}')
+
+
+def _storage_assessment(issues: List[Dict]) -> str:
+    """Generate overall storage health assessment."""
+    if not issues:
+        return "HEALTHY — No storage/volume/CSI issues detected in the log bundle."
+    critical = [i for i in issues if i.get('severity') == 'critical']
+    if critical:
+        sections = set(i['section'] for i in critical)
+        return f"CRITICAL — {len(critical)} critical storage issues in: {', '.join(sections)}. Immediate investigation needed."
+    return f"WARNING — {len(issues)} non-critical storage issues found. Review recommended."
 
 # =============================================================================
 # TCPDUMP CAPTURE VIA SSM RUN COMMAND

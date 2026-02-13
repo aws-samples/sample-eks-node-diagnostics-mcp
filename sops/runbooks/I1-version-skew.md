@@ -1,0 +1,130 @@
+---
+title: "I1 — Kubernetes Version Skew"
+description: "Diagnose API errors and node registration failures caused by Kubernetes version skew"
+status: active
+severity: HIGH
+triggers:
+  - "the server could not find the requested resource"
+  - "no matches for kind.*in version"
+  - "is deprecated.*removed in"
+  - "kubelet version.*skew"
+owner: devops-agent
+objective: "Identify version skew between control plane, nodes, and addons, then plan upgrade path"
+context: "Kubernetes supports N-2 minor version skew between control plane and nodes. Exceeding this causes registration failures, API errors, and feature incompatibilities. Addon versions must also be compatible."
+---
+
+## Phase 1 — Triage
+
+MUST:
+- Use `collect` tool with instanceId of the affected node to gather node-level logs
+- Use `status` tool with executionId to poll until collection completes
+- Use `errors` tool with instanceId and severity=high to get pre-indexed version skew findings
+- Use `search` tool with instanceId and query=`server could not find the requested resource|no matches for kind|deprecated.*removed|kubelet version.*skew` to find version-related errors
+
+SHOULD:
+- Use `cluster_health` tool with clusterName to get cluster version and node version overview
+- Use `search` tool with query=`kubeletVersion|kubeProxyVersion|server version` to find version strings in logs
+- Use `compare_nodes` tool with instanceIds of multiple nodes to identify version inconsistencies across the fleet
+
+MAY:
+- Use `search` tool with query=`deprecated|removed in|apiVersion` to find deprecated API usage in kubelet logs
+
+## Phase 2 — Enrich
+
+MUST:
+- Use `correlate` tool with instanceId and pivotEvent=`version` to build timeline of version-related failures
+- Review findings from `errors` tool and `cluster_health` to calculate version skew:
+  - If skew > 2 minor versions: unsupported — nodes must be upgraded
+  - If kubelet > API server: unsupported configuration — upgrade control plane first
+  - If kube-proxy or CoreDNS incompatible: addon version mismatch
+- Use `search` tool with query=`kube-proxy|coredns|aws-node|vpc-cni` to check addon version strings
+
+SHOULD:
+- Use `compare_nodes` tool to identify which nodes are on which versions — find the outliers
+- Use `search` tool with query=`registration.*fail|register.*error|certificate` to check if version skew is causing registration failures
+
+MAY:
+- Use `search` tool with query=`apiserver_requested_deprecated_apis|deprecated API` to find deprecated API usage
+
+## Phase 3 — Report
+
+MUST:
+- Use `summarize` tool with instanceId and finding_ids from version-related findings to generate incident summary
+- State root cause: version skew with specific versions from cluster_health and compare_nodes
+- Recommend upgrade path: control plane first, then nodes, then addons
+- Operator action — not available via MCP tools: upgrade control plane, update node groups, update addons
+
+SHOULD:
+- Include version comparison table from cluster_health and compare_nodes results
+- List any deprecated APIs found in search results that need updating before upgrade
+
+MAY:
+- Recommend upgrade runbook with pre-flight checks
+- Recommend running pluto or kubent to detect deprecated APIs before upgrade
+
+## Guardrails
+
+escalation_conditions:
+  - "Version skew > 3 minor versions (requires multi-step upgrade)"
+  - "Deprecated APIs used by critical workloads — found via search"
+  - "Addon upgrade fails due to compatibility issues"
+
+safety_ratings:
+  - "Log collection (collect), search, errors, correlate, cluster_health, compare_nodes: GREEN (read-only)"
+  - "Upgrade control plane: YELLOW — operator action, not available via MCP tools"
+  - "Update node groups: YELLOW — operator action, not available via MCP tools"
+  - "Update addons: YELLOW — operator action, not available via MCP tools"
+
+## Common Issues
+
+- symptoms: "search returns the server could not find the requested resource"
+  diagnosis: "Workload using API version removed in current control plane version. Use search with query=apiVersion to identify."
+  resolution: "Operator action: update workload manifests to use current API versions before upgrading"
+
+- symptoms: "errors tool returns findings with kubelet version skew or registration failure"
+  diagnosis: "Node kubelet version too old for control plane (>N-2). Use cluster_health to confirm versions."
+  resolution: "Operator action: update node group — aws eks update-nodegroup-version --cluster-name <cluster> --nodegroup-name <ng>"
+
+- symptoms: "compare_nodes shows mixed kubelet versions across fleet"
+  diagnosis: "Rolling upgrade incomplete — some nodes on old version."
+  resolution: "Operator action: complete rolling upgrade of remaining node groups"
+
+- symptoms: "search returns addon incompatible after control plane upgrade"
+  diagnosis: "kube-proxy, CoreDNS, or VPC CNI version not compatible with new K8s version."
+  resolution: "Operator action: update addons — aws eks update-addon --cluster-name <cluster> --addon-name <addon> --addon-version <version>"
+
+## Examples
+
+```
+# Step 1: Collect logs
+collect(instanceId="i-0abc123def456")
+# Step 2: Poll status
+status(executionId="<id-from-step-1>")
+# Step 3: Get version skew findings
+errors(instanceId="i-0abc123def456", severity="high")
+# Step 4: Check cluster version overview
+cluster_health(clusterName="my-cluster")
+# Step 5: Compare node versions
+compare_nodes(instanceIds=["i-0abc123def456","i-0xyz789ghi012"])
+# Step 6: Search for version errors
+search(instanceId="i-0abc123def456", query="server could not find|no matches for kind|deprecated.*removed")
+# Step 7: Correlate version failure timeline
+correlate(instanceId="i-0abc123def456", pivotEvent="version", timeWindow=120)
+# Step 8: Generate summary
+summarize(instanceId="i-0abc123def456", finding_ids=["F-001","F-002"])
+```
+
+## Output Format
+
+```yaml
+root_cause: "Version skew — control plane <v1> vs nodes <v2>"
+evidence:
+  - type: cluster_health
+    content: "<cluster version and node versions from cluster_health>"
+  - type: compare_nodes
+    content: "<version differences from compare_nodes>"
+severity: HIGH
+mitigation:
+  immediate: "Operator: update node groups to within N-2 of control plane"
+  long_term: "Implement upgrade runbook, use managed node groups for auto AMI updates"
+```
