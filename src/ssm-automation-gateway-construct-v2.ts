@@ -633,7 +633,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // =====================================================================
       {
         Name: 'collect',
-        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Supports idempotency tokens to prevent duplicate executions. Supports cross-region: auto-detects instance region or accepts explicit region parameter. CITATION: When presenting results, always cite the executionId and region returned.',
+        Description: 'Start EKS log collection from a worker node. Returns immediately with executionId for async polling. Recommended workflow: collect → status (poll until complete) → quick_triage (ONE call for full analysis). Alternative detailed workflow: collect → status → validate → errors → summarize. Do NOT read individual files unless quick_triage/summarize/network_diagnostics are insufficient. Supports cross-region: auto-detects instance region or accepts explicit region parameter. CITATION: When presenting results, always cite the executionId and region returned.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -723,7 +723,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'validate',
-        Description: 'Verify all expected files were extracted from the log bundle. Returns manifest with file counts, sizes, and missing patterns. Uses manifest.json when available for authoritative file inventory. CITATION: Cite fileCount, totalSizeHuman, and any missingPatterns.',
+        Description: 'Verify all expected files were extracted from the log bundle. Returns manifest with file counts, sizes, and missing patterns. After validate succeeds, call errors (not read) to get findings, then summarize for root cause analysis. CITATION: Cite fileCount, totalSizeHuman, and any missingPatterns.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -753,7 +753,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'errors',
-        Description: 'Get pre-indexed error findings (fast path). Returns categorized errors by severity with finding_ids for citation. Each finding has a stable finding_id (F-001 format). CITATION: Always cite finding_id and severity when referencing findings. Use finding_ids with summarize tool.',
+        Description: 'Get pre-indexed error findings (fast path). Returns categorized errors by severity with finding_ids for citation. Each finding has a stable finding_id (F-001 format). IMPORTANT: After calling errors, pass the finding_ids to the summarize tool for root cause analysis and remediation — do NOT manually read individual log files. CITATION: Always cite finding_id and severity when referencing findings.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -799,7 +799,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'read',
-        Description: 'Read a chunk of a log file using byte-range streaming. NO TRUNCATION. Supports both byte-range and line-based reading for multi-GB files. Line-aligned: byte reads snap to newline boundaries. CITATION: Cite logKey, startByte, endByte, and totalSize.',
+        Description: 'Read a chunk of a log file using byte-range streaming. NO TRUNCATION. Use ONLY when you need raw log content that is not available from errors, summarize, search, or network_diagnostics tools. Prefer higher-level tools first — they are faster and avoid timeouts. CITATION: Cite logKey, startByte, endByte, and totalSize.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -847,7 +847,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // =====================================================================
       {
         Name: 'search',
-        Description: 'Full-text regex search across all logs without truncation. Use for detailed investigation after reviewing error summary. CITATION: Cite finding_id (S-NNN format), file name, and match count for each result group.',
+        Description: 'Full-text regex search across logs. ONLY use this if quick_triage topEvidence was insufficient and you need to find a SPECIFIC pattern not already surfaced. Do NOT use search to re-examine findings already shown in quick_triage. CITATION: Cite finding_id (S-NNN format), file name, and match count.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -960,7 +960,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'summarize',
-        Description: 'Generate structured incident summary grounded in indexed findings. Pass finding_ids from errors tool to constrain summary to specific findings. Output includes grounded flag (true = all claims backed by finding_ids). CITATION: Always cite the finding_ids that support each claim. Flag any unresolved finding_ids.',
+        Description: 'Generate structured incident summary with automatic root cause triage. This is the PRIMARY analysis tool — call it after errors to get root cause, remediation steps, and confidence assessment in ONE call. Includes pod/node failure triage across 8 categories (Volume/CSI, Node Issues, CNI/Networking, iptables/conntrack, Scheduling, Image Pull, DNS, Secrets/Webhook). Pass finding_ids from errors tool. CITATION: Always cite the finding_ids that support each claim.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -991,6 +991,46 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             recommendations: { Type: 'array' },
             confidence: { Type: 'string' },
             gaps: { Type: 'array' },
+          },
+        },
+      },
+      {
+        Name: 'quick_triage',
+        Description: 'FASTEST and MOST COMPLETE path to root cause. Combines validate + errors + triage in ONE call. Returns bundle status, error findings with log excerpts (topEvidence), root cause category, remediation steps, and followup commands. The topEvidence field contains actual log line excerpts so you do NOT need to call search afterward. Only use read(logKey=...) if you need the full content of a specific file. CITATION: Cite instanceId, rootCause category, and confidence.',
+        InputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: {
+              Type: 'string',
+              Description: 'The EC2 instance ID to triage',
+            },
+            severity: {
+              Type: 'string',
+              Description: 'Filter findings by severity: critical, high, medium, low, info, all (default: all)',
+            },
+            includeTriage: {
+              Type: 'boolean',
+              Description: 'Include pod/node failure triage analysis (default: true)',
+            },
+          },
+          Required: ['instanceId'],
+        },
+        OutputSchema: {
+          Type: 'object',
+          Properties: {
+            instanceId: { Type: 'string' },
+            bundle: { Type: 'object', Description: 'Bundle validation: complete, fileCount, totalSize, missingPatterns' },
+            errorSummary: { Type: 'object', Description: 'Counts by severity' },
+            totalFindings: { Type: 'integer' },
+            findings: { Type: 'array', Description: 'Top findings with finding_id, severity, pattern, file, count, sample' },
+            topEvidence: { Type: 'array', Description: 'Top 15 log excerpts from critical/high/medium findings — actual log lines, no need to search' },
+            rootCause: { Type: 'object', Description: 'Root cause: category, confidence, summary, detail' },
+            remediation: { Type: 'array', Description: 'Immediate remediation steps' },
+            followupCommands: { Type: 'array', Description: 'kubectl/AWS CLI commands to validate fix' },
+            recommendations: { Type: 'array' },
+            triage: { Type: 'object', Description: 'Full triage result with pod_states, node_conditions, evidence' },
+            confidence: { Type: 'string', Description: 'high|medium|low' },
+            nextStep: { Type: 'string' },
           },
         },
       },
@@ -1179,7 +1219,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'network_diagnostics',
-        Description: 'Extract and structure networking info from collected log bundles. Parses iptables rules, CNI config, route tables, DNS resolution, ENI attachment status, and VPC CNI (aws-node/ipamd) logs. Returns structured data instead of raw text. CITATION: Cite instanceId and each section analyzed.',
+        Description: 'Extract and structure ALL networking info from collected log bundles in ONE call. Parses iptables rules, CNI config, route tables, DNS resolution, ENI attachment status, and VPC CNI (aws-node/ipamd) logs. Returns structured data — do NOT manually read iproute.txt, iptables.txt, or other networking files. CITATION: Cite instanceId and each section analyzed.',
         InputSchema: {
           Type: 'object',
           Properties: {

@@ -1682,10 +1682,14 @@ def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data:
     
     # Check for missing log sources
     found_patterns = bundle_data.get('foundPatterns', [])
-    expected_sources = ['kubelet', 'containerd', 'dmesg', 'messages', 'networking', 'ipamd']
-    missing = [s for s in expected_sources if s not in found_patterns]
-    if missing:
-        triage_result['coverage_report']['missing_log_sources'] = missing
+    if found_patterns:
+        expected_sources = ['kubelet', 'containerd', 'dmesg', 'messages', 'networking']
+        missing = [s for s in expected_sources if s not in found_patterns]
+        if missing:
+            triage_result['coverage_report']['missing_log_sources'] = missing
+    else:
+        # foundPatterns not available (e.g. quick_triage passes minimal bundle_data)
+        triage_result['coverage_report']['missing_log_sources'] = []
     
     return triage_result
 
@@ -2186,6 +2190,7 @@ def lambda_handler(event, context):
         'correlate': correlate_events,
         'artifact': get_artifact_reference,
         'summarize': generate_incident_summary,
+        'quick_triage': quick_triage,
         'history': list_collection_history,
 
         # Cluster-Level Intelligence (Tier 3)
@@ -2866,6 +2871,23 @@ def read_log_chunk(arguments: Dict) -> Dict:
     
     if not log_key:
         return error_response(400, 'logKey is required')
+    
+    # Redirect agent away from networking files — network_diagnostics parses them better
+    networking_files = ['iproute.txt', 'iptables.txt', 'ip-addr.txt', 'ip-rule.txt',
+                        'ip-link.txt', 'ss.txt', 'netstat.txt', 'resolv.conf',
+                        'conntrack.txt', 'nftables.txt']
+    basename = log_key.rsplit('/', 1)[-1] if '/' in log_key else log_key
+    if basename in networking_files:
+        # Extract instance ID from key pattern: eks_{instanceId}_{executionId}/...
+        parts = log_key.split('_')
+        instance_hint = parts[1] if len(parts) >= 2 else 'unknown'
+        return success_response({
+            'logKey': log_key,
+            'content': '',
+            'redirect': True,
+            'warning': f'Do NOT read {basename} directly. Use network_diagnostics(instanceId="{instance_hint}") instead — it parses all networking files into structured data in one call.',
+            'nextStep': f'Call network_diagnostics with instanceId="{instance_hint}" to get structured routing, iptables, DNS, and CNI data.',
+        })
     
     try:
         # Get file metadata using safe helper
@@ -3876,6 +3898,145 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         })
 
 
+def quick_triage(arguments: Dict) -> Dict:
+    """
+    One-shot triage: validate + errors + summarize in a single call.
+    Designed to minimize agent round-trips and avoid session timeouts.
+    
+    Inputs:
+        instanceId: EC2 instance ID (required)
+        severity: Filter findings by severity (default: all)
+        includeTriage: Include pod/node failure triage (default: true)
+    
+    Returns:
+        Combined validate + errors + summarize output in one response.
+    """
+    import time
+    start_time = time.time()
+    
+    instance_id = arguments.get('instanceId')
+    if not instance_id:
+        return error_response(400, 'instanceId is required')
+    
+    severity_filter = arguments.get('severity', 'all')
+    include_triage = arguments.get('includeTriage', True)
+    
+    result = {
+        'instanceId': instance_id,
+        'generatedAt': datetime.utcnow().isoformat(),
+    }
+    
+    # Step 1: Validate bundle
+    try:
+        val_resp = validate_bundle_completeness({'instanceId': instance_id})
+        if val_resp['statusCode'] == 200:
+            val_data = json.loads(val_resp['body']) if isinstance(val_resp['body'], str) else val_resp['body']
+            result['bundle'] = {
+                'complete': val_data.get('complete', False),
+                'fileCount': val_data.get('fileCount', 0),
+                'totalSize': val_data.get('totalSizeHuman', 'unknown'),
+                'missingPatterns': val_data.get('missingPatterns', []),
+            }
+        else:
+            result['bundle'] = {'complete': False, 'warning': 'Could not validate bundle'}
+    except Exception as e:
+        result['bundle'] = {'complete': False, 'warning': str(e)}
+    
+    # Step 2: Get error findings
+    findings = []
+    summary_counts = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0}
+    try:
+        err_resp = get_error_summary({
+            'instanceId': instance_id,
+            'severity': severity_filter,
+            'response_format': 'detailed',
+            'pageSize': 200,
+        })
+        if err_resp['statusCode'] == 200:
+            err_data = json.loads(err_resp['body']) if isinstance(err_resp['body'], str) else err_resp['body']
+            findings = err_data.get('findings', [])
+            summary_counts = err_data.get('summary', summary_counts)
+            result['errorSummary'] = summary_counts
+            result['totalFindings'] = err_data.get('totalFindings', len(findings))
+            result['findings'] = findings[:30]  # Top 30 for response size
+        else:
+            result['errorSummary'] = summary_counts
+            result['totalFindings'] = 0
+            result['findings'] = []
+    except Exception as e:
+        result['errorSummary'] = summary_counts
+        result['totalFindings'] = 0
+        result['findings'] = []
+        result['errorWarning'] = str(e)
+    
+    # Step 3: Triage analysis (inline, skip the summarize overhead)
+    if include_triage and findings:
+        try:
+            bundle_data = result.get('bundle', {})
+            triage = perform_pod_node_triage(instance_id, findings, bundle_data)
+            result['triage'] = triage
+            
+            # Extract key fields for easy consumption
+            root_cause = triage.get('most_likely_root_cause')
+            if root_cause:
+                result['rootCause'] = {
+                    'category': root_cause.get('category_name'),
+                    'confidence': root_cause.get('confidence'),
+                    'summary': root_cause.get('summary'),
+                    'detail': root_cause.get('technical_detail', '')[:300],
+                }
+                result['remediation'] = triage.get('immediate_remediation_steps', [])[:5]
+                result['followupCommands'] = triage.get('followup_validation_commands', [])[:5]
+        except Exception as e:
+            result['triage'] = {'error': str(e)}
+    elif include_triage:
+        result['triage'] = {'info': 'No findings to triage — node may be healthy'}
+    
+    # Step 4: Recommendations
+    critical = [f for f in findings if f.get('severity') == 'critical'][:10]
+    high = [f for f in findings if f.get('severity') == 'high'][:10]
+    medium = [f for f in findings if f.get('severity') == 'medium'][:5]
+    result['recommendations'] = generate_recommendations(critical, high, medium)
+    
+    # Step 5: Top evidence excerpts — gives agent enough context to avoid follow-up searches
+    top_evidence = []
+    seen_samples = set()
+    for f in (critical + high + medium):
+        sample = f.get('sample', '')
+        if sample and sample[:80] not in seen_samples:
+            seen_samples.add(sample[:80])
+            top_evidence.append({
+                'finding_id': f.get('finding_id'),
+                'severity': f.get('severity'),
+                'file': f.get('file'),
+                'pattern': f.get('pattern'),
+                'count': f.get('count'),
+                'excerpt': sample[:300],
+            })
+        if len(top_evidence) >= 15:
+            break
+    result['topEvidence'] = top_evidence
+    
+    # Confidence
+    if critical and result.get('rootCause'):
+        result['confidence'] = 'high'
+    elif findings:
+        result['confidence'] = 'medium'
+    else:
+        result['confidence'] = 'low'
+    
+    result['executionTimeMs'] = int((time.time() - start_time) * 1000)
+    result['nextStep'] = (
+        f"Root cause: {result['rootCause']['category']} ({result['rootCause']['confidence']} confidence). "
+        f"Review topEvidence excerpts and follow remediation steps. "
+        f"Use read(logKey=...) only if you need full file content for a specific finding."
+        if result.get('rootCause')
+        else 'Review topEvidence excerpts. Use search only if a specific pattern needs deeper investigation.'
+    )
+    
+    return success_response(result)
+
+
 def list_collection_history(arguments: Dict) -> Dict:
     """
     List historical log collections for audit and comparison.
@@ -4829,8 +4990,8 @@ def network_diagnostics(arguments: Dict) -> Dict:
             section_file_map['cni'] = keys
             for k in keys: files_to_fetch.add(k); fetch_sizes[k] = 262144
         if 'routes' in sections:
-            r_keys = find_files(['ip-route', 'ip_route', 'route-table', 'routes'])[:3]
-            i_keys = find_files(['ifconfig', 'ip-addr', 'ip_addr', 'interfaces'])[:2]
+            r_keys = find_files(['iproute', 'ip-route', 'ip_route', 'route-table', 'routes'])[:3]
+            i_keys = find_files(['ifconfig', 'ip-addr', 'ip_addr', 'ipaddr', 'interfaces'])[:2]
             section_file_map['routes'] = r_keys
             section_file_map['routes_iface'] = i_keys
             for k in r_keys + i_keys: files_to_fetch.add(k); fetch_sizes[k] = 262144
@@ -5078,12 +5239,19 @@ def network_diagnostics(arguments: Dict) -> Dict:
                     ip_issues = []
                     for line in lines:
                         ll = line.lower()
+                        stripped = line.strip()
+                        # Skip Prometheus metric lines (contain {labels} with error="false" etc.)
+                        if '{' in stripped and '}' in stripped and ('error="' in ll or 'status="' in ll):
+                            continue
+                        # Skip Prometheus HELP/TYPE comment lines
+                        if stripped.startswith('# HELP') or stripped.startswith('# TYPE'):
+                            continue
                         if 'error' in ll or 'failed' in ll:
-                            error_lines.append(line.strip()[:200])
+                            error_lines.append(stripped[:200])
                         if 'ip address' in ll and ('exhaust' in ll or 'insufficient' in ll or 'no available' in ll):
-                            ip_issues.append(line.strip()[:200])
+                            ip_issues.append(stripped[:200])
                         if 'failed to allocate' in ll or 'no ips available' in ll:
-                            ip_issues.append(line.strip()[:200])
+                            ip_issues.append(stripped[:200])
 
                     ipamd_data['logSummary'][f] = {
                         'totalLines': total_lines,
