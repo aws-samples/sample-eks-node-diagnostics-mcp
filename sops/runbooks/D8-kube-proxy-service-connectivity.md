@@ -128,6 +128,14 @@ SHOULD:
   - Conntrack table full causes new connections to be dropped even if kube-proxy rules are correct
   - If found: cross-reference D3 conntrack exhaustion SOP
 
+### 2G — Control Plane kube-audit Logs
+
+SHOULD:
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="Service" to check for recent Service create/update/delete events that may have changed ClusterIP, ports, or selectors
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="Endpoints" to check for Endpoints/EndpointSlice mutations that could cause stale endpoint issues
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="kube-proxy" to check for kube-proxy ConfigMap changes (mode switch, config updates)
+- Correlate timestamps of Service/Endpoints mutations with the onset of connectivity failures
+
 ### Timeline Correlation
 
 MUST:

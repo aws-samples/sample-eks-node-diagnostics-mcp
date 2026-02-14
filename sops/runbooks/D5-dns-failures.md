@@ -48,6 +48,8 @@ SHOULD:
 
 MAY:
 - Use `network_diagnostics` with sections=iptables to check for rules blocking UDP 53
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="coredns" to check for recent CoreDNS ConfigMap changes (Corefile edits, plugin changes) that may have broken DNS
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="NetworkPolicy" to check for NetworkPolicy changes that may be blocking UDP 53 to CoreDNS pods
 
 ## Phase 3 — Report
 

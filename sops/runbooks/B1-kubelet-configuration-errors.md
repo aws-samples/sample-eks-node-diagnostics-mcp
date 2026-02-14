@@ -46,6 +46,8 @@ SHOULD:
 
 MAY:
 - Use `compare_nodes` tool to compare config between broken and healthy nodes in the same node group
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="kubelet-config" to check for recent kubelet ConfigMap changes that may have introduced the misconfiguration
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="configmap" to check for other ConfigMap mutations in kube-system that affect kubelet behavior
 
 ## Phase 3 — Report
 

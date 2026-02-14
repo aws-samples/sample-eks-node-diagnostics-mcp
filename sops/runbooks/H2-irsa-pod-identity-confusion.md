@@ -52,6 +52,8 @@ SHOULD:
 
 MAY:
 - Use `search` tool with query=`token.*expir|token.*refresh` to check for intermittent token expiration failures
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="ServiceAccount" to check for recent ServiceAccount mutations (annotation changes, deletions) that may have broken IRSA bindings
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="podidentityassociation" to check for Pod Identity association create/update/delete events
 
 ## Phase 3 — Report
 

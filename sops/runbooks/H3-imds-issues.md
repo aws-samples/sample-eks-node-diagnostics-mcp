@@ -52,6 +52,7 @@ SHOULD:
 
 MAY:
 - Use `compare_nodes` tool to check if IMDS issue affects all nodes or specific ones
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="NetworkPolicy" to check for recent NetworkPolicy changes that may be blocking traffic to 169.254.169.254 (IMDS endpoint)
 
 ## Phase 3 — Report
 

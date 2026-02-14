@@ -157,6 +157,14 @@ SHOULD:
   - TCP SYN with no SYN-ACK (packets silently dropped)
   - ICMP unreachable messages (routing or firewall rejection)
 
+### 2G — Control Plane kube-audit Logs
+
+SHOULD:
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="NetworkPolicy" to check for recent NetworkPolicy create/update/delete events that may be blocking traffic
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="policyendpoints" to check for policyendpoint CRD mutations
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="securitygroups" to check for SecurityGroupPolicy changes (if SGP is in use)
+- Correlate timestamps of NetworkPolicy mutations with the onset of connectivity failures — a recently applied deny-all policy is a common root cause
+
 ### Timeline Correlation
 
 MUST:

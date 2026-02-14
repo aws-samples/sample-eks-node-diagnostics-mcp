@@ -78,6 +78,8 @@ SHOULD:
 MAY:
 - Use `compare_nodes` tool with instanceIds of affected + healthy node to find what differs
 - Use `tcpdump_capture` tool if networking is suspected but network_diagnostics is inconclusive
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="error" to check kube-audit logs for recent API errors, denied requests, or failed mutations that may correlate with the issue
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="Forbidden" to check for RBAC denials in the audit log that may indicate permission issues
 
 ## Phase 3 — Classify or Escalate
 

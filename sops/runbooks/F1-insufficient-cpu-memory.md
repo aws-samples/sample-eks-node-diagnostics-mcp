@@ -49,6 +49,8 @@ SHOULD:
 
 MAY:
 - Use `search` tool with query=`PriorityClass|preemption` to check if priority-based scheduling is configured
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="Deployment" to check for recent Deployment scale-up events (replicas increased) that may have exhausted cluster capacity
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="ResourceQuota" to check for ResourceQuota create/update events that may be limiting scheduling
 
 ## Phase 3 — Report
 

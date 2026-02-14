@@ -51,6 +51,8 @@ SHOULD:
 
 MAY:
 - Use `search` tool with query=`SCP|service control policy|Organizations` to check for org-level restrictions
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="access" to check for recent access entry changes or aws-auth ConfigMap mutations that may have removed the node role mapping
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="certificatesigningrequests" to check for node CSR approval/denial events
 
 ## Phase 3 — Report
 

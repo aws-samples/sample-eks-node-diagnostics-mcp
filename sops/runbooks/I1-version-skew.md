@@ -51,6 +51,8 @@ SHOULD:
 
 MAY:
 - Use `search` tool with query=`apiserver_requested_deprecated_apis|deprecated API` to find deprecated API usage
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="deprecated" to check kube-audit logs for deprecated API usage warnings — these indicate workloads using APIs that will be removed in future versions
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="removed" to check for API calls to already-removed endpoints
 
 ## Phase 3 — Report
 

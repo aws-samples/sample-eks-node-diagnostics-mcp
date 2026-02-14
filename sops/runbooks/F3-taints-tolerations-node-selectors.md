@@ -48,6 +48,8 @@ SHOULD:
 
 MAY:
 - Use `compare_nodes` tool to compare taint configurations across node groups
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="taint" to check for recent taint mutations on nodes (e.g., maintenance taints applied but not removed)
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="label" to check for recent label changes on nodes that may have broken nodeSelector matching
 
 ## Phase 3 — Report
 

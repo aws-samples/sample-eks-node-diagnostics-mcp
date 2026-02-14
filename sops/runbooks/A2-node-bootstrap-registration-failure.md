@@ -47,6 +47,9 @@ SHOULD:
 
 MAY:
 - Use `network_diagnostics` tool with sections=dns to verify DNS resolution of API server endpoint
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="certificatesigningrequests" to check for node CSR requests and whether they were approved or denied — unapproved CSRs prevent node registration
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="aws-auth" to check for recent aws-auth ConfigMap changes that may have removed the node role mapping
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="access" to check for access entry mutations
 
 ## Phase 3 — Report
 
