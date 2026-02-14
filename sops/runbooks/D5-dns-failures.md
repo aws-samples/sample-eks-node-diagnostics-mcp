@@ -21,14 +21,20 @@ MUST:
   - Verify the affected pod is Running and Ready — DNS failures in a non-running pod are a symptom, not the cause
   - Check CoreDNS pods: `kubectl get pods -n kube-system -l k8s-app=kube-dns` (via EKS MCP `list_k8s_resources`) — if CoreDNS pods are not Running, that is the root cause
   - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — NotReady nodes cannot reach CoreDNS
-- Use `collect` tool with instanceId to gather logs from the affected node
-- Use `status` tool with executionId to poll until collection completes
+- **PREREQUISITE — Check firewall rules blocking DNS (port 53)**: Before investigating DNS config or CoreDNS health, rule out firewall blocks:
+  - Use `collect` tool with instanceId to gather logs from the affected node
+  - Use `status` tool with executionId to poll until collection completes
+  - Use `network_diagnostics` tool with instanceId and sections=iptables to get iptables rules
+  - Use `search` tool with instanceId and query=`DROP.*53|REJECT.*53|DROP.*dns|REJECT.*dns|DROP.*coredns|iptables.*53.*DROP|iptables.*53.*REJECT` — if matches found, firewall rules are blocking DNS traffic. That is the root cause.
+  - Use `search` tool with instanceId and query=`NetworkPolicy|network.*policy|calico.*deny|cilium.*deny` — check for Kubernetes NetworkPolicy or CNI policy rules that may block UDP/TCP 53
+  - ONLY if no firewall blocks found, proceed to DNS config and CoreDNS investigation below.
 - Use `errors` tool with instanceId to get pre-indexed findings — look for DNS errors
 - Use `network_diagnostics` tool with instanceId and sections=dns to get DNS configuration from collected logs
 
 SHOULD:
 - Use `search` tool with instanceId and query=`UnknownHostException|Could not resolve|SERVFAIL|linklocal_allowance_exceeded` to find DNS failure evidence
 - Use `search` tool with query=`resolv.conf|nameserver|ndots` to check DNS configuration
+- Use `search` tool with query=`security group|sg-|port 53|UDP.*53|TCP.*53` to check if security groups allow DNS traffic (TCP/UDP port 53) from the pod CIDR range to CoreDNS pods
 
 MAY:
 - Use `search` tool with query=`ethtool.*linklocal|linklocal_allowance` to check ENA linklocal counters
@@ -41,15 +47,18 @@ MUST:
 - Use `search` tool with query=`linklocal_allowance_exceeded` — if found, PPS throttling to VPC DNS (recommend NodeLocal DNSCache)
 - Use `search` tool with query=`nameserver` in resolv.conf — if not kube-dns ClusterIP, bootstrap misconfiguration
 - Use `search` tool with query=`CoreDNS|coredns.*error|coredns.*CrashLoop` to check CoreDNS health
+- Use `search` tool with query=`OOM|oom-killer|out of memory|stress|memory.*exhaust` — check for memory exhaustion causing cascading failures including DNS. If found, DNS failure is a symptom, not the root cause — switch to A1 (OOM) SOP.
 
 SHOULD:
 - Use `correlate` tool with instanceId and pivotEvent=`DNS|resolve` to correlate DNS failures with other events
 - Use `search` tool with query=`ndots` to check ndots setting (ndots:5 causes 4x query amplification)
+- Use `search` tool with query=`NodeLocalDNS|node-local-dns|nodelocaldns|169.254.20.10` to check if NodeLocalDNS is installed and running — if installed but CrashLoopBackOff, check for port 53 conflicts
+- Use `search` tool with query=`ipvs|IPVS|kube-proxy.*mode.*ipvs` to check if kube-proxy is in IPVS mode — IPVS mode requires manual pod DNS configuration to use NodeLocalDNS link-local address (169.254.20.10)
 
 MAY:
-- Use `network_diagnostics` with sections=iptables to check for rules blocking UDP 53
-- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="coredns" to check for recent CoreDNS ConfigMap changes (Corefile edits, plugin changes) that may have broken DNS
-- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="NetworkPolicy" to check for NetworkPolicy changes that may be blocking UDP 53 to CoreDNS pods
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="coredns" to check for recent CoreDNS ConfigMap changes
+- Use EKS MCP `get_cloudwatch_logs` with clusterName, resource_type="cluster", log_type="control-plane", filter_pattern="NetworkPolicy" to check for NetworkPolicy changes blocking UDP 53
+- When log-level DNS evidence is inconclusive (no clear iptables blocks, CoreDNS healthy, resolv.conf correct, but DNS still failing), suggest operator run tcpdump to capture live DNS traffic: `tcpdump -i any -nn port 53 -c 50` on the affected node. This can reveal packet drops, timeouts, or unexpected responses not visible in logs. Recommend capturing both UDP and TCP on port 53.
 
 ## Phase 3 — Report
 
@@ -79,6 +88,14 @@ safety_ratings:
 
 ## Common Issues
 
+- symptoms: "search returns DROP.*53 or REJECT.*53 in iptables output"
+  diagnosis: "Firewall rules (iptables/nftables) are blocking DNS traffic on port 53"
+  resolution: "Operator action: remove the offending iptables rule — iptables -D <chain> <rule-spec>. Check for NetworkPolicy or security tooling that injected the rule."
+
+- symptoms: "search returns NetworkPolicy deny rules affecting kube-dns or CoreDNS pods"
+  diagnosis: "Kubernetes NetworkPolicy blocking UDP/TCP 53 to CoreDNS"
+  resolution: "Operator action: update NetworkPolicy to allow egress to kube-dns on UDP/TCP 53"
+
 - symptoms: "search returns linklocal_allowance_exceeded > 0"
   diagnosis: "PPS throttling to VPC DNS (169.254.169.253)"
   resolution: "Operator action: deploy NodeLocal DNSCache to reduce VPC DNS queries"
@@ -90,6 +107,18 @@ safety_ratings:
 - symptoms: "search returns CoreDNS CrashLooping"
   diagnosis: "CoreDNS resource exhaustion or configuration error"
   resolution: "Operator action: scale CoreDNS replicas, increase memory limits, check Corefile"
+
+- symptoms: "search returns NodeLocalDNS CrashLoopBackOff on EKS Auto Mode nodes or port 53 conflict"
+  diagnosis: "NodeLocalDNS cannot bind to port 53 because another process (e.g., systemd-resolved on EKS Auto Mode nodes) is already listening on that port."
+  resolution: "Operator action: configure NodeLocalDNS to use a different port or disable systemd-resolved on the node. On EKS Auto Mode nodes, NodeLocalDNS may not be compatible — use CoreDNS scaling instead."
+
+- symptoms: "search returns IPVS mode and pods not using NodeLocalDNS link-local address"
+  diagnosis: "When kube-proxy runs in IPVS mode, pods must be manually configured to use the NodeLocalDNS link-local address (169.254.20.10) because IPVS does not intercept traffic to the kube-dns ClusterIP the same way iptables does."
+  resolution: "Operator action: update pod DNS config to use 169.254.20.10 as the nameserver, or configure NodeLocalDNS to listen on the kube-dns ClusterIP (requires disabling kube-dns service). See AWS docs for IPVS + NodeLocalDNS setup."
+
+- symptoms: "search returns security group blocking TCP/UDP port 53 from pod CIDR"
+  diagnosis: "Security group rules are blocking DNS traffic (TCP/UDP port 53) from the pod CIDR range to CoreDNS pods."
+  resolution: "Operator action: update security groups to allow TCP and UDP port 53 from the pod CIDR range to the CoreDNS pod IPs or the node security group."
 
 ## Examples
 

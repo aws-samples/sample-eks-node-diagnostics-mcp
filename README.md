@@ -177,6 +177,62 @@ All SOPs are stored in `sops/runbooks/` and automatically deployed to S3 via CDK
 
 ---
 
+## Time-Bounded Log Analysis
+
+All analysis tools enforce time-bounded log filtering to prevent historical errors from polluting active incident investigation.
+
+### How It Works
+
+Every tool that reads or analyzes logs (`errors`, `search`, `correlate`, `summarize`, `quick_triage`) accepts optional time window parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `incident_time` | ISO8601 timestamp of the incident. Analysis window = incident_time ± 5 minutes |
+| `start_time` + `end_time` | Explicit UTC window (ISO8601). Used exactly as provided |
+| *(none)* | Defaults to last 10 minutes from current UTC time |
+
+### Resolution Rules
+
+1. If `start_time` AND `end_time` provided → use exactly
+2. If `incident_time` provided → window = [incident_time - 5min, incident_time + 5min]
+3. If nothing provided → window = [now_utc - 10min, now_utc]
+4. Maximum window size: 24 hours (safety cap)
+
+### Response Metadata
+
+Every response includes:
+- `window_start_utc` / `window_end_utc` — the exact UTC window used
+- `resolution_reason` — how the window was determined (e.g., "explicit incident window provided", "no incident time; default last 10 minutes")
+- `time_window_filter` — counts of findings excluded outside the window and unparseable timestamps
+
+### Example Tool Calls
+
+With incident time (± 5 min padding):
+```json
+{
+  "instanceId": "i-0abc123",
+  "incident_time": "2026-02-13T09:10:00Z"
+}
+```
+
+With explicit window:
+```json
+{
+  "instanceId": "i-0abc123",
+  "start_time": "2026-02-13T09:00:00Z",
+  "end_time": "2026-02-13T09:30:00Z"
+}
+```
+
+Without time (defaults to last 10 minutes):
+```json
+{
+  "instanceId": "i-0abc123"
+}
+```
+
+---
+
 ## Prerequisites
 
 ### 1. Node.js (v18.x or later)

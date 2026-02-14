@@ -21,6 +21,10 @@ MUST:
   - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for PLEG-related warnings
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
+- **PREREQUISITE — Is containerd running?** PLEG relists containers via containerd — if containerd is dead, PLEG will always be unhealthy:
+  - Use `search` tool with instanceId and query=`Active: active \(running\)|containerd.*started|containerd.service.*running` and logTypes=`containerd` — if NO matches, containerd is stopped/dead. That is the root cause, not a PLEG-specific issue.
+  - Use `search` tool with instanceId and query=`Active: inactive|Active: failed|containerd.service.*dead|containerd.service.*failed` — if matches found, containerd is stopped. Report "containerd service not running — PLEG cannot relist containers" as root cause.
+  - ONLY if containerd is confirmed running, proceed to PLEG investigation below.
 - Use `errors` tool with instanceId to get pre-indexed findings — look for PLEG health check failures
 - Use `search` tool with instanceId and query=`PLEG is not healthy|PLEG.*relisting|pleg was last seen` to find PLEG failure evidence
 
@@ -75,6 +79,10 @@ safety_ratings:
 
 ## Common Issues
 
+- symptoms: "search for containerd service status returns Active: inactive or Active: failed"
+  diagnosis: "Containerd is stopped. PLEG cannot relist containers without the runtime, so it will always report unhealthy."
+  resolution: "Operator action: check journalctl -u containerd for startup errors, then restart containerd (systemctl restart containerd). PLEG should recover once containerd is running."
+
 - symptoms: "errors tool returns PLEG unhealthy findings, search shows containerd slow to respond"
   diagnosis: "Containerd overloaded by high pod density or slow disk"
   resolution: "Operator action: reduce pod count on node, check disk I/O, consider larger instance type with faster storage"
@@ -82,6 +90,22 @@ safety_ratings:
 - symptoms: "PLEG unhealthy findings correlate with high pod churn in correlate timeline"
   diagnosis: "Rapid pod creation/deletion overwhelming container runtime"
   resolution: "Operator action: reduce deployment rollout speed, spread across more nodes"
+
+- symptoms: "search for kubelet logs shows 'Skipping pod synchronization' with PLEG threshold exceeded (e.g., 'pleg was last seen active 4h5m ago; threshold is 3m0s')"
+  diagnosis: "PLEG has been unhealthy for an extended period. Kubelet is skipping all pod sync operations, meaning no pod lifecycle events are processed."
+  resolution: "Operator action: check kubelet and containerd logs for root cause. Restart kubelet (systemctl restart kubelet) if containerd is healthy. If containerd is also stuck, restart containerd first."
+
+- symptoms: "search for kubelet logs shows liveness/readiness probe failures ('Probe failed probeType=Liveness context deadline exceeded') alongside PLEG unhealthy"
+  diagnosis: "Frequent probe failures are contributing to PLEG overload. Each probe timeout adds latency to the PLEG relist cycle."
+  resolution: "Operator action: review probe configurations — increase timeoutSeconds, reduce frequency. Check if pods with security groups need DISABLE_TCP_EARLY_DEMUX=true or POD_SECURITY_GROUP_ENFORCING_MODE=standard."
+
+- symptoms: "search for kubelet logs shows 'disk usage and inodes count on following dirs took Xs' (>1 second) alongside PLEG unhealthy"
+  diagnosis: "Slow disk I/O is causing containerd and kubelet to stall during filesystem operations, which delays PLEG relisting. Monitor EBS volume IOPS and throughput."
+  resolution: "Operator action: check EBS volume type and IOPS limits (CloudWatch VolumeReadOps/VolumeWriteOps). Upgrade to gp3 with provisioned IOPS, or increase volume size for higher baseline IOPS."
+
+- symptoms: "search returns MemoryPressure or OOM alongside PLEG unhealthy"
+  diagnosis: "Instance-level OOM or memory pressure caused kubelet/containerd to stall, triggering PLEG unhealthy. Resource crunch is the root cause, not PLEG itself."
+  resolution: "Operator action: set CPU and memory limits on pods to prevent resource exhaustion. Consider using Container Insights to monitor node_cpu_utilization and node_memory_utilization."
 
 ## Examples
 

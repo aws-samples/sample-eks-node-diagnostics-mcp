@@ -89,6 +89,18 @@ safety_ratings:
   diagnosis: "Too many processes/threads on the node"
   resolution: "Operator action: identify runaway process, set PID limits on containers"
 
+- symptoms: "errors tool returns DiskPressure findings, search shows 'Disk usage on image filesystem is over the high threshold, trying to free bytes'"
+  diagnosis: "Kubelet image garbage collection is failing to free enough space. The image-gc-high-threshold has been exceeded."
+  resolution: "Operator action: 1) Manually prune images: crictl rmi --prune. 2) Lower GC thresholds: set --image-gc-high-threshold=70 --image-gc-low-threshold=60 in kubelet config. 3) Increase EBS volume size or provision new nodes with larger root volumes."
+
+- symptoms: "storage_diagnostics shows root filesystem >85% used, search shows container log files consuming significant space"
+  diagnosis: "Container runtime log files (stdout/stderr) are not being rotated properly, consuming disk space."
+  resolution: "Operator action: configure containerd log rotation in /etc/containerd/config.toml — set log_file_max (max rotated files) and log_file_max_size (max size per file). Consider using a logging agent to ship logs externally."
+
+- symptoms: "errors tool returns DiskPressure findings, search shows pods without ephemeral-storage limits"
+  diagnosis: "Pods without ephemeral-storage limits can consume unlimited disk space on the node, triggering DiskPressure evictions for other pods."
+  resolution: "Operator action: set ephemeral-storage requests and limits on all pods. Example: resources.requests.ephemeral-storage=1Mi, resources.limits.ephemeral-storage=2Mi. Use LimitRange to enforce defaults."
+
 ## Examples
 
 ```

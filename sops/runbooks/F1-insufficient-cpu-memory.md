@@ -98,6 +98,26 @@ safety_ratings:
   diagnosis: "Over-provisioned resource requests wasting capacity."
   resolution: "Operator action: right-size using VPA recommendations or manual adjustment"
 
+- symptoms: "search for node affinity returns 'node(s) had untolerated taint'"
+  diagnosis: "Taint/toleration mismatch — nodes have taints that the pod does not tolerate. Use search with query=taint|toleration to identify specific taints."
+  resolution: "Operator action: add matching tolerations to pod spec, or remove unnecessary taints from nodes"
+
+- symptoms: "search returns 'Insufficient vpc.amazonaws.com/pod-eni' in scheduling events"
+  diagnosis: "Pod security groups require trunk ENI interface, which is only available on Nitro-based instances. Non-Nitro instances cannot allocate pod-eni resources."
+  resolution: "Operator action: ensure node group uses Nitro-based instance types (m5, c5, r5, etc.). Enable trunk interface via ENABLE_POD_ENI=true on aws-node DaemonSet."
+
+- symptoms: "search returns 'didn't have free ports for requested pod ports' in scheduling events"
+  diagnosis: "Pod uses hostNetwork:true and the requested hostPort is already in use on all available nodes."
+  resolution: "Operator action: remove hostNetwork:true if not required, or use different hostPort values. Consider using a Service with NodePort instead."
+
+- symptoms: "search returns 'node(s) didn't match Pod's node affinity/selector' but nodes appear to have capacity"
+  diagnosis: "Pod uses requiredDuringSchedulingIgnoredDuringExecution affinity that eliminates all available nodes. Consider using preferredDuringScheduling for soft constraints."
+  resolution: "Operator action: change requiredDuringScheduling to preferredDuringScheduling for non-critical placement preferences, or add nodes matching the required labels"
+
+- symptoms: "search returns volume zone mismatch or 'no available volume zone' in scheduling events"
+  diagnosis: "PVC is bound to an EBS volume in a different AZ than available nodes. Pod cannot schedule because the volume cannot be attached cross-AZ."
+  resolution: "Operator action: create a new PVC in the correct AZ, or add nodes in the AZ where the volume exists. Use volumeBindingMode: WaitForFirstConsumer in StorageClass to prevent this."
+
 ## Examples
 
 ```

@@ -20,8 +20,12 @@ MUST:
   - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready or check what condition it's in
   - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at kubelet version, conditions, and capacity
   - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods in CrashLoopBackOff or Error state that indicate kubelet config issues
-- Use `collect` tool with instanceId to gather logs from the affected node
-- Use `status` tool with executionId to poll until collection completes
+- **PREREQUISITE — Is kubelet running?** Before investigating configuration, verify the kubelet process is alive:
+  - Use `collect` tool with instanceId to gather logs from the affected node
+  - Use `status` tool with executionId to poll until collection completes
+  - Use `search` tool with instanceId and query=`Active: active \(running\)|kubelet.*started|kubelet.service.*running` and logTypes=`kubelet` — if NO matches, kubelet is stopped/dead. That is the root cause, not a config issue.
+  - Use `search` tool with instanceId and query=`Active: inactive|Active: failed|kubelet.service.*dead|kubelet.service.*failed` — if matches found, kubelet is stopped. Report "kubelet service not running" as root cause before investigating config.
+  - ONLY if kubelet is confirmed running but misbehaving, proceed to config investigation below.
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kubelet config errors
 - Use `search` tool with instanceId and query=`failed to run Kubelet|invalid configuration|cgroup driver|Failed to create cgroup` to find config failure evidence
 

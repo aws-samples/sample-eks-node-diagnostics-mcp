@@ -89,6 +89,14 @@ safety_ratings:
   diagnosis: "Application has a persistent thread leak — killing the process is only a temporary fix."
   resolution: "Operator action: fix application thread leak, set container PID limits as safety net"
 
+- symptoms: "search for pids.max shows container-level PID limit set but process still exhausts node PIDs"
+  diagnosis: "Container PID limit (pids.max in cgroup) may be set too high or not set at all. Without container-level limits, a single pod can exhaust all node PIDs."
+  resolution: "Operator action: set --pod-max-pids in kubelet config to limit PIDs per pod. Default is -1 (unlimited). Recommended: set to 1024-4096 depending on workload."
+
+- symptoms: "search returns 'fork: retry: Resource temporarily unavailable' or 'cannot allocate memory' alongside PIDPressure"
+  diagnosis: "PID exhaustion is preventing new process creation. This affects all containers on the node including system pods."
+  resolution: "Operator action: 1) Identify the runaway process (check /proc/*/status for highest Threads count). 2) Kill the process. 3) Set kernel.pid_max higher if needed (sysctl -w kernel.pid_max=65536). 4) Set --pod-max-pids in kubelet config."
+
 ## Examples
 
 ```

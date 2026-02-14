@@ -49,6 +49,8 @@ MUST:
 SHOULD:
 - Use `search` tool with query=`audience|sts.amazonaws.com` to check token audience configuration
 - Use `search` tool with query=`pod-identity|EKS_POD_IDENTITY_AGENT` to determine if Pod Identity is in use vs IRSA
+- Use `search` tool with query=`MutatingWebhookConfiguration|pod-identity-webhook` to verify webhook is injecting IRSA env vars
+- Use `search` tool with query=`169.254.170.23|eks-pod-identity-agent|Read timeout` to check Pod Identity agent connectivity
 
 MAY:
 - Use `search` tool with query=`token.*expir|token.*refresh` to check for intermittent token expiration failures
@@ -100,6 +102,38 @@ safety_ratings:
 - symptoms: "errors tool returns findings with ExpiredTokenException"
   diagnosis: "Projected service account token expired or not mounted. Use search with query=token.*expir to check."
   resolution: "Operator action: check token expiration settings, verify projected volume mount in pod spec"
+
+- symptoms: "search returns 'Request ARN is invalid' or extra colons in IAM ARN"
+  diagnosis: "IAM role ARN format is incorrect in ServiceAccount annotation. Extra colons or malformed ARN causes STS to reject the request."
+  resolution: "Operator action: fix the eks.amazonaws.com/role-arn annotation to use correct ARN format (arn:aws:iam::ACCOUNT:role/ROLE-NAME, no extra colons)"
+
+- symptoms: "search returns 'Incorrect token audience' or audience mismatch"
+  diagnosis: "OIDC provider audience is not set to sts.amazonaws.com. Use search with query=audience|sts.amazonaws.com to confirm."
+  resolution: "Operator action: update OIDC provider audience to sts.amazonaws.com in IAM console or via CLI"
+
+- symptoms: "search returns 'HTTPS certificate doesn't match configured thumbprint'"
+  diagnosis: "OIDC provider root CA thumbprint is stale or incorrect. AWS rotated the certificate."
+  resolution: "Operator action: update OIDC provider thumbprint — get new thumbprint from cluster OIDC issuer URL and update in IAM"
+
+- symptoms: "search returns 'Not authorized to perform sts:AssumeRoleWithWebIdentity' but SA annotation and OIDC are correct"
+  diagnosis: "IAM role trust policy conditions do not match the ServiceAccount namespace/name or OIDC issuer URL."
+  resolution: "Operator action: update trust policy Condition to match exact namespace:sa-name and correct OIDC issuer URL"
+
+- symptoms: "search for AWS_WEB_IDENTITY_TOKEN_FILE returns no matches in pod environment"
+  diagnosis: "Pod identity webhook (pod-identity-webhook) is not injecting environment variables. The MutatingWebhookConfiguration may be missing or invalid."
+  resolution: "Operator action: verify pod-identity-webhook MutatingWebhookConfiguration exists — kubectl get mutatingwebhookconfigurations. Restart the webhook pod if needed."
+
+- symptoms: "search returns 'Error retrieving metadata.*Read timeout.*169.254.170.23' or Pod Identity credential fetch timeout"
+  diagnosis: "EKS Pod Identity agent cannot reach the eks-auth endpoint. In private clusters, the eks-auth VPC endpoint may be missing."
+  resolution: "Operator action: for private clusters, create eks-auth PrivateLink VPC endpoint. Check security groups allow traffic to the endpoint. Check eks-pod-identity-agent pod logs for errors."
+
+- symptoms: "search returns proxy-related errors in eks-pod-identity-agent logs"
+  diagnosis: "Pod Identity agent needs proxy configuration to reach eks-auth endpoint through a corporate proxy."
+  resolution: "Operator action: configure proxy on the DaemonSet — kubectl set env ds/eks-pod-identity-agent https_proxy=PROXY-URL -n kube-system"
+
+- symptoms: "IRSA works for some AWS SDK calls but not others, or returns 'InvalidIdentityToken' intermittently"
+  diagnosis: "AWS SDK version may be too old to support IRSA token refresh. Older SDKs do not auto-refresh projected SA tokens."
+  resolution: "Operator action: upgrade AWS SDK in the application container to a version that supports IRSA (check AWS SDK compatibility matrix)"
 
 ## Examples
 

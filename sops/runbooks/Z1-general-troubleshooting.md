@@ -7,7 +7,7 @@ triggers:
   - ".*"
 owner: devops-agent
 objective: "Systematically investigate an unknown node issue using MCP tools, classify the failure domain, and either match to an existing SOP or escalate with full evidence"
-context: "This SOP is invoked when the reported symptoms do not match any of the 36 specific runbooks (A1–J3, D7–D9). It provides a broad, methodical investigation that narrows the failure domain step by step. If the issue remains unclassified after enrichment, escalate to the operator with all collected evidence."
+context: "This SOP is invoked when the reported symptoms do not match any of the 41 specific runbooks (A1–J3, D7–D9, K1–K5). It provides a broad, methodical investigation that narrows the failure domain step by step. If the issue remains unclassified after enrichment, escalate to the operator with all collected evidence."
 ---
 
 ## Phase 1 — Triage
@@ -44,6 +44,11 @@ MUST:
   - IMDS → H3
   - Version skew → I1
   - EBS attach → J2
+  - Stuck Terminating pods/finalizers → K1
+  - Probe failures (liveness/readiness/startup) → K2
+  - CrashLoopBackOff → K3
+  - Containerd/runtime failures → K4
+  - CSI node plugin not running/registration → K5
 - If a match is found: switch to that specific SOP immediately
 - If no match: continue to broad collection below
 
@@ -58,6 +63,13 @@ MAY:
 ## Phase 2 — Enrich
 
 MUST:
+- **PREREQUISITE HEALTH CHECKS — Verify basic service health before rationalizing symptoms**:
+  - Is kubelet running? Use `search` with query=`Active: active.*kubelet|kubelet.service.*running` — if no matches, kubelet is stopped. That is the root cause.
+  - Is kubelet stopped/failed? Use `search` with query=`Active: inactive|Active: failed|kubelet.service.*dead` — if matches, report kubelet down before investigating further.
+  - Are critical add-ons installed? Use `list_k8s_resources` with kind=DaemonSet, namespace=kube-system to verify CoreDNS, kube-proxy, VPC CNI, and EBS CSI driver are present. Missing add-ons are root causes, not symptoms.
+  - Are there firewall rules blocking traffic? Use `search` with query=`DROP|REJECT` in iptables output — firewall blocks explain connectivity failures more directly than application-level errors.
+  - Is there memory/resource exhaustion? Use `search` with query=`OOM|oom-killer|out of memory|stress|memory.*exhaust` — resource exhaustion causes cascading failures. If found, it is likely the root cause, not the downstream symptoms.
+  - **RULE: Always verify the simplest explanation first. A stopped service, missing driver, or firewall block is more likely the root cause than a complex chain of transient conditions.**
 - Use `search` tool with instanceId and query=`error|Error|ERROR|fail|Fail|FAIL|fatal|Fatal|FATAL` to cast a wide net for error signals
 - Use `search` tool with query=`warning|Warning|WARNING` to find warning-level signals that may indicate the root cause
 - Classify the failure domain from search results:

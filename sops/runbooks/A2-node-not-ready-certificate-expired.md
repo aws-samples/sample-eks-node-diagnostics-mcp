@@ -21,6 +21,10 @@ MUST:
   - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check if pods are being evicted or stuck
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
+- **PREREQUISITE — Is kubelet running?** Before investigating certificate expiry, verify kubelet is alive:
+  - Use `search` tool with instanceId and query=`Active: active \(running\)|kubelet.*started|kubelet.service.*running` and logTypes=`kubelet` — if NO matches, kubelet is stopped/dead. That may be the root cause, not necessarily a certificate issue.
+  - Use `search` tool with instanceId and query=`Active: inactive|Active: failed|kubelet.service.*dead|kubelet.service.*failed` — if matches found, kubelet is stopped. Check if certificate errors caused the stop, or if kubelet died for another reason (see B1 SOP for config issues, A1 for OOM).
+  - ONLY if kubelet is confirmed running (but failing TLS), OR kubelet is stopped AND certificate errors are found, proceed to certificate investigation below.
 - Use `errors` tool with instanceId to get pre-indexed findings — look for x509 or certificate errors
 - Use `search` tool with instanceId and query=`x509.*expired|certificate has expired|TLS handshake error` to find certificate failure evidence
 
@@ -73,6 +77,10 @@ safety_ratings:
   - "Approve CSR: YELLOW — operator action, not available via MCP tools"
 
 ## Common Issues
+
+- symptoms: "search for kubelet service status returns Active: inactive or Active: failed, but no x509 or certificate errors found"
+  diagnosis: "Kubelet is stopped but not due to certificate expiry. Could be config error, OOM, or other failure."
+  resolution: "Investigate kubelet config (see B1 SOP) or OOM (see A1 SOP). Operator action: check journalctl -u kubelet for startup errors."
 
 - symptoms: "errors tool returns findings with x509: certificate has expired"
   diagnosis: "Kubelet client certificate expired and rotation did not occur"

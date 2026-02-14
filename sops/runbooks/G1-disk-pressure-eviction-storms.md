@@ -47,7 +47,8 @@ SHOULD:
 - Use `storage_diagnostics` to check kubelet eviction threshold configuration
 
 MAY:
-- Use `search` tool with query=`imageGCHighThreshold|imageGCLowThreshold` to check image GC configuration
+- Use `search` tool with query=`imageGCHighThreshold|imageGCLowThreshold|imageGCHighThresholdPercent|imageGCLowThresholdPercent` to check image GC configuration — default thresholds are imageGCHighThreshold=85% (start GC) and imageGCLowThreshold=80% (stop GC). Lower to 70%/60% for more aggressive cleanup.
+- Use `search` tool with query=`containerd.*log|containerd.runc.log|log_file_max|log_file_max_size` to check container runtime log rotation — misconfigured containerd log rotation can fill disk independently of kubelet log management
 
 ## Phase 3 — Report
 
@@ -90,6 +91,14 @@ safety_ratings:
 - symptoms: "storage_diagnostics shows inode exhaustion (inodes >95%)"
   diagnosis: "Too many small files — see C3 overlayfs inode exhaustion SOP."
   resolution: "Operator action: clean up container layers, increase inode count on volume"
+
+- symptoms: "search returns imageGCHighThreshold or image GC not reclaiming space"
+  diagnosis: "Image garbage collection thresholds may be misconfigured. Default: imageGCHighThreshold=85% (start GC), imageGCLowThreshold=80% (stop GC). If thresholds are too high, GC starts too late."
+  resolution: "Operator action: lower imageGCHighThresholdPercent to 70 and imageGCLowThresholdPercent to 60 in kubelet config for more aggressive image cleanup."
+
+- symptoms: "search returns containerd.runc.log or container runtime logs consuming disk"
+  diagnosis: "Container runtime log rotation is misconfigured. containerd writes to /var/log/pods/ and /var/log/containers/. The containerd config (log_file_max, log_file_max_size) controls runtime-level log rotation separately from kubelet's containerLogMaxSize."
+  resolution: "Operator action: configure containerd log rotation in /etc/containerd/config.toml — set log_file_max (number of rotated files) and log_file_max_size (max size per file, e.g., 10MB). Also verify kubelet containerLogMaxSize and containerLogMaxFiles settings. Restart containerd after config changes."
 
 ## Examples
 

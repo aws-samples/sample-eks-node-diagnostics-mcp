@@ -90,6 +90,14 @@ safety_ratings:
   diagnosis: "DaemonSet overhead too high, reducing available pod slots for workloads."
   resolution: "Operator action: consolidate DaemonSets or increase max-pods via prefix delegation"
 
+- symptoms: "search returns 'Too many pods' and network_diagnostics shows all ENI slots consumed"
+  diagnosis: "Instance ENI/IP limit reached. Each instance type has a fixed max ENI count and IPs-per-ENI. Use aws ec2 describe-instance-types --instance-types <type> --query 'InstanceTypes[].NetworkInfo.{MaxENI:MaximumNetworkInterfaces,IPv4PerENI:Ipv4AddressesPerInterface}' to check limits."
+  resolution: "Operator action: enable prefix delegation (ENABLE_PREFIX_DELEGATION=true) for up to 110 pods on most Nitro instances, or upgrade to instance type with more ENIs"
+
+- symptoms: "errors tool returns 'Too many pods' but max-pods value appears lower than expected for instance type"
+  diagnosis: "Max-pods may be calculated incorrectly or overridden. Default formula: (MaxENI * (IPv4PerENI - 1)) + 2. With prefix delegation: (MaxENI * ((IPv4PerENI - 1) * 16)) + 2."
+  resolution: "Operator action: verify max-pods calculation matches instance type. Check if --max-pods is overridden in kubelet args or launch template user data."
+
 ## Examples
 
 ```

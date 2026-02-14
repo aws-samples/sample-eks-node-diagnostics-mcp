@@ -20,7 +20,14 @@ MUST:
   - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at Conditions (MemoryPressure, DiskPressure, PIDPressure) and allocatable resources
   - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods in CrashLoopBackOff, OOMKilled, or Evicted state
   - Check kubelet pod status on the node — if kubelet is OOM-killed, all pods on the node will be affected
-- Use `collect` tool with instanceId to start log collection from the affected node
+- **PREREQUISITE — Is kubelet running?** Before investigating OOM, verify the kubelet process is alive:
+  - Use `collect` tool with instanceId to gather logs from the affected node
+  - Use `status` tool with executionId to poll until collection completes
+  - Use `search` tool with instanceId and query=`Active: active \(running\)|kubelet.*started|kubelet.service.*running` and logTypes=`kubelet` — if NO matches, kubelet is stopped/dead. That is the root cause, not necessarily OOM.
+  - Use `search` tool with instanceId and query=`Active: inactive|Active: failed|kubelet.service.*dead|kubelet.service.*failed` — if matches found, kubelet is stopped. Check dmesg for OOM evidence before concluding.
+  - If kubelet is stopped but NO OOM evidence found in dmesg, report "kubelet service not running — cause unknown, not OOM" and investigate further (check B1 SOP for config issues).
+  - ONLY if kubelet is confirmed stopped AND OOM evidence exists, OR kubelet is running but under memory pressure, proceed to OOM investigation below.
+- Use `collect` tool with instanceId to start log collection from the affected node (skip if already collected in prerequisite)
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=critical to get pre-indexed OOM findings
 - Use `search` tool with instanceId and query=`oom-killer|OOMKilled|out of memory|Memory cgroup` to find OOM evidence in dmesg and system logs
@@ -80,6 +87,10 @@ safety_ratings:
   - "Terminate and replace node: RED — operator action, requires approval"
 
 ## Common Issues
+
+- symptoms: "search for kubelet service status returns Active: inactive or Active: failed, but no OOM evidence in dmesg"
+  diagnosis: "Kubelet is stopped but not due to OOM. Could be config error, manual stop, or other failure."
+  resolution: "Investigate kubelet config (see B1 SOP). Operator action: check journalctl -u kubelet for startup errors, then restart kubelet."
 
 - symptoms: "errors tool returns findings with oom-killer targeting kubelet PID"
   diagnosis: "Kernel killed kubelet due to memory exhaustion. Use search tool with query=system-reserved to check if memory reservation is configured."

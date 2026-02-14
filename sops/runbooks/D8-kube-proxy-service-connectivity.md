@@ -36,6 +36,14 @@ MUST:
   - Check the Service and its endpoints: `kubectl get svc <svc>` and `kubectl get endpoints <svc>` (via EKS MCP `read_k8s_resource`) — if endpoints list is empty, no backend pods are selected
   - Check backend pods are Running and Ready — if backends are down, the Service has no healthy endpoints
   - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — NotReady nodes break kube-proxy rule sync
+- **PREREQUISITE — Does the Service have healthy endpoints?** Before investigating kube-proxy, verify the Service has backends:
+  - Use `read_k8s_resource` with clusterName, kind=Endpoints, apiVersion=v1, namespace=<namespace>, name=<service-name> — if the subsets array is empty or has no addresses, there are no healthy backend pods. That is the root cause, not a kube-proxy issue.
+  - If endpoints are empty: check if backend pods exist and are passing readiness probes. Report "Service has no healthy endpoints — backend pods are not Ready" immediately.
+  - ONLY if the Service has healthy endpoints, proceed to kube-proxy investigation below.
+- **PREREQUISITE — Is kube-proxy running?** Before investigating iptables/IPVS rules, verify kube-proxy is alive:
+  - Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, namespace=kube-system, labelSelector=k8s-app=kube-proxy — check that kube-proxy pod on the affected node is Running.
+  - If kube-proxy pod is CrashLoopBackOff, Error, or missing: that is the root cause. Report "kube-proxy not running on node — service rules will not be synced" immediately.
+  - ONLY if kube-proxy is confirmed running, proceed to service connectivity investigation below.
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kube-proxy errors
@@ -101,11 +109,13 @@ MUST (if IPVS mode detected):
   - "can't load module ip_vs": IPVS kernel modules not loaded on the node
   - Required modules: ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, nf_conntrack
 - Use `search` tool with query=`ipvs.*scheduler|scheduler.*rr|scheduler.*lc` to check IPVS scheduler configuration
+- Use `search` tool with query=`ipvsadm -L|ipvs.*TCP|ipvs.*UDP` to verify IPVS entries exist for services — after switching to IPVS, `ipvsadm -L` should show TCP/UDP entries for each Service ClusterIP
 
 SHOULD:
 - Use `search` tool with query=`ipvsadm -L|ip_vs_` to check if IPVS entries exist for services
 - Use `search` tool with query=`kube-ipvs0|dummy.*interface` to check if the kube-ipvs0 dummy interface exists
   - Missing kube-ipvs0: IPVS mode not properly initialized
+- Use `search` tool with query=`KUBE-SVC.*iptables|iptables.*KUBE-SVC` to check if stale iptables rules remain after switching to IPVS — old KUBE-SVC chains should be cleaned up after IPVS is confirmed working
 
 ### 2E — Stale Endpoints and Service Connectivity
 
@@ -182,6 +192,14 @@ safety_ratings:
 
 ## Common Issues
 
+- symptoms: "read_k8s_resource for Endpoints shows empty subsets or no addresses"
+  diagnosis: "Service has no healthy backend pods. This is not a kube-proxy issue — the Service selector does not match any Running/Ready pods."
+  resolution: "Operator action: verify pods matching the Service selector exist and are passing readiness probes. Check 'kubectl get pods -l <selector>' and 'kubectl describe pod' for readiness probe failures."
+
+- symptoms: "list_k8s_resources returns kube-proxy pod in CrashLoopBackOff, Error, or missing on the affected node"
+  diagnosis: "kube-proxy is not running. Service iptables/IPVS rules will not be synced on this node."
+  resolution: "Operator action: check kube-proxy logs, restart kube-proxy DaemonSet, check kube-proxy-config ConfigMap."
+
 - symptoms: "search returns kube-proxy CrashLoopBackOff or OOMKilled"
   diagnosis: "kube-proxy pod crashing. OOM common in large clusters (>1000 services) with iptables mode. Check kube-proxy logs for config errors."
   resolution: "Operator action: if OOM, increase kube-proxy memory limits or switch to IPVS mode. If config error, fix kube-proxy-config ConfigMap."
@@ -203,8 +221,20 @@ safety_ratings:
   resolution: "Operator action: switch to IPVS mode for O(1) lookup performance. See AWS docs for IPVS setup: install ipvsadm, load kernel modules, update kube-proxy addon config."
 
 - symptoms: "IPVS mode configured but search returns 'can't load module ip_vs'"
-  diagnosis: "IPVS kernel modules not loaded on the worker node."
-  resolution: "Operator action: install ipvsadm package, load kernel modules (ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, nf_conntrack), persist in /etc/modules-load.d/ipvs.conf."
+  diagnosis: "IPVS kernel modules not loaded on the worker node. Required modules: ip_vs, ip_vs_rr, ip_vs_wrr, ip_vs_sh, nf_conntrack."
+  resolution: "Operator action: install ipvsadm package, load kernel modules (modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack), persist in /etc/modules-load.d/ipvs.conf. For worker node bootstrap, add modprobe commands to user data."
+
+- symptoms: "IPVS mode configured but search returns missing kube-ipvs0 dummy interface"
+  diagnosis: "IPVS mode not properly initialized. The kube-ipvs0 dummy interface is required for IPVS to bind Service ClusterIPs."
+  resolution: "Operator action: verify IPVS kernel modules are loaded, restart kube-proxy. The kube-ipvs0 interface is created automatically when kube-proxy starts in IPVS mode with all required modules."
+
+- symptoms: "after switching to IPVS mode, search returns stale KUBE-SVC iptables entries"
+  diagnosis: "After switching from iptables to IPVS mode, old iptables KUBE-SVC chains were not cleaned up. This can cause routing conflicts."
+  resolution: "Operator action: after confirming IPVS is working (ipvsadm -L shows TCP/UDP entries for services), flush stale iptables rules. Restart kube-proxy pods to ensure clean state."
+
+- symptoms: "search returns kube-proxy IPVS configuration via managed addon"
+  diagnosis: "IPVS mode can be configured via the EKS managed kube-proxy addon using configuration values."
+  resolution: "Operator action: update kube-proxy addon with IPVS config — aws eks update-addon --cluster-name <name> --addon-name kube-proxy --configuration-values '{\"ipvs\": {\"scheduler\": \"rr\"}, \"mode\": \"ipvs\"}'. Ensure worker nodes have ipvsadm installed and IPVS kernel modules loaded before switching."
 
 - symptoms: "search returns 'no endpoints available' for a service"
   diagnosis: "Service has no ready pods, or kube-proxy has stale endpoint list. Check if pods are running and ready."

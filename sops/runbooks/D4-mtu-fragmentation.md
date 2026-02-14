@@ -74,6 +74,18 @@ safety_ratings:
   diagnosis: "MTU mismatch causing large packet drops. PMTUD may be blocked."
   resolution: "Operator action: set AWS_VPC_MTU_OVERRIDE on aws-node DaemonSet. Ensure ICMP is not blocked."
 
+- symptoms: "search returns 'Destination Unreachable: Fragmentation Needed' (ICMP Type 3, Code 4) in dmesg or tcpdump"
+  diagnosis: "Path MTU Discovery is working — a device along the path has a smaller MTU than the packet size. The ICMP message instructs the sender to reduce packet size. If these messages are blocked by NACLs or security groups, PMTUD fails silently."
+  resolution: "Operator action: ensure network ACLs allow ICMP Type 3 Code 4 (Fragmentation Needed) inbound and outbound. For IPv6, ensure ICMPv6 Type 2 (Packet Too Big) is allowed. See AWS docs on Path MTU Discovery."
+
+- symptoms: "search returns TLS handshake failures or large HTTP response timeouts, but small requests (ping, DNS) work fine"
+  diagnosis: "Classic MTU black hole — large packets are silently dropped because ICMP PMTUD messages are blocked. Small packets under the path MTU work fine."
+  resolution: "Operator action: 1) Check NACLs allow ICMP Type 3 Code 4. 2) Set AWS_VPC_MTU_OVERRIDE=1500 on aws-node if using VPC peering or Transit Gateway (which may have lower MTU). 3) For cross-region or VPN traffic, MTU may be as low as 1300-1400."
+
+- symptoms: "network_diagnostics shows host interface MTU=9001 (jumbo) but traffic crosses VPC peering, Transit Gateway, or VPN"
+  diagnosis: "VPC peering, Transit Gateway, and VPN connections may not support jumbo frames (MTU 9001). Traffic crossing these boundaries gets fragmented or dropped."
+  resolution: "Operator action: set AWS_VPC_MTU_OVERRIDE=1500 on aws-node DaemonSet for pods that communicate across VPC boundaries. Alternatively, set MTU at the pod level."
+
 ## Examples
 
 ```

@@ -39,6 +39,10 @@ MUST:
   - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for scheduling failures, OOM kills, or image pull errors
 - Use `collect` tool with instanceId of the SOURCE node (where the calling pod runs) to gather logs
 - Use `status` tool with executionId to poll until collection completes
+- **PREREQUISITE — Is aws-node (VPC CNI) running on the source node?** Pod networking requires the CNI:
+  - Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, namespace=kube-system, labelSelector=k8s-app=aws-node — check that aws-node pod on the SOURCE node is Running.
+  - If aws-node pod is CrashLoopBackOff, Error, or missing: that is the root cause. Report "aws-node (VPC CNI) not running on source node — pod networking is broken at the CNI level" immediately.
+  - ONLY if aws-node is confirmed running on the source node, proceed to connectivity investigation below.
 - Use `errors` tool with instanceId to get pre-indexed findings — look for network/CNI errors
 - Use `network_diagnostics` tool with instanceId and sections=eni,routes,iptables,cni to get the full network picture on the source node
 
@@ -72,6 +76,7 @@ SHOULD:
 - Use `search` tool with query=`aws-node.*version|vpc-cni.*version|VPC_CNI_VERSION` to check VPC CNI version
   - Known buggy version: VPC CNI v1.20.4 has issues
 - Use `search` tool with query=`ENABLE_NETWORK_POLICY|enableNetworkPolicy|network-policy-agent` to check if NetworkPolicy enforcement is enabled
+- Use `search` tool with query=`kube-proxy.*not running|kube-proxy.*CrashLoop` to check kube-proxy health — kube-proxy must be running for aws-node to reach Ready state. If kube-proxy is down, pod networking is broken at a lower level.
 
 ### 2B — NetworkPolicy Enforcement (Most Common Cause)
 
@@ -215,6 +220,10 @@ safety_ratings:
   - "Modify VPC route tables: RED — operator action, VPC-wide impact"
 
 ## Common Issues
+
+- symptoms: "list_k8s_resources returns aws-node pod in CrashLoopBackOff, Error, or missing on the source or destination node"
+  diagnosis: "VPC CNI DaemonSet not running. Pod networking is broken at the CNI level — no further packet tracing needed."
+  resolution: "Operator action: check aws-node logs (kubectl logs -n kube-system -l k8s-app=aws-node). Common fixes: update VPC CNI addon, check IAM permissions (AmazonEKS_CNI_Policy), verify subnet has available IPs."
 
 - symptoms: "search returns DENY verdict in network-policy-agent.log for the pod IPs"
   diagnosis: "NetworkPolicy is blocking inter-pod traffic. Check if a default-deny policy exists without a matching allow rule."

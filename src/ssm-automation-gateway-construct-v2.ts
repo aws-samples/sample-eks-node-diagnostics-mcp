@@ -821,6 +821,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'string',
               Description: 'EKS cluster name for baseline subtraction. When provided, findings seen 10+ times are annotated as baseline (normal operation).',
             },
+            incident_time: {
+              Type: 'string',
+              Description: 'ISO8601 timestamp of the incident (e.g., 2026-02-13T09:10:00Z). Analysis will be restricted to +/- 5 minutes around this time. If omitted and no start_time/end_time, defaults to last 10 minutes.',
+            },
+            start_time: {
+              Type: 'string',
+              Description: 'Start of analysis window (ISO8601). Use with end_time for explicit time range.',
+            },
+            end_time: {
+              Type: 'string',
+              Description: 'End of analysis window (ISO8601). Use with start_time for explicit time range.',
+            },
           },
           Required: ['instanceId'],
         },
@@ -834,6 +846,10 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             hasMore: { Type: 'boolean' },
             nextPageToken: { Type: 'string' },
             coverage_report: { Type: 'object', Description: 'files_scanned, files_skipped, scan_complete' },
+            window_start_utc: { Type: 'string', Description: 'UTC start of analysis window (ISO8601)' },
+            window_end_utc: { Type: 'string', Description: 'UTC end of analysis window (ISO8601)' },
+            resolution_reason: { Type: 'string', Description: 'How the time window was determined' },
+            time_window_filter: { Type: 'object', Description: 'excluded_outside_window, unparseable_timestamps counts' },
           },
         },
       },
@@ -911,6 +927,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'string',
               Description: '"concise" (default) or "detailed" — controls verbosity of match context',
             },
+            incident_time: {
+              Type: 'string',
+              Description: 'ISO8601 timestamp of the incident. Search results will be filtered to +/- 5 minutes around this time. If omitted and no start_time/end_time, defaults to last 10 minutes.',
+            },
+            start_time: {
+              Type: 'string',
+              Description: 'Start of analysis window (ISO8601). Use with end_time for explicit time range.',
+            },
+            end_time: {
+              Type: 'string',
+              Description: 'End of analysis window (ISO8601). Use with start_time for explicit time range.',
+            },
           },
           Required: ['instanceId', 'query'],
         },
@@ -953,6 +981,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'string',
               Description: '"concise" (default) or "detailed" — controls verbosity of timeline entries',
             },
+            incident_time: {
+              Type: 'string',
+              Description: 'ISO8601 timestamp of the incident. Correlation will be restricted to +/- 5 minutes around this time. If omitted and no start_time/end_time, defaults to last 10 minutes.',
+            },
+            start_time: {
+              Type: 'string',
+              Description: 'Start of analysis window (ISO8601). Use with end_time for explicit time range.',
+            },
+            end_time: {
+              Type: 'string',
+              Description: 'End of analysis window (ISO8601). Use with start_time for explicit time range.',
+            },
           },
           Required: ['instanceId'],
         },
@@ -968,6 +1008,9 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             confidence: { Type: 'string', Description: 'high|medium|low|none' },
             gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
             coverage_report: { Type: 'object' },
+            window_start_utc: { Type: 'string', Description: 'UTC start of analysis window (ISO8601)' },
+            window_end_utc: { Type: 'string', Description: 'UTC end of analysis window (ISO8601)' },
+            resolution_reason: { Type: 'string', Description: 'How the time window was determined' },
           },
         },
       },
@@ -1016,6 +1059,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
               Type: 'array',
               Description: 'Optional list of finding_ids (F-001 format) from errors tool. When provided, summary is constrained to only these findings.',
             },
+            incident_time: {
+              Type: 'string',
+              Description: 'ISO8601 timestamp of the incident. Summary analysis will be restricted to +/- 5 minutes around this time. If omitted and no start_time/end_time, defaults to last 10 minutes.',
+            },
+            start_time: {
+              Type: 'string',
+              Description: 'Start of analysis window (ISO8601). Use with end_time for explicit time range.',
+            },
+            end_time: {
+              Type: 'string',
+              Description: 'End of analysis window (ISO8601). Use with start_time for explicit time range.',
+            },
           },
           Required: ['instanceId', 'finding_ids'],
         },
@@ -1036,7 +1091,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'quick_triage',
-        Description: 'FASTEST and MOST COMPLETE path to root cause. Combines validate + errors + triage in ONE call. Returns bundle status, error findings with log excerpts (topEvidence), root cause category, remediation steps, and followup commands. The topEvidence field contains actual log line excerpts so you do NOT need to call search afterward. Only use read(logKey=...) if you need the full content of a specific file. CITATION: Cite instanceId, rootCause category, and confidence.',
+        Description: 'FASTEST and MOST COMPLETE path to root cause. Combines validate + errors + triage in ONE call. Returns bundle status, error findings with log excerpts (topEvidence), root cause category, remediation steps, followup commands, and recommendedSOPs (auto-matched SOPs based on detected issues). The topEvidence field contains actual log line excerpts so you do NOT need to call search afterward. Only use read(logKey=...) if you need the full content of a specific file. When recommendedSOPs is present, call get_sop for each recommended SOP to get detailed remediation runbooks. CITATION: Cite instanceId, rootCause category, and confidence.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -1051,6 +1106,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             includeTriage: {
               Type: 'boolean',
               Description: 'Include pod/node failure triage analysis (default: true)',
+            },
+            incident_time: {
+              Type: 'string',
+              Description: 'ISO8601 timestamp of the incident. Triage will be restricted to +/- 5 minutes around this time. If omitted and no start_time/end_time, defaults to last 10 minutes.',
+            },
+            start_time: {
+              Type: 'string',
+              Description: 'Start of analysis window (ISO8601). Use with end_time for explicit time range.',
+            },
+            end_time: {
+              Type: 'string',
+              Description: 'End of analysis window (ISO8601). Use with start_time for explicit time range.',
             },
           },
           Required: ['instanceId'],
@@ -1070,6 +1137,10 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             recommendations: { Type: 'array' },
             triage: { Type: 'object', Description: 'Full triage result with pod_states, node_conditions, evidence' },
             confidence: { Type: 'string', Description: 'high|medium|low' },
+            window_start_utc: { Type: 'string', Description: 'UTC start of analysis window (ISO8601)' },
+            window_end_utc: { Type: 'string', Description: 'UTC end of analysis window (ISO8601)' },
+            resolution_reason: { Type: 'string', Description: 'How the time window was determined' },
+            recommendedSOPs: { Type: 'array', Description: 'Auto-matched SOPs based on detected issues. Each entry has sopName, relevanceScore, matchedKeywords, reason. Call get_sop(sopName) for full remediation runbook.' },
             nextStep: { Type: 'string' },
           },
         },
@@ -1259,7 +1330,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'network_diagnostics',
-        Description: 'Extract and structure ALL networking info from collected log bundles in ONE call. Parses iptables rules, CNI config/env vars, route tables, DNS resolution, ENI attachment status, VPC CNI (aws-node/ipamd) logs, and kube-proxy mode/conntrack/IPVS status. Returns structured data with an eksNetworkingContext section containing guardrails to prevent misinterpretation. IMPORTANT EKS NETWORKING RULES: (1) Empty host route table / no default gateway is NORMAL on multi-ENI EKS nodes — secondary ENIs handle pod traffic via policy routing and SNAT. (2) Missing SNAT/MASQUERADE in iptables is EXPECTED when AWS_VPC_K8S_CNI_EXTERNALSNAT=true — NAT gateway handles egress. (3) iptables FORWARD policy DROP breaks pod networking on custom AMIs. (4) Transient "no available IP" after pod deletion is normal — IP_COOLDOWN_PERIOD (default 30s) cache. (5) Pods with hostNetwork=true use node IP directly, no SNAT. (6) nm-cloud-setup (routing table 30200/30400) is INCOMPATIBLE with VPC CNI. (7) ENABLE_PREFIX_DELEGATION changes ENI slot behavior (/28 = 16 IPs per slot). (8) ENABLE_POD_ENI enables trunk ENI for security groups per pod — extra ENIs are expected. (9) NETWORK_POLICY_ENFORCING_MODE=strict means default deny for new pods. (10) systemd-udev MACAddressPolicy=persistent breaks veth MAC on Ubuntu 22.04+. (11) kube-proxy IPVS mode: KUBE-SVC iptables chains will NOT exist — use "ipvsadm -L" instead. Requires ip_vs kernel modules. (12) kube-proxy nftables mode: rules NOT visible via iptables-save — use "nft list ruleset". (13) "nf_conntrack: table full, dropping packet" = conntrack exhaustion — increase conntrack.min in kube-proxy-config ConfigMap. Each entry ~300 bytes. (14) kube-proxy version must be within 1 minor version of cluster control plane. (15) On RHEL 8.6+ (nftables-based OS), iptables mode kube-proxy may not work — use IPVS mode. Always read eksNetworkingContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
+        Description: 'Extract and structure ALL networking info from collected log bundles in ONE call. Parses iptables rules, CNI config/env vars, route tables, DNS resolution, ENI attachment status, VPC CNI (aws-node/ipamd) logs, and kube-proxy mode/conntrack/IPVS status. Returns structured data with an eksNetworkingContext section containing guardrails to prevent misinterpretation, plus recommendedSOPs (auto-matched SOPs based on detected networking issues). When recommendedSOPs is present, call get_sop for each recommended SOP to get detailed remediation runbooks. IMPORTANT EKS NETWORKING RULES: (1) Empty host route table / no default gateway is NORMAL on multi-ENI EKS nodes — secondary ENIs handle pod traffic via policy routing and SNAT. (2) Missing SNAT/MASQUERADE in iptables is EXPECTED when AWS_VPC_K8S_CNI_EXTERNALSNAT=true — NAT gateway handles egress. (3) iptables FORWARD policy DROP breaks pod networking on custom AMIs. (4) Transient "no available IP" after pod deletion is normal — IP_COOLDOWN_PERIOD (default 30s) cache. (5) Pods with hostNetwork=true use node IP directly, no SNAT. (6) nm-cloud-setup (routing table 30200/30400) is INCOMPATIBLE with VPC CNI. (7) ENABLE_PREFIX_DELEGATION changes ENI slot behavior (/28 = 16 IPs per slot). (8) ENABLE_POD_ENI enables trunk ENI for security groups per pod — extra ENIs are expected. (9) NETWORK_POLICY_ENFORCING_MODE=strict means default deny for new pods. (10) systemd-udev MACAddressPolicy=persistent breaks veth MAC on Ubuntu 22.04+. (11) kube-proxy IPVS mode: KUBE-SVC iptables chains will NOT exist — use "ipvsadm -L" instead. Requires ip_vs kernel modules. (12) kube-proxy nftables mode: rules NOT visible via iptables-save — use "nft list ruleset". (13) "nf_conntrack: table full, dropping packet" = conntrack exhaustion — increase conntrack.min in kube-proxy-config ConfigMap. Each entry ~300 bytes. (14) kube-proxy version must be within 1 minor version of cluster control plane. (15) On RHEL 8.6+ (nftables-based OS), iptables mode kube-proxy may not work — use IPVS mode. Always read eksNetworkingContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -1284,12 +1355,13 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             issues: { Type: 'array' },
             confidence: { Type: 'string', Description: 'high|medium|low|none' },
             gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+            recommendedSOPs: { Type: 'array', Description: 'Auto-matched SOPs based on detected networking issues. Each entry has sopName, relevanceScore, matchedKeywords, reason. Call get_sop(sopName) for full remediation runbook.' },
           },
         },
       },
       {
         Name: 'storage_diagnostics',
-        Description: 'Extract and structure ALL storage/volume/CSI info from collected log bundles in ONE call. Parses kubelet volume mount errors (FailedMount, FailedAttachVolume, Multi-Attach), EBS CSI driver logs (controller + node), EFS CSI driver logs, PV/PVC/StorageClass status, and instance EBS attachment capacity. Returns structured data with an eksStorageContext section containing guardrails to prevent misinterpretation. IMPORTANT EKS STORAGE RULES: (1) Multi-Attach error with ~6 minute delay after pod termination is NORMAL K8s behavior (maxWaitForUnmountDuration), NOT a CSI bug — check Node.Status.VolumesInUse. (2) EBS attachment slots are SHARED with ENIs on pre-Gen7 instances (m5/c5/r5) — VPC CNI ENIs consume EBS slots. Fix: prefix delegation, --reserved-volume-attachments, or Gen7+. (3) IMDSv2 hop limit must be >=2 for containerized CSI drivers. (4) ebs.csi.aws.com/agent-not-ready taint prevents scheduling before CSI is ready. (5) XFS "wrong fs type, bad superblock" on AL2 with newer xfsprogs — fix: --legacy-xfs=true. (6) EFS PV/PVC capacity is MEANINGLESS — EFS is elastic, capacity field is required by K8s but not enforced. (7) EFS dynamic provisioning = access points (up to 1000 per FS). EFS file system must be pre-created. (8) StorageClass kubernetes.io/aws-ebs uses deprecated in-tree driver — CSI migration translates at runtime. (9) EC2 API throttling from CSI sidecars with high --worker-threads affects ALL instances in account/region. (10) Network policies in strict mode can block CSI driver communication (EC2 API 443, NFS 2049). (11) For cross-VPC EFS mounts, botocore must be installed for DNS resolution fallback. Always read eksStorageContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
+        Description: 'Extract and structure ALL storage/volume/CSI info from collected log bundles in ONE call. Parses kubelet volume mount errors (FailedMount, FailedAttachVolume, Multi-Attach), EBS CSI driver logs (controller + node), EFS CSI driver logs, PV/PVC/StorageClass status, and instance EBS attachment capacity. Returns structured data with an eksStorageContext section containing guardrails to prevent misinterpretation, plus recommendedSOPs (auto-matched SOPs based on detected storage issues). When recommendedSOPs is present, call get_sop for each recommended SOP to get detailed remediation runbooks. IMPORTANT EKS STORAGE RULES: (1) Multi-Attach error with ~6 minute delay after pod termination is NORMAL K8s behavior (maxWaitForUnmountDuration), NOT a CSI bug — check Node.Status.VolumesInUse. (2) EBS attachment slots are SHARED with ENIs on pre-Gen7 instances (m5/c5/r5) — VPC CNI ENIs consume EBS slots. Fix: prefix delegation, --reserved-volume-attachments, or Gen7+. (3) IMDSv2 hop limit must be >=2 for containerized CSI drivers. (4) ebs.csi.aws.com/agent-not-ready taint prevents scheduling before CSI is ready. (5) XFS "wrong fs type, bad superblock" on AL2 with newer xfsprogs — fix: --legacy-xfs=true. (6) EFS PV/PVC capacity is MEANINGLESS — EFS is elastic, capacity field is required by K8s but not enforced. (7) EFS dynamic provisioning = access points (up to 1000 per FS). EFS file system must be pre-created. (8) StorageClass kubernetes.io/aws-ebs uses deprecated in-tree driver — CSI migration translates at runtime. (9) EC2 API throttling from CSI sidecars with high --worker-threads affects ALL instances in account/region. (10) Network policies in strict mode can block CSI driver communication (EC2 API 443, NFS 2049). (11) For cross-VPC EFS mounts, botocore must be installed for DNS resolution fallback. Always read eksStorageContext.guardrails before concluding on any issue. CITATION: Cite instanceId and each section analyzed.',
         InputSchema: {
           Type: 'object',
           Properties: {
@@ -1314,6 +1386,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
             issues: { Type: 'array' },
             confidence: { Type: 'string', Description: 'high|medium|low|none' },
             gaps: { Type: 'array', Description: 'Data quality issues that reduce confidence' },
+            recommendedSOPs: { Type: 'array', Description: 'Auto-matched SOPs based on detected storage issues. Each entry has sopName, relevanceScore, matchedKeywords, reason. Call get_sop(sopName) for full remediation runbook.' },
           },
         },
       },
@@ -1436,7 +1509,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // =====================================================================
       {
         Name: 'list_sops',
-        Description: 'List all available Standard Operating Procedures (SOPs) in the S3 bucket. Returns name, size, and last modified date for each SOP.',
+        Description: 'List all available Standard Operating Procedures (SOPs) in the S3 bucket. Returns name, size, and last modified date for each SOP. IMPORTANT: quick_triage, network_diagnostics, and storage_diagnostics automatically return recommendedSOPs based on detected issues — check those first before browsing the full SOP list.',
         InputSchema: {
           Type: 'object',
           Properties: {},
@@ -1452,7 +1525,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       },
       {
         Name: 'get_sop',
-        Description: 'Get a specific Standard Operating Procedure (SOP) by name. Returns the full content of the SOP file. Use list_sops first to discover available SOPs.',
+        Description: 'Get a specific Standard Operating Procedure (SOP) by name. Returns the full content of the SOP file. Called automatically when quick_triage, network_diagnostics, or storage_diagnostics return recommendedSOPs — use the sopName from recommendedSOPs directly. Can also be used after list_sops to retrieve any SOP manually.',
         InputSchema: {
           Type: 'object',
           Properties: {

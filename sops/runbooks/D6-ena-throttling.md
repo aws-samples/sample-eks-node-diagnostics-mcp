@@ -91,6 +91,22 @@ safety_ratings:
   diagnosis: "DNS/IMDS/NTP request rate too high"
   resolution: "Operator action: deploy NodeLocal DNSCache, use IRSA instead of IMDS"
 
+- symptoms: "search returns conntrack_allowance_exceeded > 0 alongside bw or pps allowance exceeded"
+  diagnosis: "Multiple ENA allowances exceeded simultaneously. Connection tracking limit is separate from bandwidth/PPS limits. See D3-conntrack-exhaustion SOP for conntrack-specific troubleshooting."
+  resolution: "Operator action: upgrade to instance type with higher limits across all allowance types. Configure security group rules to avoid tracking where possible (untracked connections do not count against conntrack allowance)."
+
+- symptoms: "search returns ENA keep-alive watchdog timeout or 'Trigger reset is on' in dmesg"
+  diagnosis: "ENA device experienced a failure and triggered a reset. This causes brief traffic loss while the driver reinitializes. Check ethtool -S for wd_expired counter."
+  resolution: "Operator action: check for ENA driver version compatibility — update to latest ENA driver. If persistent, check for instance hardware issues and consider replacing the instance."
+
+- symptoms: "search returns queue_N_tx_queue_stop > 0 or queue_N_rx_page_alloc_fail > 0"
+  diagnosis: "ENA queue-level issues — tx_queue_stop indicates transmit queue full (bandwidth saturation), rx_page_alloc_fail indicates low memory preventing packet reception."
+  resolution: "Operator action: for tx_queue_stop, reduce traffic or upgrade instance. For rx_page_alloc_fail, check memory pressure on the node (see G2-oomkill SOP) and ensure sufficient free memory."
+
+- symptoms: "search returns conntrack_allowance_available showing low values (approaching 0)"
+  diagnosis: "Connection tracking allowance is nearly exhausted. New connections will be dropped when it reaches 0. Monitor conntrack_allowance_available metric proactively."
+  resolution: "Operator action: reduce tracked connections by configuring security group rules to avoid tracking (symmetric rules with 0.0.0.0/0 are untracked). Reduce idle connection timeout. Upgrade instance type if needed."
+
 ## Examples
 
 ```

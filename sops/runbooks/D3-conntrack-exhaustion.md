@@ -81,6 +81,14 @@ safety_ratings:
   diagnosis: "AWS instance-level conntrack limit. Kernel sysctl cannot fix this."
   resolution: "Operator action: upgrade to instance type with higher connection tracking allowance."
 
+- symptoms: "search for nf_conntrack_max shows default value (e.g., 131072) with high connection workloads"
+  diagnosis: "Kernel conntrack limit too low for workload. Can be increased via kube-proxy ConfigMap or sysctl."
+  resolution: "Operator action: increase via kube-proxy ConfigMap — set conntrack.min and conntrack.maxPerCore. Formula: max(min, maxPerCore * number_of_CPU_cores). Then restart kube-proxy DaemonSet: kubectl rollout restart ds/kube-proxy -n kube-system. Each conntrack entry uses ~300 bytes of memory."
+
+- symptoms: "search returns both nf_conntrack table full AND conntrack_allowance_exceeded > 0"
+  diagnosis: "Both kernel and AWS instance-level limits are being hit. Kernel limit should be raised first, but AWS limit is the hard ceiling."
+  resolution: "Operator action: first increase kernel limit via sysctl or kube-proxy ConfigMap. If conntrack_allowance_exceeded persists, upgrade instance type. Monitor memory impact (~300 bytes per entry)."
+
 ## Examples
 
 ```

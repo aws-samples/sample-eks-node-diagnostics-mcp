@@ -183,6 +183,186 @@ def assign_finding_id(index: int) -> str:
     return f"F-{index:03d}"
 
 
+# =============================================================================
+# TIME WINDOW RESOLVER — enforces time-bounded log analysis
+# =============================================================================
+
+class TimeWindowResolver:
+    """
+    Resolves an analysis time window from user-provided incident time parameters.
+
+    Rules:
+      1. If start_time AND end_time provided: use exactly.
+      2. If a single incident_time provided: window = [incident_time - 5min, incident_time + 5min].
+      3. If nothing provided: window = [now_utc - 10min, now_utc].
+
+    All outputs are UTC datetime objects.
+    """
+
+    DEFAULT_WINDOW_MINUTES = 10
+    INCIDENT_PADDING_MINUTES = 5
+    MAX_WINDOW_HOURS = 24  # safety cap
+
+    @staticmethod
+    def resolve(arguments: Dict) -> Dict:
+        """
+        Resolve time window from tool arguments.
+
+        Accepts:
+            incident_time: ISO8601 string or human-readable UTC timestamp
+            start_time: ISO8601 string (window start)
+            end_time: ISO8601 string (window end)
+
+        Returns dict with:
+            window_start_utc: datetime
+            window_end_utc: datetime
+            window_start_iso: str (ISO8601)
+            window_end_iso: str (ISO8601)
+            resolution_reason: str
+            journalctl_since: str (formatted for --since)
+            journalctl_until: str (formatted for --until)
+        """
+        now_utc = datetime.utcnow()
+        incident_time_str = arguments.get('incident_time')
+        start_time_str = arguments.get('start_time')
+        end_time_str = arguments.get('end_time')
+
+        window_start = None
+        window_end = None
+        reason = ''
+
+        if start_time_str and end_time_str:
+            window_start = TimeWindowResolver._parse_timestamp(start_time_str)
+            window_end = TimeWindowResolver._parse_timestamp(end_time_str)
+            if window_start and window_end:
+                reason = 'explicit incident window provided'
+            else:
+                reason = 'failed to parse explicit window; default last 10 minutes'
+                window_start = None
+                window_end = None
+
+        if window_start is None and incident_time_str:
+            incident_dt = TimeWindowResolver._parse_timestamp(incident_time_str)
+            if incident_dt:
+                pad = timedelta(minutes=TimeWindowResolver.INCIDENT_PADDING_MINUTES)
+                window_start = incident_dt - pad
+                window_end = incident_dt + pad
+                reason = f'incident time provided; applied +/- {TimeWindowResolver.INCIDENT_PADDING_MINUTES} minute padding'
+            else:
+                reason = 'failed to parse incident_time; default last 10 minutes'
+
+        if window_start is None:
+            window_end = now_utc
+            window_start = now_utc - timedelta(minutes=TimeWindowResolver.DEFAULT_WINDOW_MINUTES)
+            if not reason:
+                reason = f'no incident time; default last {TimeWindowResolver.DEFAULT_WINDOW_MINUTES} minutes'
+
+        # Safety cap: clamp window to MAX_WINDOW_HOURS
+        max_delta = timedelta(hours=TimeWindowResolver.MAX_WINDOW_HOURS)
+        if (window_end - window_start) > max_delta:
+            window_start = window_end - max_delta
+            reason += f' (clamped to max {TimeWindowResolver.MAX_WINDOW_HOURS}h window)'
+
+        # Ensure end >= start
+        if window_end < window_start:
+            window_start, window_end = window_end, window_start
+            reason += ' (swapped start/end)'
+
+        jctl_fmt = '%Y-%m-%d %H:%M:%S'
+        return {
+            'window_start_utc': window_start,
+            'window_end_utc': window_end,
+            'window_start_iso': window_start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'window_end_iso': window_end.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'resolution_reason': reason,
+            'journalctl_since': window_start.strftime(jctl_fmt),
+            'journalctl_until': window_end.strftime(jctl_fmt),
+        }
+
+    @staticmethod
+    def _parse_timestamp(ts_str: str) -> Optional[datetime]:
+        """Parse various timestamp formats into a UTC datetime."""
+        if not ts_str or not isinstance(ts_str, str):
+            return None
+        ts_str = ts_str.strip()
+        # Try ISO8601 variants
+        for fmt in [
+            '%Y-%m-%dT%H:%M:%SZ',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S.%fZ',
+            '%Y-%m-%dT%H:%M:%S.%f',
+            '%Y-%m-%dT%H:%M:%S%z',
+            '%Y-%m-%d %H:%M:%S UTC',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M',
+        ]:
+            try:
+                dt = datetime.strptime(ts_str, fmt)
+                if dt.tzinfo:
+                    # Convert to UTC, then strip tzinfo for uniform comparison
+                    from datetime import timezone
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            except ValueError:
+                continue
+        # Try unix timestamp (seconds)
+        try:
+            ts_float = float(ts_str)
+            if 1_000_000_000 < ts_float < 2_000_000_000:
+                return datetime.utcfromtimestamp(ts_float)
+            if 1_000_000_000_000 < ts_float < 2_000_000_000_000:
+                return datetime.utcfromtimestamp(ts_float / 1000)
+        except (ValueError, OSError):
+            pass
+        return None
+
+    @staticmethod
+    def is_within_window(timestamp_str: str, window: Dict) -> bool:
+        """Check if a log line timestamp falls within the resolved window."""
+        dt = TimeWindowResolver._parse_timestamp(timestamp_str)
+        if dt is None:
+            return True  # If we can't parse, include it (conservative)
+        return window['window_start_utc'] <= dt <= window['window_end_utc']
+
+    @staticmethod
+    def filter_findings_by_window(findings: List[Dict], window: Dict) -> Dict:
+        """
+        Filter findings list to only those within the time window.
+        Returns dict with filtered findings and exclusion stats.
+        """
+        included = []
+        excluded_count = 0
+        unparseable_count = 0
+
+        for f in findings:
+            sample = f.get('sample', '')
+            ts_str = extract_timestamp(sample) if sample else None
+            if ts_str is None:
+                unparseable_count += 1
+                included.append(f)  # Conservative: include if no timestamp
+                continue
+            if TimeWindowResolver.is_within_window(ts_str, window):
+                included.append(f)
+            else:
+                excluded_count += 1
+
+        return {
+            'findings': included,
+            'excluded_outside_window': excluded_count,
+            'unparseable_timestamps': unparseable_count,
+            'total_before_filter': len(findings),
+        }
+
+    @staticmethod
+    def window_metadata(window: Dict) -> Dict:
+        """Return a serializable metadata block for inclusion in tool responses."""
+        return {
+            'window_start_utc': window['window_start_iso'],
+            'window_end_utc': window['window_end_iso'],
+            'resolution_reason': window['resolution_reason'],
+        }
+
+
 ERROR_PATTERNS = {
     Severity.CRITICAL: [  # Unrecoverable / node-down / data-loss risk
         r'BUG:.*',  # Kernel bug detected
@@ -811,6 +991,177 @@ LOG_TYPE_PATTERNS = {
 
 
 # =============================================================================
+# SOP (Standard Operating Procedure) KEYWORD MAPPING
+# Maps issue patterns, triage categories, and diagnostic findings to SOP runbook filenames.
+# Used by quick_triage, network_diagnostics, and storage_diagnostics to automatically
+# recommend relevant SOPs without requiring the user to mention "SOP" in their prompt.
+# =============================================================================
+
+SOP_KEYWORD_MAP = {
+    # ── Node readiness / bootstrap ──
+    'node_not_ready': [
+        {'sop': 'runbooks/A1-node-not-ready-kubelet-oom.md', 'keywords': ['NotReady', 'node not ready', 'OOMKilled', 'kubelet.*oom', 'memory cgroup out of memory'], 'relevance': 'primary'},
+        {'sop': 'runbooks/A2-node-not-ready-certificate-expired.md', 'keywords': ['certificate.*expir', 'x509.*certificate', 'tls.*handshake'], 'relevance': 'primary'},
+        {'sop': 'runbooks/A2-node-bootstrap-registration-failure.md', 'keywords': ['bootstrap', 'registration.*fail', 'node.*register', 'nodeadm'], 'relevance': 'primary'},
+        {'sop': 'runbooks/A3-clock-skew.md', 'keywords': ['clock.*skew', 'time.*sync', 'ntp', 'chrony', 'certificate.*not yet valid'], 'relevance': 'primary'},
+        {'sop': 'runbooks/A4-worker-node-join-failure.md', 'keywords': ['join.*fail', 'worker.*join', 'aws-auth', 'configmap.*aws-auth', 'unauthorized'], 'relevance': 'primary'},
+    ],
+    # ── Kubelet / runtime ──
+    'kubelet_runtime': [
+        {'sop': 'runbooks/B1-kubelet-configuration-errors.md', 'keywords': ['kubelet.*config', 'kubelet.*error', 'kubelet.*fail', 'flag.*not recognized'], 'relevance': 'primary'},
+        {'sop': 'runbooks/B2-eviction-manager-issues.md', 'keywords': ['evict', 'eviction', 'DiskPressure', 'MemoryPressure', 'ephemeral.*storage'], 'relevance': 'primary'},
+        {'sop': 'runbooks/B3-pleg-issues.md', 'keywords': ['PLEG', 'pod lifecycle', 'GenericPLEG', 'relist.*slow'], 'relevance': 'primary'},
+    ],
+    # ── Container / image ──
+    'container_image': [
+        {'sop': 'runbooks/C1-image-pull-failures.md', 'keywords': ['ImagePullBackOff', 'ErrImagePull', 'pull.*access.*denied', 'manifest.*not found', 'ecr.*token'], 'relevance': 'primary'},
+        {'sop': 'runbooks/C2-sandbox-creation-failures.md', 'keywords': ['sandbox.*creat', 'RunPodSandbox', 'sandbox.*fail', 'network.*sandbox'], 'relevance': 'primary'},
+        {'sop': 'runbooks/C3-overlayfs-inode-exhaustion.md', 'keywords': ['inode', 'no space left', 'overlayfs', 'overlay.*error', 'disk.*full'], 'relevance': 'primary'},
+        {'sop': 'runbooks/K4-containerd-runtime-failures.md', 'keywords': ['containerd', 'runtime.*error', 'container.*runtime', 'runc', 'shim.*error'], 'relevance': 'primary'},
+    ],
+    # ── Networking / CNI ──
+    'networking_cni': [
+        {'sop': 'runbooks/D1-vpc-cni-ip-allocation-failures.md', 'keywords': ['ip.*alloc', 'no available ip', 'ipamd', 'ip exhaustion', 'subnet.*full', 'ENI.*fail', 'warm.*ip'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D2-kube-proxy-iptables-sync.md', 'keywords': ['kube-proxy', 'iptables.*sync', 'iptables.*restore', 'KUBE-SVC', 'sync.*rules.*fail'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D3-conntrack-exhaustion.md', 'keywords': ['conntrack', 'nf_conntrack', 'table full', 'dropping packet'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D4-mtu-fragmentation.md', 'keywords': ['mtu', 'fragmentation', 'packet.*too.*large', 'pmtu', 'jumbo'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D5-dns-failures.md', 'keywords': ['dns', 'coredns', 'SERVFAIL', 'NXDOMAIN', 'resolve.*fail', 'name.*resolution'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D6-ena-throttling.md', 'keywords': ['ena.*throttl', 'linklocal.*throttl', 'bw_in_allowance_exceeded', 'conntrack_allowance_exceeded'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D7-network-performance-degradation.md', 'keywords': ['network.*degrad', 'latency', 'packet.*loss', 'retransmit', 'tcp.*timeout'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D8-kube-proxy-service-connectivity.md', 'keywords': ['service.*connect', 'ClusterIP.*unreachable', 'service.*timeout', 'endpoint.*not.*found'], 'relevance': 'primary'},
+        {'sop': 'runbooks/D9-pod-to-pod-connectivity.md', 'keywords': ['pod.*connect', 'pod.*unreachable', 'pod.*timeout', 'network.*policy.*deny'], 'relevance': 'primary'},
+    ],
+    # ── Storage / volumes ──
+    'storage_volumes': [
+        {'sop': 'runbooks/E1-ebs-csi-attach-mount-timeout.md', 'keywords': ['ebs.*csi', 'FailedAttachVolume', 'FailedMount', 'volume.*attach.*timeout', 'Multi-Attach'], 'relevance': 'primary'},
+        {'sop': 'runbooks/E2-efs-mount-failures.md', 'keywords': ['efs', 'nfs.*mount', 'mount.*2049', 'efs.*timeout', 'access.*point'], 'relevance': 'primary'},
+        {'sop': 'runbooks/K5-csi-node-plugin-failures.md', 'keywords': ['csi.*node', 'csi.*plugin', 'csi.*driver', 'agent-not-ready', 'NodeStageVolume', 'NodePublishVolume'], 'relevance': 'primary'},
+        {'sop': 'runbooks/J2-ebs-transient-attach.md', 'keywords': ['ebs.*transient', 'volume.*detach', 'volume.*stuck', 'VolumeInUse'], 'relevance': 'primary'},
+    ],
+    # ── Scheduling / capacity ──
+    'scheduling_capacity': [
+        {'sop': 'runbooks/F1-insufficient-cpu-memory.md', 'keywords': ['Insufficient.*cpu', 'Insufficient.*memory', 'Unschedulable', 'FailedScheduling', 'resource.*quota'], 'relevance': 'primary'},
+        {'sop': 'runbooks/F2-max-pods-limit.md', 'keywords': ['max.*pods', 'Too many pods', 'pod.*limit', 'max-pods'], 'relevance': 'primary'},
+        {'sop': 'runbooks/F3-taints-tolerations-node-selectors.md', 'keywords': ['taint', 'toleration', 'nodeSelector', 'node.*affinity', 'NoSchedule', 'NoExecute'], 'relevance': 'primary'},
+    ],
+    # ── Resource pressure ──
+    'resource_pressure': [
+        {'sop': 'runbooks/G1-disk-pressure-eviction-storms.md', 'keywords': ['DiskPressure', 'disk.*pressure', 'eviction.*storm', 'imagefs', 'nodefs'], 'relevance': 'primary'},
+        {'sop': 'runbooks/G2-oomkill-memory-pressure.md', 'keywords': ['OOMKill', 'oom_kill', 'MemoryPressure', 'memory.*pressure', 'cgroup.*oom', 'exit code 137'], 'relevance': 'primary'},
+        {'sop': 'runbooks/G3-pid-pressure.md', 'keywords': ['PIDPressure', 'pid.*pressure', 'fork.*fail', 'cannot allocate memory', 'too many process'], 'relevance': 'primary'},
+    ],
+    # ── IAM / permissions ──
+    'iam_permissions': [
+        {'sop': 'runbooks/H1-node-role-missing-permissions.md', 'keywords': ['AccessDenied', 'not authorized', 'iam.*role', 'instance.*profile', 'sts.*assume'], 'relevance': 'primary'},
+        {'sop': 'runbooks/H2-irsa-pod-identity-confusion.md', 'keywords': ['irsa', 'pod.*identity', 'service.*account.*token', 'oidc', 'web.*identity'], 'relevance': 'primary'},
+        {'sop': 'runbooks/H3-imds-issues.md', 'keywords': ['imds', 'metadata.*service', '169.254.169.254', 'hop.*limit', 'IMDSv2'], 'relevance': 'primary'},
+    ],
+    # ── Version / compatibility ──
+    'version_compat': [
+        {'sop': 'runbooks/I1-version-skew.md', 'keywords': ['version.*skew', 'version.*mismatch', 'incompatible.*version', 'api.*version.*not.*supported'], 'relevance': 'primary'},
+    ],
+    # ── Hardware / instance ──
+    'hardware_instance': [
+        {'sop': 'runbooks/J1-ena-throttling-instance-limits.md', 'keywords': ['ena.*throttl', 'instance.*limit', 'bandwidth.*exceed', 'pps.*limit'], 'relevance': 'primary'},
+        {'sop': 'runbooks/J2-ebs-transient-attach.md', 'keywords': ['ebs.*attach', 'volume.*attach.*limit', 'maximum.*volumes'], 'relevance': 'primary'},
+        {'sop': 'runbooks/J3-az-outage-impact.md', 'keywords': ['az.*outage', 'availability.*zone', 'zone.*fail', 'regional.*issue'], 'relevance': 'primary'},
+    ],
+    # ── Pod lifecycle ──
+    'pod_lifecycle': [
+        {'sop': 'runbooks/K1-stuck-terminating-pods.md', 'keywords': ['Terminating', 'stuck.*terminat', 'finalizer', 'force.*delete', 'gracePeriod'], 'relevance': 'primary'},
+        {'sop': 'runbooks/K2-probe-failures.md', 'keywords': ['probe.*fail', 'liveness.*fail', 'readiness.*fail', 'startup.*fail', 'Unhealthy'], 'relevance': 'primary'},
+        {'sop': 'runbooks/K3-crashloopbackoff.md', 'keywords': ['CrashLoopBackOff', 'crash.*loop', 'Back-off restarting', 'exit code'], 'relevance': 'primary'},
+    ],
+}
+
+# Map triage categories (A-H) to SOP keyword groups for quick_triage integration
+TRIAGE_CATEGORY_TO_SOP_GROUP = {
+    'A': ['storage_volumes'],
+    'B': ['kubelet_runtime', 'node_not_ready', 'resource_pressure'],
+    'C': ['networking_cni'],
+    'D': ['networking_cni'],
+    'E': ['scheduling_capacity'],
+    'F': ['container_image'],
+    'G': ['networking_cni'],  # DNS is under networking
+    'H': ['iam_permissions'],
+}
+
+
+def match_sops_for_issues(issues: List[Dict], findings: List[Dict] = None,
+                          triage_category: str = None, max_sops: int = 5) -> List[Dict]:
+    """
+    Match detected issues/findings against SOP runbooks.
+    Returns a list of recommended SOPs with relevance and reason.
+
+    Args:
+        issues: List of issue dicts from diagnostics (each has 'message' and 'section')
+        findings: Optional list of error findings (each has 'pattern', 'sample')
+        triage_category: Optional triage category ID (A-H) from quick_triage root cause
+        max_sops: Maximum SOPs to return
+    """
+    scored_sops = {}  # sop_name -> {score, reasons}
+
+    # Build a combined text corpus from issues and findings for keyword matching
+    issue_texts = []
+    for issue in (issues or []):
+        issue_texts.append(issue.get('message', ''))
+    for finding in (findings or []):
+        issue_texts.append(finding.get('pattern', ''))
+        issue_texts.append(finding.get('sample', '')[:200])
+    corpus = ' '.join(issue_texts).lower()
+
+    # If triage category is known, prioritize SOPs from that category's groups
+    priority_groups = set()
+    if triage_category and triage_category in TRIAGE_CATEGORY_TO_SOP_GROUP:
+        priority_groups = set(TRIAGE_CATEGORY_TO_SOP_GROUP[triage_category])
+
+    for group_name, sop_entries in SOP_KEYWORD_MAP.items():
+        is_priority = group_name in priority_groups
+        for entry in sop_entries:
+            sop_name = entry['sop']
+            matched_keywords = []
+            for kw in entry['keywords']:
+                try:
+                    if re.search(kw, corpus, re.IGNORECASE):
+                        matched_keywords.append(kw)
+                except re.error:
+                    if kw.lower() in corpus:
+                        matched_keywords.append(kw)
+
+            if matched_keywords:
+                if sop_name not in scored_sops:
+                    scored_sops[sop_name] = {'score': 0, 'reasons': [], 'keywords': []}
+                # Score: 3 per keyword match, +5 bonus if from priority triage group
+                scored_sops[sop_name]['score'] += len(matched_keywords) * 3
+                if is_priority:
+                    scored_sops[sop_name]['score'] += 5
+                scored_sops[sop_name]['keywords'].extend(matched_keywords[:3])
+                scored_sops[sop_name]['reasons'].append(
+                    f"Matched {len(matched_keywords)} keyword(s) from {group_name}"
+                )
+
+    # Always include Z1 general troubleshooting if any issues exist but no specific SOPs matched
+    if not scored_sops and (issues or findings):
+        scored_sops['runbooks/Z1-general-troubleshooting.md'] = {
+            'score': 1,
+            'reasons': ['General troubleshooting guide for unmatched issues'],
+            'keywords': []
+        }
+
+    # Sort by score descending, take top N
+    sorted_sops = sorted(scored_sops.items(), key=lambda x: x[1]['score'], reverse=True)
+    result = []
+    for sop_name, info in sorted_sops[:max_sops]:
+        result.append({
+            'sopName': sop_name,
+            'relevanceScore': info['score'],
+            'matchedKeywords': list(set(info['keywords']))[:5],
+            'reason': '; '.join(info['reasons'][:2]),
+        })
+    return result
+
+
+# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -1062,8 +1413,8 @@ def find_findings_index(prefix: str) -> Optional[str]:
     return None
 
 
-def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
-    """Scan logs and build error index on-demand."""
+def scan_and_index_errors(instance_id: str, severity_filter: str, time_window: Dict = None) -> Dict:
+    """Scan logs and build error index on-demand, filtered by time window."""
     prefix = f'eks_{instance_id}'
     
     # List files to scan
@@ -1076,7 +1427,8 @@ def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
             'totalFindings': 0,
             'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0},
             'cached': False,
-            'warning': list_result.get('error', 'Failed to list log files')
+            'warning': list_result.get('error', 'Failed to list log files'),
+            **(TimeWindowResolver.window_metadata(time_window) if time_window else {}),
         })
     
     # Filter for text files in extracted folder
@@ -1139,6 +1491,17 @@ def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
     for idx, finding in enumerate(findings):
         finding['finding_id'] = assign_finding_id(idx + 1)
     
+    # ── Time-window filtering ──
+    tw_meta = {}
+    excluded_outside_window = 0
+    unparseable_timestamps = 0
+    if time_window:
+        tw_result = TimeWindowResolver.filter_findings_by_window(findings, time_window)
+        findings = tw_result['findings']
+        excluded_outside_window = tw_result['excluded_outside_window']
+        unparseable_timestamps = tw_result['unparseable_timestamps']
+        tw_meta = TimeWindowResolver.window_metadata(time_window)
+    
     return success_response({
         'instanceId': instance_id,
         'findings': findings[:100],
@@ -1151,7 +1514,18 @@ def scan_and_index_errors(instance_id: str, severity_filter: str) -> Dict:
             'files_available': len(files_to_scan),
             'files_skipped_size': len([f for f in list_result['objects'] if '/extracted/' in f['key'] and f['size'] >= 10485760]),
             'scan_complete': len(files_batch) >= len(files_to_scan),
-        }
+        },
+        **tw_meta,
+        **(
+            {
+                'time_window_filter': {
+                    'excluded_outside_window': excluded_outside_window,
+                    'unparseable_timestamps': unparseable_timestamps,
+                    'total_before_filter': excluded_outside_window + len(findings),
+                }
+            }
+            if time_window else {}
+        ),
     })
 
 
@@ -2746,9 +3120,12 @@ def get_error_summary(arguments: Dict) -> Dict:
         response_format: 'concise' (default) or 'detailed'
         pageSize: Number of findings per page (default: 50, max: 200)
         pageToken: Opaque token for next page (base64-encoded offset)
+        incident_time: ISO8601 timestamp of the incident (optional)
+        start_time: Start of analysis window ISO8601 (optional)
+        end_time: End of analysis window ISO8601 (optional)
     
     Returns:
-        findings[], summary counts, indexed timestamp, coverage_report
+        findings[], summary counts, indexed timestamp, coverage_report, time window metadata
     """
     instance_id = arguments.get('instanceId')
     severity_filter = arguments.get('severity', 'all')
@@ -2756,6 +3133,10 @@ def get_error_summary(arguments: Dict) -> Dict:
     page_size = min(arguments.get('pageSize', 50), 200)
     page_token = arguments.get('pageToken')
     cluster_context = arguments.get('clusterContext')
+    
+    # ── Resolve time window ──
+    time_window = TimeWindowResolver.resolve(arguments)
+    tw_meta = TimeWindowResolver.window_metadata(time_window)
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
@@ -2797,6 +3178,16 @@ def get_error_summary(arguments: Dict) -> Dict:
                     
                     if cluster_context:
                         findings = annotate_findings_with_baselines(findings, cluster_context)
+                    
+                    # ── Time-window filtering on cached findings ──
+                    tw_filter_stats = {}
+                    tw_result = TimeWindowResolver.filter_findings_by_window(findings, time_window)
+                    findings = tw_result['findings']
+                    tw_filter_stats = {
+                        'excluded_outside_window': tw_result['excluded_outside_window'],
+                        'unparseable_timestamps': tw_result['unparseable_timestamps'],
+                        'total_before_filter': tw_result['total_before_filter'],
+                    }
                     
                     # Filter by severity if requested
                     allowed_severities = normalize_severity_filter(severity_filter)
@@ -2867,6 +3258,8 @@ def get_error_summary(arguments: Dict) -> Dict:
                         'summary': summary,
                         'cached': True,
                         'coverage_report': coverage_report,
+                        **tw_meta,
+                        'time_window_filter': tw_filter_stats,
                         'interpretationGuide': {
                             'NXDOMAIN': 'Domain does not exist. Check if pods are querying wrong service names or non-existent external domains. This is NOT necessarily a DNS server misconfiguration.',
                             'OOMKilled': 'Container exceeded its memory limit and was killed by the kernel. Check container memory requests/limits.',
@@ -2885,7 +3278,7 @@ def get_error_summary(arguments: Dict) -> Dict:
                     print(f"Warning: Findings index corrupted, will scan on-demand")
         
         # Slow path: scan and index on-demand
-        result = scan_and_index_errors(instance_id, severity_filter)
+        result = scan_and_index_errors(instance_id, severity_filter, time_window=time_window)
         
         if cluster_context and result.get('success') and result.get('data', {}).get('findings'):
             result['data']['findings'] = annotate_findings_with_baselines(
@@ -2902,6 +3295,7 @@ def get_error_summary(arguments: Dict) -> Dict:
             'totalFindings': 0,
             'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0},
             'cached': False,
+            **tw_meta,
             'warning': f'Could not retrieve error summary: {str(e)}',
             'nextStep': 'Check if logs exist with validate'
         })
@@ -3109,15 +3503,22 @@ def search_logs_deep(arguments: Dict) -> Dict:
         timeRange: ISO timestamp range (optional)
         maxResults: Max results per file (default: 100)
         response_format: 'concise' (default) or 'detailed'
+        incident_time: ISO8601 timestamp of the incident (optional)
+        start_time: Start of analysis window ISO8601 (optional)
+        end_time: End of analysis window ISO8601 (optional)
     
     Returns:
-        matches[], pagination info, coverage_report
+        matches[], pagination info, coverage_report, time window metadata
     """
     instance_id = arguments.get('instanceId')
     query = arguments.get('query')
     log_types_str = arguments.get('logTypes', '')
     max_results = min(arguments.get('maxResults', 100), 500)
     response_format = arguments.get('response_format', 'concise')
+    
+    # ── Resolve time window ──
+    time_window = TimeWindowResolver.resolve(arguments)
+    tw_meta = TimeWindowResolver.window_metadata(time_window)
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
@@ -3227,6 +3628,26 @@ def search_logs_deep(arguments: Dict) -> Dict:
         # Sort by match count
         all_matches.sort(key=lambda x: x['matchCount'], reverse=True)
         
+        # ── Time-window filtering on search matches ──
+        excluded_outside_window = 0
+        unparseable_timestamps = 0
+        for match_group in all_matches:
+            filtered_matches = []
+            for m in match_group['matches']:
+                line_text = m.get('line', m.get('text', ''))
+                ts_str = extract_timestamp(line_text) if line_text else None
+                if ts_str is None:
+                    unparseable_timestamps += 1
+                    filtered_matches.append(m)  # Conservative: include if no timestamp
+                elif TimeWindowResolver.is_within_window(ts_str, time_window):
+                    filtered_matches.append(m)
+                else:
+                    excluded_outside_window += 1
+            match_group['matches'] = filtered_matches
+            match_group['matchCount'] = len(filtered_matches)
+        # Remove groups with zero matches after filtering
+        all_matches = [mg for mg in all_matches if mg['matchCount'] > 0]
+        
         # Assign finding_ids to search results
         finding_counter = 0
         for match_group in all_matches:
@@ -3261,6 +3682,11 @@ def search_logs_deep(arguments: Dict) -> Dict:
             'results': all_matches,
             'truncated': files_searched < len(files_to_search),
             'coverage_report': coverage_report,
+            **tw_meta,
+            'time_window_filter': {
+                'excluded_outside_window': excluded_outside_window,
+                'unparseable_timestamps': unparseable_timestamps,
+            },
             'interpretationGuide': {
                 'NXDOMAIN': 'Domain does not exist. Likely pods querying wrong service names or non-existent domains — not a DNS server misconfiguration.',
                 'OOMKilled': 'Container exceeded memory limit. Check requests/limits in pod spec.',
@@ -3288,6 +3714,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
             'totalMatches': 0,
             'results': [],
             'truncated': False,
+            **tw_meta,
             'error': f'Search encountered an error: {str(e)}',
             'nextStep': 'Check if logs exist with validate'
         })
@@ -3304,15 +3731,22 @@ def correlate_events(arguments: Dict) -> Dict:
         pivotEvent: Event to correlate around (optional)
         components: Components to include (optional)
         response_format: 'concise' (default) or 'detailed'
+        incident_time: ISO8601 timestamp of the incident (optional)
+        start_time: Start of analysis window ISO8601 (optional)
+        end_time: End of analysis window ISO8601 (optional)
     
     Returns:
-        timeline[], correlations, temporal_clusters, potential_root_cause_chain, coverage_report
+        timeline[], correlations, temporal_clusters, potential_root_cause_chain, coverage_report, time window metadata
     """
     instance_id = arguments.get('instanceId')
     time_window = arguments.get('timeWindow', 60)
     pivot_event = arguments.get('pivotEvent')
     components = arguments.get('components', [])
     response_format = arguments.get('response_format', 'concise')
+    
+    # ── Resolve analysis time window ──
+    analysis_window = TimeWindowResolver.resolve(arguments)
+    tw_meta = TimeWindowResolver.window_metadata(analysis_window)
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
@@ -3380,6 +3814,15 @@ def correlate_events(arguments: Dict) -> Dict:
             old_sev = f.get('severity', 'info')
             if old_sev == 'warning':
                 f['severity'] = 'high'
+        
+        # ── Time-window filtering on findings ──
+        tw_result = TimeWindowResolver.filter_findings_by_window(findings, analysis_window)
+        findings = tw_result['findings']
+        tw_filter_stats = {
+            'excluded_outside_window': tw_result['excluded_outside_window'],
+            'unparseable_timestamps': tw_result['unparseable_timestamps'],
+            'total_before_filter': tw_result['total_before_filter'],
+        }
         
         # Build timeline from findings with finding_ids
         timeline = []
@@ -3450,6 +3893,8 @@ def correlate_events(arguments: Dict) -> Dict:
                 'events_total': len(timeline),
                 'scan_complete': True,
             },
+            **tw_meta,
+            'time_window_filter': tw_filter_stats,
             'caveat': (
                 'Timeline correlation is based on pattern matching across log files. '
                 'Timestamps may not be perfectly synchronized across components. '
@@ -3472,6 +3917,7 @@ def correlate_events(arguments: Dict) -> Dict:
             'confidence': 'none',
             'gaps': [f'Correlation error: {str(e)}'],
             'coverage_report': {'files_scanned': 0, 'scan_complete': False},
+            **tw_meta,
             'error': f'Correlation encountered an error: {str(e)}',
             'nextStep': 'Check if logs exist with validate'
         })
@@ -3689,17 +4135,20 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         finding_ids: List of finding IDs from errors/search to include (recommended)
         includeRecommendations: Include remediation suggestions (default: true)
         includeTriage: Include pod/node failure triage analysis (default: true)
+        incident_time: ISO8601 timestamp of the incident (optional)
+        start_time: Start of analysis window ISO8601 (optional)
+        end_time: End of analysis window ISO8601 (optional)
     
     Returns:
         summary with criticalFindings, timeline, recommendations, artifactLinks,
-        pod_node_triage, confidence, gaps
+        pod_node_triage, confidence, gaps, time window metadata
     """
     import time
-    start_time = time.time()
+    start_time_perf = time.time()
     MAX_EXECUTION_TIME = 25  # Leave buffer for API Gateway 29s timeout
     
     def check_timeout():
-        elapsed = time.time() - start_time
+        elapsed = time.time() - start_time_perf
         if elapsed > MAX_EXECUTION_TIME:
             raise TimeoutError(f"Execution time exceeded {MAX_EXECUTION_TIME}s")
         return elapsed
@@ -3708,6 +4157,10 @@ def generate_incident_summary(arguments: Dict) -> Dict:
     finding_ids = arguments.get('finding_ids', [])
     include_recommendations = arguments.get('includeRecommendations', True)
     include_triage = arguments.get('includeTriage', True)
+    
+    # ── Resolve time window ──
+    time_window_resolved = TimeWindowResolver.resolve(arguments)
+    tw_meta = TimeWindowResolver.window_metadata(time_window_resolved)
     
     if not instance_id:
         return error_response(400, 'instanceId is required')
@@ -3734,7 +4187,14 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         error_data = {}
         try:
             check_timeout()
-            error_result = get_error_summary({'instanceId': instance_id, 'severity': 'all', 'pageSize': 200})
+            error_result = get_error_summary({
+                'instanceId': instance_id,
+                'severity': 'all',
+                'pageSize': 200,
+                'incident_time': arguments.get('incident_time'),
+                'start_time': arguments.get('start_time'),
+                'end_time': arguments.get('end_time'),
+            })
             if error_result['statusCode'] == 200:
                 error_data = json.loads(error_result['body'])
         except TimeoutError:
@@ -3793,10 +4253,11 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         summary = {
             'instanceId': instance_id,
             'generatedAt': datetime.utcnow().isoformat(),
-            'executionTimeMs': int((time.time() - start_time) * 1000),
+            'executionTimeMs': int((time.time() - start_time_perf) * 1000),
             'grounded': grounded,
             'confidence': confidence,
             'gaps': gaps,
+            **tw_meta,
             'bundleStatus': {
                 'complete': bundle_data.get('complete', False),
                 'fileCount': bundle_data.get('fileCount', 0),
@@ -3905,7 +4366,7 @@ def generate_incident_summary(arguments: Dict) -> Dict:
             summary['nextStep'] = 'Use search for detailed investigation of specific patterns'
         
         # Update execution time
-        summary['executionTimeMs'] = int((time.time() - start_time) * 1000)
+        summary['executionTimeMs'] = int((time.time() - start_time_perf) * 1000)
         
         return success_response(summary)
     
@@ -3914,10 +4375,11 @@ def generate_incident_summary(arguments: Dict) -> Dict:
         return success_response({
             'instanceId': instance_id,
             'generatedAt': datetime.utcnow().isoformat(),
-            'executionTimeMs': int((time.time() - start_time) * 1000),
+            'executionTimeMs': int((time.time() - start_time_perf) * 1000),
             'grounded': bool(finding_ids),
             'confidence': 'low',
             'gaps': ['Execution timed out — partial results only'],
+            **tw_meta,
             'bundleStatus': bundle_data if bundle_data else {'complete': False, 'fileCount': 0, 'totalSize': 'unknown'},
             'errorSummary': error_data.get('summary', {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0, 'total': 0}) if error_data else {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0, 'total': 0},
             'criticalFindings': [],
@@ -3966,12 +4428,15 @@ def quick_triage(arguments: Dict) -> Dict:
         instanceId: EC2 instance ID (required)
         severity: Filter findings by severity (default: all)
         includeTriage: Include pod/node failure triage (default: true)
+        incident_time: ISO8601 timestamp of the incident (optional)
+        start_time: Start of analysis window ISO8601 (optional)
+        end_time: End of analysis window ISO8601 (optional)
     
     Returns:
-        Combined validate + errors + summarize output in one response.
+        Combined validate + errors + summarize output in one response, with time window metadata.
     """
     import time
-    start_time = time.time()
+    start_time_perf = time.time()
     
     instance_id = arguments.get('instanceId')
     if not instance_id:
@@ -3980,9 +4445,14 @@ def quick_triage(arguments: Dict) -> Dict:
     severity_filter = arguments.get('severity', 'all')
     include_triage = arguments.get('includeTriage', True)
     
+    # ── Resolve time window ──
+    time_window_resolved = TimeWindowResolver.resolve(arguments)
+    tw_meta = TimeWindowResolver.window_metadata(time_window_resolved)
+    
     result = {
         'instanceId': instance_id,
         'generatedAt': datetime.utcnow().isoformat(),
+        **tw_meta,
     }
     
     # Step 1: Validate bundle
@@ -4010,6 +4480,9 @@ def quick_triage(arguments: Dict) -> Dict:
             'severity': severity_filter,
             'response_format': 'detailed',
             'pageSize': 200,
+            'incident_time': arguments.get('incident_time'),
+            'start_time': arguments.get('start_time'),
+            'end_time': arguments.get('end_time'),
         })
         if err_resp['statusCode'] == 200:
             err_data = json.loads(err_resp['body']) if isinstance(err_resp['body'], str) else err_resp['body']
@@ -4076,6 +4549,24 @@ def quick_triage(arguments: Dict) -> Dict:
             break
     result['topEvidence'] = top_evidence
     
+    # Step 6: Match relevant SOPs based on findings and triage results
+    try:
+        triage_cat = result.get('rootCause', {}).get('category') if result.get('rootCause') else None
+        # Build issues list from findings for SOP matching
+        sop_issues = []
+        for f in findings[:50]:
+            sop_issues.append({'message': f.get('pattern', '') + ' ' + f.get('sample', '')[:100], 'section': 'triage'})
+        recommended_sops = match_sops_for_issues(
+            issues=sop_issues,
+            findings=findings[:50],
+            triage_category=triage_cat,
+            max_sops=5
+        )
+        if recommended_sops:
+            result['recommendedSOPs'] = recommended_sops
+    except Exception:
+        pass  # SOP matching is best-effort, never block triage
+    
     # Confidence
     if critical and result.get('rootCause'):
         result['confidence'] = 'high'
@@ -4084,13 +4575,14 @@ def quick_triage(arguments: Dict) -> Dict:
     else:
         result['confidence'] = 'low'
     
-    result['executionTimeMs'] = int((time.time() - start_time) * 1000)
+    result['executionTimeMs'] = int((time.time() - start_time_perf) * 1000)
+    sop_hint = ' Use get_sop to review the recommended SOPs for detailed remediation steps.' if result.get('recommendedSOPs') else ''
     result['nextStep'] = (
         f"Root cause: {result['rootCause']['category']} ({result['rootCause']['confidence']} confidence). "
         f"Review topEvidence excerpts and follow remediation steps. "
-        f"Use read(logKey=...) only if you need full file content for a specific finding."
+        f"Use read(logKey=...) only if you need full file content for a specific finding.{sop_hint}"
         if result.get('rootCause')
-        else 'Review topEvidence excerpts. Use search only if a specific pattern needs deeper investigation.'
+        else f'Review topEvidence excerpts. Use search only if a specific pattern needs deeper investigation.{sop_hint}'
     )
     
     return success_response(result)
@@ -5996,7 +6488,16 @@ def network_diagnostics(arguments: Dict) -> Dict:
         if empty_reads:
             gaps.append(f'Sections returned empty data: {", ".join(empty_reads)}')
 
-        return success_response({
+        # Match relevant SOPs based on detected networking issues
+        recommended_sops = []
+        try:
+            if issues_found:
+                recommended_sops = match_sops_for_issues(issues=issues_found, max_sops=5)
+        except Exception:
+            pass  # SOP matching is best-effort
+
+        sop_hint = ' Use get_sop to review the recommended SOPs for detailed remediation steps.' if recommended_sops else ''
+        response_data = {
             'instanceId': instance_id,
             'sections': sections,
             'diagnostics': results,
@@ -6010,8 +6511,12 @@ def network_diagnostics(arguments: Dict) -> Dict:
             'confidence': confidence,
             'gaps': gaps,
             'overallAssessment': _network_assessment(issues_found),
-            'nextStep': 'Review eksNetworkingContext guardrails before concluding on any networking issue. Use search tool only if you need a SPECIFIC pattern not already surfaced.' if issues_found else 'No networking issues detected in the bundle.',
-        })
+            'nextStep': f'Review eksNetworkingContext guardrails before concluding on any networking issue. Use search tool only if you need a SPECIFIC pattern not already surfaced.{sop_hint}' if issues_found else 'No networking issues detected in the bundle.',
+        }
+        if recommended_sops:
+            response_data['recommendedSOPs'] = recommended_sops
+
+        return success_response(response_data)
 
     except Exception as e:
         return error_response(500, f'network_diagnostics failed: {str(e)}')
@@ -6674,7 +7179,16 @@ def storage_diagnostics(arguments: Dict) -> Dict:
             elif s in results and not any(v for k, v in results[s].items() if k not in ('issues', 'sourceFiles')):
                 gaps.append(f'Section {s} returned empty data')
 
-        return success_response({
+        # Match relevant SOPs based on detected storage issues
+        recommended_sops = []
+        try:
+            if issues_found:
+                recommended_sops = match_sops_for_issues(issues=issues_found, max_sops=5)
+        except Exception:
+            pass  # SOP matching is best-effort
+
+        sop_hint = ' Use get_sop to review the recommended SOPs for detailed remediation steps.' if recommended_sops else ''
+        response_data = {
             'instanceId': instance_id,
             'sections': sections,
             'diagnostics': results,
@@ -6688,8 +7202,12 @@ def storage_diagnostics(arguments: Dict) -> Dict:
             'confidence': confidence,
             'gaps': gaps,
             'overallAssessment': _storage_assessment(issues_found),
-            'nextStep': 'Review eksStorageContext guardrails before concluding on any storage issue.' if issues_found else 'No storage issues detected in the bundle.',
-        })
+            'nextStep': f'Review eksStorageContext guardrails before concluding on any storage issue.{sop_hint}' if issues_found else 'No storage issues detected in the bundle.',
+        }
+        if recommended_sops:
+            response_data['recommendedSOPs'] = recommended_sops
+
+        return success_response(response_data)
 
     except Exception as e:
         return error_response(500, f'storage_diagnostics failed: {str(e)}')
@@ -7088,10 +7606,13 @@ chmod +x /tmp/gen_stats_{timestamp}.sh
 /tmp/gen_stats_{timestamp}.sh "$PCAP_FILE" "$STATS_FILE" 2>/dev/null || echo '{{"error":"stats generation failed"}}' > "$STATS_FILE"
 
 # Upload all artifacts to S3 (non-fatal — node may lack S3 permissions)
+# IMPORTANT: disable set -e for uploads — these are best-effort and must not kill the script
+set +e
 UPLOAD_FAILURES=0
 
 echo "Uploading pcap to {s3_uri}..."
-if aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet 2>/dev/null; then
+aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet 2>&1
+if [ $? -eq 0 ]; then
     echo "UPLOAD_PCAP=ok"
 else
     echo "WARNING: Failed to upload pcap to S3 (node IAM role may lack s3:PutObject permission)"
@@ -7100,7 +7621,8 @@ else
 fi
 
 echo "Uploading text summary to {s3_uri_txt}..."
-if aws s3 cp "$TXT_FILE" "{s3_uri_txt}" --quiet 2>/dev/null; then
+aws s3 cp "$TXT_FILE" "{s3_uri_txt}" --quiet 2>&1
+if [ $? -eq 0 ]; then
     echo "UPLOAD_TXT=ok"
 else
     echo "WARNING: Failed to upload text summary to S3"
@@ -7109,13 +7631,17 @@ else
 fi
 
 echo "Uploading stats to {s3_uri_stats}..."
-if aws s3 cp "$STATS_FILE" "{s3_uri_stats}" --quiet 2>/dev/null; then
+aws s3 cp "$STATS_FILE" "{s3_uri_stats}" --quiet 2>&1
+if [ $? -eq 0 ]; then
     echo "UPLOAD_STATS=ok"
 else
     echo "WARNING: Failed to upload stats to S3"
     echo "UPLOAD_STATS=failed"
     UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
 fi
+
+# Do NOT re-enable set -e — the inline output section and cleanup must not kill the script
+# set -e is intentionally left off for the remainder
 
 if [ "$UPLOAD_FAILURES" -gt 0 ]; then
     echo "WARNING: $UPLOAD_FAILURES of 3 uploads failed. Ensure the node IAM role has s3:PutObject permission to {LOGS_BUCKET}."
@@ -7140,8 +7666,9 @@ echo ""
 echo "===INLINE_TXT_END==="
 
 # Cleanup
-rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" /tmp/gen_stats_{timestamp}.sh
+rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" /tmp/gen_stats_{timestamp}.sh 2>/dev/null || true
 echo "DONE"
+exit 0
 """
 
     try:
@@ -7264,7 +7791,23 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                     pass
 
         # Check if capture completed but S3 upload failed (script has inline data)
-        capture_completed = 'Capture complete.' in stdout or 'DONE' in stdout
+        # Use multiple markers for robustness — SSM truncates StandardOutputContent at 24KB
+        # so early markers like "Capture complete." may be cut if inline stats/text are large.
+        #
+        # IMPORTANT: These markers are ONLY printed AFTER the capture succeeds.
+        # Genuine failures (tcpdump not found, pod PID not resolved, no capture file)
+        # exit with "FATAL:" before any of these markers are emitted, so
+        # capture_completed will correctly be False for real failures.
+        capture_completed = (
+            'Capture complete.' in stdout
+            or 'DONE' in stdout
+            or 'UPLOAD_PCAP=ok' in stdout
+            or 'UPLOAD_PCAP=failed' in stdout
+            or ('FILE_SIZE=' in stdout and 'S3_KEY=' in stdout)
+        )
+        # Double-check: if stdout contains FATAL, the capture itself failed — never treat as success
+        if 'FATAL:' in stdout:
+            capture_completed = False
         upload_failures = 0
         for line in stdout.split('\n'):
             if line.startswith('UPLOAD_FAILURES='):
@@ -7292,7 +7835,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 pass
 
         # If capture completed (even if S3 upload failed), treat as success with warnings
-        if status in ('Success',) or (capture_completed and status == 'Failed' and upload_failures > 0):
+        if status in ('Success',) or (capture_completed and status == 'Failed'):
             # Generate presigned URL for download (may fail if pcap wasn't uploaded)
             presigned_url = ''
             try:
@@ -7305,7 +7848,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 pass
 
             # If S3 uploads failed, store inline data to S3 from Lambda (Lambda has S3 permissions)
-            if upload_failures > 0 and inline_stats:
+            if (upload_failures > 0 or (status == 'Failed' and capture_completed)) and inline_stats:
                 try:
                     s3_client.put_object(
                         Bucket=LOGS_BUCKET,
@@ -7315,7 +7858,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                     )
                 except Exception:
                     pass
-            if upload_failures > 0 and inline_txt_lines:
+            if (upload_failures > 0 or (status == 'Failed' and capture_completed)) and inline_txt_lines:
                 try:
                     s3_client.put_object(
                         Bucket=LOGS_BUCKET,
@@ -7327,9 +7870,11 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                     pass
 
             warnings = []
-            if upload_failures > 0:
-                warnings.append(f'{upload_failures} of 3 S3 uploads failed from the node (node IAM role may lack s3:PutObject). Stats and text summary were recovered from stdout and uploaded by Lambda.')
-                if upload_failures == 3:
+            actual_failures = 0
+            if upload_failures > 0 or (status == 'Failed' and capture_completed):
+                actual_failures = upload_failures if upload_failures > 0 else 3  # assume all failed if script died during upload
+                warnings.append(f'{actual_failures} of 3 S3 uploads failed from the node (node IAM role may lack s3:PutObject). Stats and text summary were recovered from stdout and uploaded by Lambda.')
+                if actual_failures == 3:
                     warnings.append('pcap file was NOT uploaded — it was too large to inline in stdout. Add S3 PutObject permission to the node IAM role to capture pcap files.')
 
             response_data = {
@@ -7350,7 +7895,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 'task': {
                     'taskId': command_id,
                     'state': 'completed',
-                    'message': f'tcpdump capture completed' + (f' ({upload_failures} S3 uploads failed — recovered via Lambda)' if upload_failures else f' — uploaded to s3://{LOGS_BUCKET}/{s3_key}'),
+                    'message': f'tcpdump capture completed' + (f' ({actual_failures} S3 uploads failed — recovered via Lambda)' if warnings else f' — uploaded to s3://{LOGS_BUCKET}/{s3_key}'),
                     'progress': 100,
                 },
             }

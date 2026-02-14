@@ -19,6 +19,10 @@ MUST:
   - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready
   - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods with connectivity issues
   - Check kube-proxy pods: `kubectl get pods -n kube-system -l k8s-app=kube-proxy` (via EKS MCP `list_k8s_resources`) — if kube-proxy is not Running or CrashLoopBackOff, iptables rules won't sync
+- **PREREQUISITE — Is kube-proxy running?** Before investigating iptables sync, verify kube-proxy is alive:
+  - Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, namespace=kube-system, labelSelector=k8s-app=kube-proxy — check that kube-proxy pod on the affected node is Running.
+  - If kube-proxy pod is CrashLoopBackOff, Error, or missing: that is the root cause. Report "kube-proxy not running on node — iptables/IPVS rules will not be synced" immediately.
+  - ONLY if kube-proxy is confirmed running, proceed to sync investigation below.
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kube-proxy errors
@@ -73,6 +77,10 @@ safety_ratings:
   - "Restart kube-proxy pods: YELLOW — operator action, not available via MCP tools"
 
 ## Common Issues
+
+- symptoms: "list_k8s_resources returns kube-proxy pod in CrashLoopBackOff, Error, or missing on the affected node"
+  diagnosis: "kube-proxy is not running. No iptables/IPVS rules will be synced on this node."
+  resolution: "Operator action: check kube-proxy logs (kubectl logs -n kube-system -l k8s-app=kube-proxy). Common fixes: restart kube-proxy DaemonSet, check kube-proxy-config ConfigMap, verify RBAC."
 
 - symptoms: "network_diagnostics iptables section shows no KUBE-SVC rules"
   diagnosis: "kube-proxy not running or not syncing rules"

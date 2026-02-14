@@ -59,8 +59,10 @@ MUST:
   - If found: aws-auth ConfigMap or EKS access entry is missing the node IAM role ARN
   - Common mistake: using instance profile ARN instead of role ARN
   - Common mistake: role ARN contains a path (e.g., /development/apps/my-role) — path must be removed
-- Use `search` tool with query=`AccessDenied|not authorized|AmazonEKSWorkerNodePolicy|AmazonEKS_CNI_Policy|AmazonEC2ContainerRegistryReadOnly` to check node role permissions
-  - Node role must have: AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly
+  - Recommended: use EKS Access Entries (EC2 Linux or EC2 Windows type) instead of aws-auth ConfigMap for new clusters
+- Use `search` tool with query=`AccessDenied|not authorized|AmazonEKSWorkerNodePolicy|AmazonEKS_CNI_Policy|AmazonEC2ContainerRegistryReadOnly|AmazonEC2ContainerRegistryPullOnly` to check node role permissions
+  - Node role must have: AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, and AmazonEC2ContainerRegistryReadOnly (or AmazonEC2ContainerRegistryPullOnly for newer setups)
+  - Also verify the cluster IAM role has AmazonEKSClusterPolicy and the correct trust policy for eks.amazonaws.com
 - Use `search` tool with query=`InvalidClientTokenId|SignatureDoesNotMatch|security token.*expired` to check STS/credential issues
   - If found: regional STS endpoint may not be activated for this region
 
@@ -236,11 +238,39 @@ safety_ratings:
 
 - symptoms: "search returns AccessDenied for AmazonEKSWorkerNodePolicy or AmazonEKS_CNI_Policy"
   diagnosis: "Node IAM role missing required managed policies, or SCP/permissions boundary blocking the policies."
-  resolution: "Operator action: attach AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, and AmazonEC2ContainerRegistryReadOnly to the node IAM role."
+  resolution: "Operator action: attach AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, and AmazonEC2ContainerRegistryReadOnly (or AmazonEC2ContainerRegistryPullOnly for newer setups) to the node IAM role. Also verify the cluster IAM role has AmazonEKSClusterPolicy and the correct trust policy for eks.amazonaws.com."
 
 - symptoms: "errors tool returns no findings, node simply never appears"
   diagnosis: "Bootstrap script may not have run at all. Check cloud-init logs for user data execution."
   resolution: "Operator action: verify launch template user data is correctly formatted (MIME multipart for AL2023, bash script for AL2). Check cloud-init output log."
+
+- symptoms: "search returns AutoScalingGroupNotFound or managed node group shows Degraded"
+  diagnosis: "The Auto Scaling Group referenced by the managed node group was deleted or cannot be found."
+  resolution: "Operator action: delete the degraded node group and create a new one. The ASG cannot be recovered once deleted."
+
+- symptoms: "search returns ClusterUnreachable or etcd database size exceeded"
+  diagnosis: "EKS control plane etcd database has exceeded 8GB, making the cluster unreachable. Nodes cannot join because the API server is unavailable."
+  resolution: "Operator action: reduce the number of objects in the cluster (delete unused ConfigMaps, Secrets, Events). Contact AWS Support if the cluster remains unreachable."
+
+- symptoms: "search returns AutoScalingGroupInvalidConfiguration or subnet mismatch"
+  diagnosis: "Node group subnets do not match the cluster subnets, or the specified subnets no longer exist."
+  resolution: "Operator action: delete the node group and recreate with correct subnets that match the cluster VPC configuration."
+
+- symptoms: "search returns Ec2SecurityGroupNotFound"
+  diagnosis: "The security group referenced by the node group was deleted. Managed node groups cannot recover from a deleted SG."
+  resolution: "Operator action: delete the node group and create a new one with a valid security group. The deleted SG cannot be re-associated."
+
+- symptoms: "search returns Ec2LaunchTemplateNotFound or LaunchTemplateVersionMismatch"
+  diagnosis: "The launch template or the specified version was deleted or does not exist."
+  resolution: "Operator action: update the node group to use a valid launch template version, or delete and recreate the node group."
+
+- symptoms: "search returns AsgInstanceLaunchFailures or InsufficientInstanceCapacity for Spot"
+  diagnosis: "Spot instance capacity unavailable for the requested instance type in the specified AZ."
+  resolution: "Operator action: use mixed instance types in the node group to increase Spot availability. Configure multiple instance types across multiple AZs."
+
+- symptoms: "search returns IamInstanceProfileNotFound or IamNodeRoleNotFound"
+  diagnosis: "The IAM instance profile or node role referenced by the node group was deleted."
+  resolution: "Operator action: delete the degraded node group and create a new one with a valid IAM role and instance profile."
 
 ## Examples
 

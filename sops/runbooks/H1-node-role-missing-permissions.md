@@ -21,6 +21,10 @@ FIRST — Check node and pod state before collecting logs:
 - Use `get_k8s_events` with clusterName, kind=Node, name=<node-name> to check for FailedCreatePodSandBox, ErrImagePull, or registration-related events
 
 MUST:
+- **PREREQUISITE — Is an instance profile attached?** Before investigating which policy is missing, verify the node has an IAM role at all:
+  - Use `search` tool with instanceId and query=`No instance profile|instance profile.*not found|Unable to locate credentials|NoCredentialProviders` — if matches found, the EC2 instance has no instance profile attached. That is the root cause. Report "No instance profile attached to instance — node has no IAM role" immediately.
+  - Use `search` tool with instanceId and query=`instance profile|iam role|arn:aws:iam` — if NO matches found for any IAM role ARN, the instance may not have a profile. Report this before investigating specific policies.
+  - ONLY if instance profile is confirmed attached, proceed to policy investigation below.
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=high to get pre-indexed IAM/permission findings
@@ -82,6 +86,10 @@ safety_ratings:
 
 ## Common Issues
 
+- symptoms: "search returns No instance profile, Unable to locate credentials, or NoCredentialProviders"
+  diagnosis: "EC2 instance has no instance profile attached. The node has no IAM role at all, so all AWS API calls will fail."
+  resolution: "Operator action: attach an instance profile with the required EKS node policies (AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly). Use managed node groups for automatic IAM setup."
+
 - symptoms: "errors tool returns findings with ECR image pull AccessDenied"
   diagnosis: "Node role missing AmazonEC2ContainerRegistryReadOnly. Use search with query=ecr.*AccessDenied to confirm."
   resolution: "Operator action: attach AmazonEC2ContainerRegistryReadOnly to node IAM role"
@@ -93,6 +101,14 @@ safety_ratings:
 - symptoms: "errors tool returns findings with node registration Unauthorized"
   diagnosis: "Node role missing AmazonEKSWorkerNodePolicy. Use search with query=bootstrap to check registration logs."
   resolution: "Operator action: attach AmazonEKSWorkerNodePolicy to node IAM role"
+
+- symptoms: "search returns IamInstanceProfileNotFound or IamNodeRoleNotFound in node group events"
+  diagnosis: "The IAM instance profile or node role referenced by the managed node group was deleted. The node group enters Degraded state."
+  resolution: "Operator action: delete the degraded node group and create a new one with a valid IAM role. The deleted role/instance profile cannot be re-associated with the existing node group."
+
+- symptoms: "search returns ECR repository policy AccessDenied or cross-account pull failure"
+  diagnosis: "ECR repository policy does not allow the node role to pull images. This is separate from the IAM policy on the node role — the repository itself has a resource-based policy that can deny access."
+  resolution: "Operator action: update the ECR repository policy to allow ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:BatchCheckLayerAvailability for the node role ARN. Use 'aws ecr set-repository-policy'."
 
 ## Examples
 
