@@ -15,6 +15,11 @@ context: "Kubelet process killed by kernel OOM-killer causes node to lose heartb
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — confirm the node is NotReady
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at Conditions (MemoryPressure, DiskPressure, PIDPressure) and allocatable resources
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods in CrashLoopBackOff, OOMKilled, or Evicted state
+  - Check kubelet pod status on the node — if kubelet is OOM-killed, all pods on the node will be affected
 - Use `collect` tool with instanceId to start log collection from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=critical to get pre-indexed OOM findings

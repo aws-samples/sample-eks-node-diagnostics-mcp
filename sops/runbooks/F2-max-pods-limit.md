@@ -15,6 +15,12 @@ context: "Each EC2 instance type has a max-pods limit based on ENI count and IPs
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Check pod status — pods in Pending state with "Too many pods" event confirms this SOP
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for "Too many pods" or max-pods scheduling failures
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — compare current pod count vs allocatable pods
+  - Check all nodes: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — check if all nodes are at max pods
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=high to get pre-indexed findings related to pod limits

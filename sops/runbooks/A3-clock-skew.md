@@ -15,6 +15,10 @@ context: "System clock drift causes TLS certificate validation to fail because c
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — confirm the node is NotReady or showing clock-related issues
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look for x509 certificate errors or time-related conditions
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods failing with TLS or certificate errors
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for x509 or time-related errors

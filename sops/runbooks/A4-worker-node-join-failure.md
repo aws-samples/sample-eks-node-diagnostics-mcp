@@ -29,6 +29,10 @@ context: >
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — check if the node appears in the node list (failed join = not listed)
+  - If node IS listed: check its status and conditions for join-related errors
+  - If node is NOT listed: confirms join failure — proceed with log collection via SSM
 - Use `collect` tool with instanceId to gather logs from the node that failed to join
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=critical to get pre-indexed findings

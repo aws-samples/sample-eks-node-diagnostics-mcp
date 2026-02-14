@@ -16,6 +16,12 @@ context: "EC2 instances have network performance limits (bandwidth, PPS, conntra
 
 ## Phase 1 — Triage
 
+FIRST — Check node state before collecting logs:
+- Use `list_k8s_resources` with clusterName, kind=Node, apiVersion=v1 to list all nodes — check if the affected node is Ready and identify its instance type from node labels (node.kubernetes.io/instance-type)
+- Use `read_k8s_resource` with clusterName, kind=Node, apiVersion=v1, name=<node-name> to get detailed node status — check conditions, allocatable resources, and instance type label for network limit reference
+- Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, fieldSelector=spec.nodeName=<node-name> to list pods on the node — check for pods experiencing network timeouts or connection failures
+- Use `get_k8s_events` with clusterName, kind=Node, name=<node-name> to check for network-related warning events
+
 MUST:
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes

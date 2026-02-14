@@ -17,6 +17,12 @@ context: "VPC CNI assigns real VPC IP addresses to pods. When IPs are exhausted 
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Check pod status — pods stuck in ContainerCreating without an IP address confirms IP allocation failure
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for "failed to assign an IP address" or CNI errors
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready
+  - Check aws-node (VPC CNI) pods: `kubectl get pods -n kube-system -l k8s-app=aws-node` — if CNI is not Running, IP allocation is broken
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for IP allocation errors

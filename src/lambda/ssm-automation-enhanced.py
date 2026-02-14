@@ -7087,20 +7087,57 @@ STATSEOF
 chmod +x /tmp/gen_stats_{timestamp}.sh
 /tmp/gen_stats_{timestamp}.sh "$PCAP_FILE" "$STATS_FILE" 2>/dev/null || echo '{{"error":"stats generation failed"}}' > "$STATS_FILE"
 
-# Upload all artifacts to S3
-echo "Uploading pcap to {s3_uri}..."
-aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet
-echo "Uploading text summary to {s3_uri_txt}..."
-aws s3 cp "$TXT_FILE" "{s3_uri_txt}" --quiet
-echo "Uploading stats to {s3_uri_stats}..."
-aws s3 cp "$STATS_FILE" "{s3_uri_stats}" --quiet
+# Upload all artifacts to S3 (non-fatal — node may lack S3 permissions)
+UPLOAD_FAILURES=0
 
-echo "Upload complete."
+echo "Uploading pcap to {s3_uri}..."
+if aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet 2>/dev/null; then
+    echo "UPLOAD_PCAP=ok"
+else
+    echo "WARNING: Failed to upload pcap to S3 (node IAM role may lack s3:PutObject permission)"
+    echo "UPLOAD_PCAP=failed"
+    UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+fi
+
+echo "Uploading text summary to {s3_uri_txt}..."
+if aws s3 cp "$TXT_FILE" "{s3_uri_txt}" --quiet 2>/dev/null; then
+    echo "UPLOAD_TXT=ok"
+else
+    echo "WARNING: Failed to upload text summary to S3"
+    echo "UPLOAD_TXT=failed"
+    UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+fi
+
+echo "Uploading stats to {s3_uri_stats}..."
+if aws s3 cp "$STATS_FILE" "{s3_uri_stats}" --quiet 2>/dev/null; then
+    echo "UPLOAD_STATS=ok"
+else
+    echo "WARNING: Failed to upload stats to S3"
+    echo "UPLOAD_STATS=failed"
+    UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+fi
+
+if [ "$UPLOAD_FAILURES" -gt 0 ]; then
+    echo "WARNING: $UPLOAD_FAILURES of 3 uploads failed. Ensure the node IAM role has s3:PutObject permission to {LOGS_BUCKET}."
+    echo "See README — 'S3 Upload Permissions for Worker Nodes' section."
+fi
+
 echo "S3_KEY={s3_key}"
 echo "S3_KEY_TXT={s3_key_txt}"
 echo "S3_KEY_STATS={s3_key_stats}"
 echo "FILE_SIZE=$FILE_SIZE"
 echo "PACKET_COUNT=$PACKET_COUNT"
+echo "UPLOAD_FAILURES=$UPLOAD_FAILURES"
+
+# Inline the decoded text and stats in stdout so Lambda can parse them even if S3 upload failed
+echo "===INLINE_STATS_BEGIN==="
+cat "$STATS_FILE" 2>/dev/null || echo '{{"error":"stats file missing"}}'
+echo ""
+echo "===INLINE_STATS_END==="
+echo "===INLINE_TXT_BEGIN==="
+head -500 "$TXT_FILE" 2>/dev/null || echo "(no decoded text)"
+echo ""
+echo "===INLINE_TXT_END==="
 
 # Cleanup
 rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" /tmp/gen_stats_{timestamp}.sh
@@ -7226,8 +7263,37 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 except ValueError:
                     pass
 
-        if status in ('Success',):
-            # Generate presigned URL for download
+        # Check if capture completed but S3 upload failed (script has inline data)
+        capture_completed = 'Capture complete.' in stdout or 'DONE' in stdout
+        upload_failures = 0
+        for line in stdout.split('\n'):
+            if line.startswith('UPLOAD_FAILURES='):
+                try:
+                    upload_failures = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    pass
+
+        # Extract inline stats and text from stdout (available even when S3 upload fails)
+        inline_stats = {}
+        inline_txt_lines = []
+        if '===INLINE_STATS_BEGIN===' in stdout:
+            try:
+                stats_block = stdout.split('===INLINE_STATS_BEGIN===')[1].split('===INLINE_STATS_END===')[0].strip()
+                if stats_block:
+                    inline_stats = json.loads(stats_block)
+            except (IndexError, json.JSONDecodeError):
+                pass
+        if '===INLINE_TXT_BEGIN===' in stdout:
+            try:
+                txt_block = stdout.split('===INLINE_TXT_BEGIN===')[1].split('===INLINE_TXT_END===')[0].strip()
+                if txt_block:
+                    inline_txt_lines = txt_block.split('\n')
+            except IndexError:
+                pass
+
+        # If capture completed (even if S3 upload failed), treat as success with warnings
+        if status in ('Success',) or (capture_completed and status == 'Failed' and upload_failures > 0):
+            # Generate presigned URL for download (may fail if pcap wasn't uploaded)
             presigned_url = ''
             try:
                 presigned_url = s3_client.generate_presigned_url(
@@ -7238,10 +7304,38 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
             except Exception:
                 pass
 
-            return success_response({
+            # If S3 uploads failed, store inline data to S3 from Lambda (Lambda has S3 permissions)
+            if upload_failures > 0 and inline_stats:
+                try:
+                    s3_client.put_object(
+                        Bucket=LOGS_BUCKET,
+                        Key=s3_key_stats,
+                        Body=json.dumps(inline_stats, indent=2),
+                        ContentType='application/json',
+                    )
+                except Exception:
+                    pass
+            if upload_failures > 0 and inline_txt_lines:
+                try:
+                    s3_client.put_object(
+                        Bucket=LOGS_BUCKET,
+                        Key=s3_key_txt,
+                        Body='\n'.join(inline_txt_lines),
+                        ContentType='text/plain',
+                    )
+                except Exception:
+                    pass
+
+            warnings = []
+            if upload_failures > 0:
+                warnings.append(f'{upload_failures} of 3 S3 uploads failed from the node (node IAM role may lack s3:PutObject). Stats and text summary were recovered from stdout and uploaded by Lambda.')
+                if upload_failures == 3:
+                    warnings.append('pcap file was NOT uploaded — it was too large to inline in stdout. Add S3 PutObject permission to the node IAM role to capture pcap files.')
+
+            response_data = {
                 'commandId': command_id,
                 'instanceId': instance_id,
-                'status': 'completed',
+                'status': 'completed' if not warnings else 'completed_with_warnings',
                 's3Key': s3_key,
                 's3KeyTxt': s3_key_txt,
                 's3KeyStats': s3_key_stats,
@@ -7256,10 +7350,16 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 'task': {
                     'taskId': command_id,
                     'state': 'completed',
-                    'message': f'tcpdump capture uploaded to s3://{LOGS_BUCKET}/{s3_key}',
+                    'message': f'tcpdump capture completed' + (f' ({upload_failures} S3 uploads failed — recovered via Lambda)' if upload_failures else f' — uploaded to s3://{LOGS_BUCKET}/{s3_key}'),
                     'progress': 100,
                 },
-            })
+            }
+            if warnings:
+                response_data['warnings'] = warnings
+            if inline_stats:
+                response_data['inlineStats'] = inline_stats
+
+            return success_response(response_data)
 
         elif status in ('InProgress', 'Pending', 'Delayed'):
             elapsed = 0

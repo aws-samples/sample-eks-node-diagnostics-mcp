@@ -12,6 +12,12 @@ context: "This SOP is invoked when the reported symptoms do not match any of the
 
 ## Phase 1 — Triage
 
+FIRST — Check node and pod state before any log collection:
+- Use `list_k8s_resources` with clusterName, kind=Node, apiVersion=v1 to list all nodes — check Ready/NotReady status, conditions (DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable), and identify the affected node
+- Use `read_k8s_resource` with clusterName, kind=Node, apiVersion=v1, name=<node-name> to get detailed node conditions, capacity, allocatable resources, and node info (kubelet version, OS, container runtime)
+- Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, fieldSelector=spec.nodeName=<node-name> to list all pods on the affected node — check for pods in CrashLoopBackOff, Error, ImagePullBackOff, Pending, or ContainerCreating state
+- Use `get_k8s_events` with clusterName, kind=Node, name=<node-name> to check for recent warning events that may indicate the failure domain
+
 MUST:
 - Use `quick_triage` tool with instanceId to get a one-shot validate + errors + summarize overview of the node
 - Review the quick_triage output to check if any findings match a known SOP trigger pattern:

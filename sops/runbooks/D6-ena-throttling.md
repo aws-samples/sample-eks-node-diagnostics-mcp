@@ -17,6 +17,9 @@ context: "AWS instances have network performance limits (bandwidth, PPS, conntra
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods experiencing network throttling or timeouts
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for ENA throttling errors

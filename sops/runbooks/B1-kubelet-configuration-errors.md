@@ -16,6 +16,10 @@ context: "Kubelet fails to start or crashes on startup due to configuration erro
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready or check what condition it's in
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at kubelet version, conditions, and capacity
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods in CrashLoopBackOff or Error state that indicate kubelet config issues
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kubelet config errors

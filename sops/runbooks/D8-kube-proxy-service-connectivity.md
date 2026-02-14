@@ -30,6 +30,12 @@ context: >
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Verify the client pod is Running and Ready — if the pod is not running, connectivity failure is expected
+  - Check the Service and its endpoints: `kubectl get svc <svc>` and `kubectl get endpoints <svc>` (via EKS MCP `read_k8s_resource`) — if endpoints list is empty, no backend pods are selected
+  - Check backend pods are Running and Ready — if backends are down, the Service has no healthy endpoints
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — NotReady nodes break kube-proxy rule sync
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kube-proxy errors

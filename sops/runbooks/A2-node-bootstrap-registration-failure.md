@@ -16,6 +16,10 @@ context: "Node instance is running in EC2 but never joins the cluster. Common ca
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — check if the node appears in the node list at all (unregistered nodes won't appear)
+  - If node IS listed: check its status — it may be NotReady with registration errors
+  - If node is NOT listed: confirms bootstrap/registration failure — proceed with log collection
 - Use `collect` tool with instanceId to gather logs from the unregistered node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for Unauthorized, TLS, or bootstrap errors

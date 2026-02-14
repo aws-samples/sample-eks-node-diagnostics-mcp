@@ -16,6 +16,12 @@ context: "Pods remain Pending when no node has enough allocatable CPU or memory 
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Check pod status — pods in Pending state with "Insufficient cpu" or "Insufficient memory" events confirms this SOP
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for scheduling failure details (FailedScheduling)
+  - Check node conditions and allocatable resources: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — compare Allocatable vs Allocated resources
+  - Check all nodes: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify which nodes are Ready and available for scheduling
 - Use `collect` tool with instanceId of a node where pods cannot schedule to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=high to get pre-indexed scheduling-related findings

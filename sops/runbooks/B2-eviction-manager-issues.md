@@ -16,6 +16,10 @@ context: "Kubelet eviction manager kills pods when node resources drop below con
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — look for MemoryPressure, DiskPressure conditions that trigger evictions
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at Conditions and recent events for eviction activity
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for Evicted pods, pods in Terminating state, or pods being rescheduled
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `quick_triage` tool with instanceId to get combined validate + errors + triage in one call

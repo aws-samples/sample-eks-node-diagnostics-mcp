@@ -16,6 +16,13 @@ context: "EBS volumes can get stuck in attaching state, remain attached to termi
 
 ## Phase 1 — Triage
 
+FIRST — Check pod and node state before collecting logs:
+- Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, namespace=<namespace> to list pods — check for pods stuck in ContainerCreating or Pending state (indicates volume attach failure)
+- Use `read_k8s_resource` with clusterName, kind=Pod, apiVersion=v1, namespace=<namespace>, name=<pod-name> to get detailed pod status — check conditions for PodScheduled, volumes section for PVC references, and container status
+- Use `get_k8s_events` with clusterName, kind=Pod, namespace=<namespace>, name=<pod-name> to check for FailedAttachVolume, FailedMount, Multi-Attach, or WaitForAttach timeout events
+- Use `read_k8s_resource` with clusterName, kind=PersistentVolumeClaim, apiVersion=v1, namespace=<namespace>, name=<pvc-name> to check PVC status (Bound/Pending) and the associated PV
+- Use `list_k8s_resources` with clusterName, kind=Node, apiVersion=v1 to check which node the pod is scheduled on and its AZ label (topology.kubernetes.io/zone)
+
 MUST:
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes

@@ -69,6 +69,13 @@ Tool names are kept short to stay under the 64-character limit when prefixed wit
 | `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Supports capturing inside a pod/container network namespace — provide `podName` + `podNamespace` (auto-resolves PID via crictl/docker) or raw `containerPid`. Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
 | `tcpdump_analyze` | Read decoded packet text, protocol stats (TCP/UDP/ICMP), top talkers, and anomaly detection (high RST, retransmissions, SYN floods) from a completed capture |
 
+### Tier 5: SOP Management
+
+| Tool | Description |
+|------|-------------|
+| `list_sops` | List all available runbooks with title, description, severity, and trigger patterns. Use to find the right SOP for a given symptom |
+| `get_sop` | Retrieve the full SOP procedure by name (e.g., `D9-pod-to-pod-connectivity`). Returns the complete 3-phase investigation flow |
+
 ---
 
 ## Agent Workflow
@@ -121,6 +128,52 @@ Recommended workflow for incident response:
 3. tcpdump_analyze(instanceId, commandId)
    → decoded packets, protocol stats, top talkers, anomalies
 ```
+
+### SOP-Guided Investigation
+
+The agent can discover and follow structured runbooks for 36 known failure categories:
+
+```
+1. list_sops()                         → browse all 36 runbooks by category
+   ↓
+2. get_sop(sopName="D9-pod-to-pod-connectivity")
+   → full 3-phase procedure with MCP tool calls
+   ↓
+3. Follow Phase 1 → Phase 2 → Phase 3 from the SOP
+```
+
+Every SOP follows a consistent 3-phase structure:
+- **Phase 1 — Triage**: FIRST check pod/node state via EKS MCP tools, then collect logs and get pre-indexed findings
+- **Phase 2 — Enrich**: Deep investigation with search, correlate, and domain-specific diagnostics
+- **Phase 3 — Report**: Grounded incident summary with root cause, evidence, and remediation
+
+---
+
+## Runbook Library (36 SOPs)
+
+All SOPs are stored in `sops/runbooks/` and automatically deployed to S3 via CDK BucketDeployment. The agent retrieves them at runtime using `list_sops` and `get_sop`.
+
+| Category | SOPs | Coverage |
+|----------|------|----------|
+| **A — Node Lifecycle** | A1 (OOM/NotReady), A2 (Certificate Expired), A2 (Bootstrap Failure), A3 (Clock Skew), A4 (Join Failure) | Node registration, readiness, certificates |
+| **B — Kubelet** | B1 (Config Errors), B2 (Eviction Manager), B3 (PLEG) | Kubelet crashes, eviction, container lifecycle |
+| **C — Container Runtime** | C1 (Image Pull), C2 (Sandbox Creation), C3 (OverlayFS/Inode) | containerd, image pulls, filesystem |
+| **D — Networking** | D1 (VPC CNI/IP), D2 (kube-proxy/iptables), D3 (Conntrack), D4 (MTU), D5 (DNS), D6 (ENA Throttling), D7 (Network Perf), D8 (Service Connectivity), D9 (Pod-to-Pod) | Full networking stack coverage |
+| **E — Storage** | E1 (EBS CSI), E2 (EFS Mount) | Persistent volume attach/mount |
+| **F — Scheduling** | F1 (CPU/Memory), F2 (Max Pods), F3 (Taints/Tolerations) | Pod scheduling failures |
+| **G — Resource Pressure** | G1 (Disk Pressure), G2 (OOMKill), G3 (PID Pressure) | Node resource exhaustion |
+| **H — IAM/Security** | H1 (Node Role), H2 (IRSA/Pod Identity), H3 (IMDS) | Permissions, credentials, metadata |
+| **I — Upgrades** | I1 (Version Skew) | Control plane / node version mismatch |
+| **J — Infrastructure** | J1 (ENA/Instance Limits), J2 (EBS Transient Attach), J3 (AZ Outage) | EC2, EBS, AZ-level failures |
+| **Z — Catch-All** | Z1 (General Troubleshooting) | Systematic investigation for unknown issues |
+
+### SOP Design Principles
+
+- **FIRST check pod/node state**: Every SOP starts by checking pod and node status via EKS MCP tools (`list_k8s_resources`, `read_k8s_resource`, `get_k8s_events`) before collecting any node-level logs
+- **MCP tools only**: SOPs reference only the 19 tools exposed by this MCP server — no kubectl, no AWS CLI, no SSH
+- **3-phase structure**: Triage → Enrich → Report with MUST/SHOULD/MAY priority levels
+- **Guardrails**: Escalation conditions and safety ratings (GREEN/YELLOW/RED) for every action
+- **Grounded evidence**: All conclusions cite specific finding IDs from the `errors` and `search` tools
 
 ---
 
@@ -226,7 +279,8 @@ The CDK stack creates all resources with the correct IAM permissions automatical
 | Resource | Purpose |
 |----------|---------|
 | S3 Bucket (KMS encrypted) | Stores collected log bundles |
-| Lambda (SSM Automation) | Handles all MCP tool invocations |
+| S3 Bucket (SOPs) | Stores 36 runbooks, auto-deployed via CDK BucketDeployment |
+| Lambda (SSM Automation) | Handles all 19 MCP tool invocations |
 | Lambda (Unzip) | Auto-extracts uploaded archives |
 | Lambda (Findings Indexer) | Pre-indexes errors for fast retrieval |
 | SSM Automation Role | Runs log collection on EC2 instances |
@@ -517,6 +571,18 @@ database. Capture all traffic from inside the pod's namespace for 2 minutes — 
 to see if SYN packets are leaving and whether RSTs are coming back.
 ```
 
+### "Check network between two pods"
+```
+Check network between pods test1 and test2 on node i-0abc123def. Capture packets on
+both pods and tell me if there are any drops or issues.
+```
+
+### "I don't know what's wrong — just investigate"
+```
+Node i-0abc123def is acting weird but I'm not sure what category the issue falls into.
+List the available SOPs, run a general triage, and follow whichever runbook matches.
+```
+
 ---
 
 ## Architecture
@@ -524,7 +590,7 @@ to see if SYN packets are leaving and whether RSTs are coming back.
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  DevOps Agent   │────▶│  MCP Gateway     │────▶│  Lambda         │
-│  (MCP Client)   │     │  (AgentCore)     │     │  (17 tools)     │
+│  (MCP Client)   │     │  (AgentCore)     │     │  (19 tools)     │
 └─────────────────┘     └──────────────────┘     └────────┬────────┘
                                                           │
                         ┌────────────┬────────────────────┼────────────────────┐
@@ -557,6 +623,7 @@ to see if SYN packets are leaving and whether RSTs are coming back.
 | `OAuthExchangeUrl` | OAuth Token URL |
 | `OAuthScope` | OAuth Scope (use only ONE) |
 | `LogsBucketName` | S3 bucket for collected logs |
+| `SOPBucketName` | S3 bucket for runbook SOPs |
 | `SSMAutomationRoleArn` | IAM role for SSM Automation |
 | `EncryptionKeyArn` | KMS key ARN |
 

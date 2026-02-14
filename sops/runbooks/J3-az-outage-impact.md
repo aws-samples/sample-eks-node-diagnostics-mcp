@@ -14,6 +14,12 @@ context: "When an AWS Availability Zone experiences degradation, multiple nodes 
 
 ## Phase 1 — Triage
 
+FIRST — Check node and pod state across AZs:
+- Use `list_k8s_resources` with clusterName, kind=Node, apiVersion=v1 to list all nodes — check Ready/NotReady status and AZ labels (topology.kubernetes.io/zone) to identify which AZ has NotReady nodes
+- Use `read_k8s_resource` with clusterName, kind=Node, apiVersion=v1, name=<node-name> for each NotReady node to get detailed conditions and last heartbeat times
+- Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1 to list all pods across all namespaces — check for pods in Unknown, Terminating, or Pending state on nodes in the affected AZ
+- Use `get_k8s_events` with clusterName, kind=Node, name=<node-name> to check for NodeNotReady, NodeStatusUnknown, or Rebooted events on affected nodes
+
 MUST:
 - Check node AZ distribution: `kubectl get nodes -L topology.kubernetes.io/zone`
 - Identify NotReady nodes: `kubectl get nodes`

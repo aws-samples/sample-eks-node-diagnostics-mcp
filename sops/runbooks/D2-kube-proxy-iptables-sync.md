@@ -15,6 +15,10 @@ context: "kube-proxy maintains iptables or IPVS rules that map Service ClusterIP
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify the node is Ready
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods with connectivity issues
+  - Check kube-proxy pods: `kubectl get pods -n kube-system -l k8s-app=kube-proxy` (via EKS MCP `list_k8s_resources`) — if kube-proxy is not Running or CrashLoopBackOff, iptables rules won't sync
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for kube-proxy errors

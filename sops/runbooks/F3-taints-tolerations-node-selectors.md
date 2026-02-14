@@ -15,6 +15,12 @@ context: "Pods remain Pending when taints, tolerations, nodeSelectors, or affini
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Check pod status — pods in Pending state with taint/toleration or nodeSelector mismatch confirms this SOP
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for "didn't match Pod's node affinity/selector" or taint-related scheduling failures
+  - Check node taints and labels: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at Taints and Labels sections
+  - Check all nodes: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — verify which nodes are available
 - Use `collect` tool with instanceId of a node where pods are expected to schedule to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings including taint/scheduling issues

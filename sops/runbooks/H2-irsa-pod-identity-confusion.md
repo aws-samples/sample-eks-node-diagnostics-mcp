@@ -15,6 +15,12 @@ context: "Pods use IRSA (IAM Roles for Service Accounts) or EKS Pod Identity to 
 
 ## Phase 1 — Triage
 
+FIRST — Check pod state before collecting logs:
+- Use `list_k8s_resources` with clusterName, kind=Pod, apiVersion=v1, namespace=<namespace> to list pods in the affected namespace — check for pods in CrashLoopBackOff or Error state due to credential failures
+- Use `read_k8s_resource` with clusterName, kind=Pod, apiVersion=v1, namespace=<namespace>, name=<pod-name> to get detailed pod spec — check serviceAccountName, projected volume mounts for token, and container status/restart count
+- Use `read_k8s_resource` with clusterName, kind=ServiceAccount, apiVersion=v1, namespace=<namespace>, name=<sa-name> to check ServiceAccount annotations for eks.amazonaws.com/role-arn
+- Use `get_k8s_events` with clusterName, kind=Pod, namespace=<namespace>, name=<pod-name> to check for credential-related warning events
+
 MUST:
 - Use `collect` tool with instanceId of the node running the affected pod to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes

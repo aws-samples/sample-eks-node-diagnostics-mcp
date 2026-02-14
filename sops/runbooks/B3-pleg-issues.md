@@ -15,6 +15,10 @@ context: "PLEG monitors pod lifecycle events by periodically relisting all conta
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — PLEG issues cause NotReady state
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for pods stuck in Unknown, Terminating, or ContainerCreating state (PLEG failures prevent pod lifecycle updates)
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for PLEG-related warnings
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for PLEG health check failures

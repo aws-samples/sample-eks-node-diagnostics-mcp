@@ -16,6 +16,10 @@ context: "When node disk usage exceeds kubelet eviction thresholds, the eviction
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — look for DiskPressure condition
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — check Conditions for DiskPressure=True and recent events for eviction activity
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for Evicted pods or pods in Terminating state
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=high to get pre-indexed disk pressure findings

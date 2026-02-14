@@ -17,6 +17,11 @@ context: "OOM kills occur at two levels: container-level (cgroup limit exceeded)
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node and pod state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — look for MemoryPressure condition
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — check Conditions for MemoryPressure=True
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check for OOMKilled pods (look at RESTARTS count and last state), CrashLoopBackOff, or Evicted pods
+  - Check pod details for OOMKilled: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) — look for "OOMKilled" in last termination reason
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId and severity=critical to get pre-indexed OOM findings

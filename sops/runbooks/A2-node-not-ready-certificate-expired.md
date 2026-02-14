@@ -15,6 +15,10 @@ context: "Kubelet uses client certificates to authenticate with the API server. 
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check node state before any log collection:
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — confirm the node is NotReady
+  - Check node details: `kubectl describe node <node>` (via EKS MCP `read_k8s_resource`) — look at Conditions and check for certificate-related events
+  - List pods on the affected node: `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` (via EKS MCP `list_k8s_resources` with field_selector) — check if pods are being evicted or stuck
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for x509 or certificate errors

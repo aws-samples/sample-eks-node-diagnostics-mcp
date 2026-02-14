@@ -15,6 +15,12 @@ context: "Kubernetes supports N-2 minor version skew between control plane and n
 
 ## Phase 1 — Triage
 
+FIRST — Check node state and version info before collecting logs:
+- Use `list_k8s_resources` with clusterName, kind=Node, apiVersion=v1 to list all nodes — check kubelet version in node status and identify nodes with different versions
+- Use `read_k8s_resource` with clusterName, kind=Node, apiVersion=v1, name=<node-name> to get detailed node info — check status.nodeInfo.kubeletVersion, status.nodeInfo.kubeProxyVersion, and node conditions (Ready/NotReady)
+- Use `get_k8s_events` with clusterName, kind=Node, name=<node-name> to check for version-related registration failures or API incompatibility events
+- Use `describe_eks_resource` with resourceType=cluster, clusterName to get the control plane Kubernetes version for skew comparison
+
 MUST:
 - Use `collect` tool with instanceId of the affected node to gather node-level logs
 - Use `status` tool with executionId to poll until collection completes

@@ -31,6 +31,12 @@ context: >
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Verify source and destination pods are Running and Ready — if pods are Pending, CrashLoopBackOff, or Terminating, that is the root cause, not a network issue
+  - Check which nodes the pods are on — same node vs different nodes changes the investigation path entirely
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — if a node is NotReady, network will fail for all pods on it
+  - Check pod events: `kubectl describe pod <pod>` (via EKS MCP `get_k8s_events`) for scheduling failures, OOM kills, or image pull errors
 - Use `collect` tool with instanceId of the SOURCE node (where the calling pod runs) to gather logs
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for network/CNI errors

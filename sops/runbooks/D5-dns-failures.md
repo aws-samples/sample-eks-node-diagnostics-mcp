@@ -16,6 +16,11 @@ context: "Pod DNS failures can stem from CoreDNS overload, VPC DNS throttling (1
 ## Phase 1 — Triage
 
 MUST:
+- **FIRST**: Check pod and node state before any log collection:
+  - List pods in the affected namespace: `kubectl get pods -n <namespace> -o wide` (via EKS MCP `list_k8s_resources`)
+  - Verify the affected pod is Running and Ready — DNS failures in a non-running pod are a symptom, not the cause
+  - Check CoreDNS pods: `kubectl get pods -n kube-system -l k8s-app=kube-dns` (via EKS MCP `list_k8s_resources`) — if CoreDNS pods are not Running, that is the root cause
+  - Check node conditions: `kubectl get nodes` (via EKS MCP `list_k8s_resources` kind=Node) — NotReady nodes cannot reach CoreDNS
 - Use `collect` tool with instanceId to gather logs from the affected node
 - Use `status` tool with executionId to poll until collection completes
 - Use `errors` tool with instanceId to get pre-indexed findings — look for DNS errors
