@@ -28,211 +28,6 @@ The result: an agent can go from "node is NotReady" to a grounded incident repor
 
 ---
 
-## MCP Tools
-
-Tool names are kept short to stay under the 64-character limit when prefixed with the MCP server name (e.g., `byo-devopsagent-mcp-v2_collect`).
-
-### Tier 1: Core Operations
-
-| Tool | Description |
-|------|-------------|
-| `collect` | Start log collection with idempotency and cross-region support |
-| `status` | Get detailed status with progress tracking and failure parsing |
-| `validate` | Verify all expected files were extracted (uses manifest.json) |
-| `errors` | Get pre-indexed findings by severity with finding IDs, pagination, and baseline subtraction |
-| `read` | Line-aligned byte-range streaming for multi-GB files (NO TRUNCATION) |
-
-### Tier 2: Advanced Analysis
-
-| Tool | Description |
-|------|-------------|
-| `search` | Full-text regex search across all logs with finding IDs (S-NNN format) |
-| `correlate` | Cross-file timeline correlation with temporal clusters, root cause chains, confidence, and gap reporting |
-| `artifact` | Secure presigned URLs for large artifacts |
-| `summarize` | Finding-grounded incident summary (requires finding_ids from errors tool) |
-| `history` | Audit trail of past collections (supports cross-region) |
-
-### Tier 3: Cluster-Level Intelligence
-
-| Tool | Description |
-|------|-------------|
-| `cluster_health` | Cluster-wide health overview: node enumeration, SSM status, instance metadata |
-| `compare_nodes` | Diff error findings between 2+ nodes to isolate unique vs common issues |
-| `batch_collect` | Smart batch collection with statistical sampling for 1000+ node clusters |
-| `batch_status` | Poll status of multiple collections at once |
-| `network_diagnostics` | Structured networking analysis: iptables, CNI, routes, DNS, ENI, IPAMD |
-
-### Tier 4: Live Packet Capture
-
-| Tool | Description |
-|------|-------------|
-| `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Supports capturing inside a pod/container network namespace — provide `podName` + `podNamespace` (auto-resolves PID via crictl/docker) or raw `containerPid`. Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
-| `tcpdump_analyze` | Read decoded packet text, protocol stats (TCP/UDP/ICMP), top talkers, and anomaly detection (high RST, retransmissions, SYN floods) from a completed capture |
-
-### Tier 5: SOP Management
-
-| Tool | Description |
-|------|-------------|
-| `list_sops` | List all available runbooks with title, description, severity, and trigger patterns. Use to find the right SOP for a given symptom |
-| `get_sop` | Retrieve the full SOP procedure by name (e.g., `D9-pod-to-pod-connectivity`). Returns the complete 3-phase investigation flow |
-
----
-
-## Agent Workflow
-
-Recommended workflow for incident response:
-
-```
-1. collect(instanceId, region?)        → returns executionId + task envelope
-   ↓
-2. status(executionId)                 → poll until task.state = completed
-   ↓
-3. validate(executionId)               → file manifest with sizes
-   ↓
-4. errors(instanceId, clusterContext?) → pre-indexed findings with finding_ids (paginated)
-   ↓
-5. search(instanceId, query)           → deep investigation with regex
-   ↓
-6. correlate(instanceId)               → timeline + root cause chain + confidence
-   ↓
-7. read(logKey, startByte, endByte)    → specific file context (line-aligned)
-   ↓
-8. summarize(instanceId, finding_ids)  → grounded incident report
-```
-
-### Cluster-Level Workflow
-
-```
-1. cluster_health(clusterName)         → node inventory + unhealthy nodes
-   ↓
-2. batch_collect(clusterName, dryRun)  → preview sampling plan
-   ↓
-3. batch_collect(clusterName)          → collect from sampled nodes
-   ↓
-4. batch_status(batchId)               → poll until allComplete
-   ↓
-5. compare_nodes(instanceIds)          → diff findings across nodes
-   ↓
-6. network_diagnostics(instanceId)     → structured networking analysis
-```
-
-### Live Packet Capture Workflow
-
-```
-1. tcpdump_capture(instanceId, durationSeconds?, filter?, podName?, podNamespace?)
-   → returns commandId + task envelope (async)
-   ↓
-2. tcpdump_capture(commandId, instanceId)
-   → poll until status = completed
-   ↓
-3. tcpdump_analyze(instanceId, commandId)
-   → decoded packets, protocol stats, top talkers, anomalies
-```
-
-### SOP-Guided Investigation
-
-The agent can discover and follow structured runbooks for 36 known failure categories:
-
-```
-1. list_sops()                         → browse all 36 runbooks by category
-   ↓
-2. get_sop(sopName="D9-pod-to-pod-connectivity")
-   → full 3-phase procedure with MCP tool calls
-   ↓
-3. Follow Phase 1 → Phase 2 → Phase 3 from the SOP
-```
-
-Every SOP follows a consistent 3-phase structure:
-- **Phase 1 — Triage**: FIRST check pod/node state via EKS MCP tools, then collect logs and get pre-indexed findings
-- **Phase 2 — Enrich**: Deep investigation with search, correlate, and domain-specific diagnostics
-- **Phase 3 — Report**: Grounded incident summary with root cause, evidence, and remediation
-
----
-
-## Runbook Library (36 SOPs)
-
-All SOPs are stored in `sops/runbooks/` and automatically deployed to S3 via CDK BucketDeployment. The agent retrieves them at runtime using `list_sops` and `get_sop`.
-
-| Category | SOPs | Coverage |
-|----------|------|----------|
-| **A — Node Lifecycle** | A1 (OOM/NotReady), A2 (Certificate Expired), A2 (Bootstrap Failure), A3 (Clock Skew), A4 (Join Failure) | Node registration, readiness, certificates |
-| **B — Kubelet** | B1 (Config Errors), B2 (Eviction Manager), B3 (PLEG) | Kubelet crashes, eviction, container lifecycle |
-| **C — Container Runtime** | C1 (Image Pull), C2 (Sandbox Creation), C3 (OverlayFS/Inode) | containerd, image pulls, filesystem |
-| **D — Networking** | D1 (VPC CNI/IP), D2 (kube-proxy/iptables), D3 (Conntrack), D4 (MTU), D5 (DNS), D6 (ENA Throttling), D7 (Network Perf), D8 (Service Connectivity), D9 (Pod-to-Pod) | Full networking stack coverage |
-| **E — Storage** | E1 (EBS CSI), E2 (EFS Mount) | Persistent volume attach/mount |
-| **F — Scheduling** | F1 (CPU/Memory), F2 (Max Pods), F3 (Taints/Tolerations) | Pod scheduling failures |
-| **G — Resource Pressure** | G1 (Disk Pressure), G2 (OOMKill), G3 (PID Pressure) | Node resource exhaustion |
-| **H — IAM/Security** | H1 (Node Role), H2 (IRSA/Pod Identity), H3 (IMDS) | Permissions, credentials, metadata |
-| **I — Upgrades** | I1 (Version Skew) | Control plane / node version mismatch |
-| **J — Infrastructure** | J1 (ENA/Instance Limits), J2 (EBS Transient Attach), J3 (AZ Outage) | EC2, EBS, AZ-level failures |
-| **Z — Catch-All** | Z1 (General Troubleshooting) | Systematic investigation for unknown issues |
-
-### SOP Design Principles
-
-- **FIRST check pod/node state**: Every SOP starts by checking pod and node status via EKS MCP tools (`list_k8s_resources`, `read_k8s_resource`, `get_k8s_events`) before collecting any node-level logs
-- **MCP tools only**: SOPs reference only the 19 tools exposed by this MCP server — no kubectl, no AWS CLI, no SSH
-- **3-phase structure**: Triage → Enrich → Report with MUST/SHOULD/MAY priority levels
-- **Guardrails**: Escalation conditions and safety ratings (GREEN/YELLOW/RED) for every action
-- **Grounded evidence**: All conclusions cite specific finding IDs from the `errors` and `search` tools
-
----
-
-## Time-Bounded Log Analysis
-
-All analysis tools enforce time-bounded log filtering to prevent historical errors from polluting active incident investigation.
-
-### How It Works
-
-Every tool that reads or analyzes logs (`errors`, `search`, `correlate`, `summarize`, `quick_triage`) accepts optional time window parameters:
-
-| Parameter | Description |
-|-----------|-------------|
-| `incident_time` | ISO8601 timestamp of the incident. Analysis window = incident_time ± 5 minutes |
-| `start_time` + `end_time` | Explicit UTC window (ISO8601). Used exactly as provided |
-| *(none)* | Defaults to last 10 minutes from current UTC time |
-
-### Resolution Rules
-
-1. If `start_time` AND `end_time` provided → use exactly
-2. If `incident_time` provided → window = [incident_time - 5min, incident_time + 5min]
-3. If nothing provided → window = [now_utc - 10min, now_utc]
-4. Maximum window size: 24 hours (safety cap)
-
-### Response Metadata
-
-Every response includes:
-- `window_start_utc` / `window_end_utc` — the exact UTC window used
-- `resolution_reason` — how the window was determined (e.g., "explicit incident window provided", "no incident time; default last 10 minutes")
-- `time_window_filter` — counts of findings excluded outside the window and unparseable timestamps
-
-### Example Tool Calls
-
-With incident time (± 5 min padding):
-```json
-{
-  "instanceId": "i-0abc123",
-  "incident_time": "2026-02-13T09:10:00Z"
-}
-```
-
-With explicit window:
-```json
-{
-  "instanceId": "i-0abc123",
-  "start_time": "2026-02-13T09:00:00Z",
-  "end_time": "2026-02-13T09:30:00Z"
-}
-```
-
-Without time (defaults to last 10 minutes):
-```json
-{
-  "instanceId": "i-0abc123"
-}
-```
-
----
-
 ## Prerequisites
 
 ### 1. Node.js (v18.x or later)
@@ -484,6 +279,213 @@ For every EKS cluster you want to collect logs from:
 The `AWSSupport-CollectEKSInstanceLogs` SSM document may not be available in all AWS regions. If you get a "document not found" error, the target region doesn't support this automation.
 
 Commonly supported regions: us-east-1, us-east-2, us-west-2, eu-west-1, eu-central-1, ap-southeast-1, ap-northeast-1, ap-south-1.
+
+---
+
+# How It Works
+
+## MCP Tools
+
+Tool names are kept short to stay under the 64-character limit when prefixed with the MCP server name (e.g., `byo-devopsagent-mcp-v2_collect`).
+
+### Tier 1: Core Operations
+
+| Tool | Description |
+|------|-------------|
+| `collect` | Start log collection with idempotency and cross-region support |
+| `status` | Get detailed status with progress tracking and failure parsing |
+| `validate` | Verify all expected files were extracted (uses manifest.json) |
+| `errors` | Get pre-indexed findings by severity with finding IDs, pagination, and baseline subtraction |
+| `read` | Line-aligned byte-range streaming for multi-GB files (NO TRUNCATION) |
+
+### Tier 2: Advanced Analysis
+
+| Tool | Description |
+|------|-------------|
+| `search` | Full-text regex search across all logs with finding IDs (S-NNN format) |
+| `correlate` | Cross-file timeline correlation with temporal clusters, root cause chains, confidence, and gap reporting |
+| `artifact` | Secure presigned URLs for large artifacts |
+| `summarize` | Finding-grounded incident summary (requires finding_ids from errors tool) |
+| `history` | Audit trail of past collections (supports cross-region) |
+
+### Tier 3: Cluster-Level Intelligence
+
+| Tool | Description |
+|------|-------------|
+| `cluster_health` | Cluster-wide health overview: node enumeration, SSM status, instance metadata |
+| `compare_nodes` | Diff error findings between 2+ nodes to isolate unique vs common issues |
+| `batch_collect` | Smart batch collection with statistical sampling for 1000+ node clusters |
+| `batch_status` | Poll status of multiple collections at once |
+| `network_diagnostics` | Structured networking analysis: iptables, CNI, routes, DNS, ENI, IPAMD |
+
+### Tier 4: Live Packet Capture
+
+| Tool | Description |
+|------|-------------|
+| `tcpdump_capture` | Run tcpdump on a node via SSM Run Command (default 2 min). Supports capturing inside a pod/container network namespace — provide `podName` + `podNamespace` (auto-resolves PID via crictl/docker) or raw `containerPid`. Returns commandId for async polling. Uploads pcap + decoded summary + stats to S3 |
+| `tcpdump_analyze` | Read decoded packet text, protocol stats (TCP/UDP/ICMP), top talkers, and anomaly detection (high RST, retransmissions, SYN floods) from a completed capture |
+
+### Tier 5: SOP Management
+
+| Tool | Description |
+|------|-------------|
+| `list_sops` | List all available runbooks with title, description, severity, and trigger patterns. Use to find the right SOP for a given symptom |
+| `get_sop` | Retrieve the full SOP procedure by name (e.g., `D9-pod-to-pod-connectivity`). Returns the complete 3-phase investigation flow |
+
+---
+
+## Agent Workflow
+
+Recommended workflow for incident response:
+
+```
+1. collect(instanceId, region?)        → returns executionId + task envelope
+   ↓
+2. status(executionId)                 → poll until task.state = completed
+   ↓
+3. validate(executionId)               → file manifest with sizes
+   ↓
+4. errors(instanceId, clusterContext?) → pre-indexed findings with finding_ids (paginated)
+   ↓
+5. search(instanceId, query)           → deep investigation with regex
+   ↓
+6. correlate(instanceId)               → timeline + root cause chain + confidence
+   ↓
+7. read(logKey, startByte, endByte)    → specific file context (line-aligned)
+   ↓
+8. summarize(instanceId, finding_ids)  → grounded incident report
+```
+
+### Cluster-Level Workflow
+
+```
+1. cluster_health(clusterName)         → node inventory + unhealthy nodes
+   ↓
+2. batch_collect(clusterName, dryRun)  → preview sampling plan
+   ↓
+3. batch_collect(clusterName)          → collect from sampled nodes
+   ↓
+4. batch_status(batchId)               → poll until allComplete
+   ↓
+5. compare_nodes(instanceIds)          → diff findings across nodes
+   ↓
+6. network_diagnostics(instanceId)     → structured networking analysis
+```
+
+### Live Packet Capture Workflow
+
+```
+1. tcpdump_capture(instanceId, durationSeconds?, filter?, podName?, podNamespace?)
+   → returns commandId + task envelope (async)
+   ↓
+2. tcpdump_capture(commandId, instanceId)
+   → poll until status = completed
+   ↓
+3. tcpdump_analyze(instanceId, commandId)
+   → decoded packets, protocol stats, top talkers, anomalies
+```
+
+### SOP-Guided Investigation
+
+The agent can discover and follow structured runbooks for 36 known failure categories:
+
+```
+1. list_sops()                         → browse all 36 runbooks by category
+   ↓
+2. get_sop(sopName="D9-pod-to-pod-connectivity")
+   → full 3-phase procedure with MCP tool calls
+   ↓
+3. Follow Phase 1 → Phase 2 → Phase 3 from the SOP
+```
+
+Every SOP follows a consistent 3-phase structure:
+- **Phase 1 — Triage**: FIRST check pod/node state via EKS MCP tools, then collect logs and get pre-indexed findings
+- **Phase 2 — Enrich**: Deep investigation with search, correlate, and domain-specific diagnostics
+- **Phase 3 — Report**: Grounded incident summary with root cause, evidence, and remediation
+
+---
+
+## Runbook Library (36 SOPs)
+
+All SOPs are stored in `sops/runbooks/` and automatically deployed to S3 via CDK BucketDeployment. The agent retrieves them at runtime using `list_sops` and `get_sop`.
+
+| Category | SOPs | Coverage |
+|----------|------|----------|
+| **A — Node Lifecycle** | A1 (OOM/NotReady), A2 (Certificate Expired), A2 (Bootstrap Failure), A3 (Clock Skew), A4 (Join Failure) | Node registration, readiness, certificates |
+| **B — Kubelet** | B1 (Config Errors), B2 (Eviction Manager), B3 (PLEG) | Kubelet crashes, eviction, container lifecycle |
+| **C — Container Runtime** | C1 (Image Pull), C2 (Sandbox Creation), C3 (OverlayFS/Inode) | containerd, image pulls, filesystem |
+| **D — Networking** | D1 (VPC CNI/IP), D2 (kube-proxy/iptables), D3 (Conntrack), D4 (MTU), D5 (DNS), D6 (ENA Throttling), D7 (Network Perf), D8 (Service Connectivity), D9 (Pod-to-Pod) | Full networking stack coverage |
+| **E — Storage** | E1 (EBS CSI), E2 (EFS Mount) | Persistent volume attach/mount |
+| **F — Scheduling** | F1 (CPU/Memory), F2 (Max Pods), F3 (Taints/Tolerations) | Pod scheduling failures |
+| **G — Resource Pressure** | G1 (Disk Pressure), G2 (OOMKill), G3 (PID Pressure) | Node resource exhaustion |
+| **H — IAM/Security** | H1 (Node Role), H2 (IRSA/Pod Identity), H3 (IMDS) | Permissions, credentials, metadata |
+| **I — Upgrades** | I1 (Version Skew) | Control plane / node version mismatch |
+| **J — Infrastructure** | J1 (ENA/Instance Limits), J2 (EBS Transient Attach), J3 (AZ Outage) | EC2, EBS, AZ-level failures |
+| **Z — Catch-All** | Z1 (General Troubleshooting) | Systematic investigation for unknown issues |
+
+### SOP Design Principles
+
+- **FIRST check pod/node state**: Every SOP starts by checking pod and node status via EKS MCP tools (`list_k8s_resources`, `read_k8s_resource`, `get_k8s_events`) before collecting any node-level logs
+- **MCP tools only**: SOPs reference only the 19 tools exposed by this MCP server — no kubectl, no AWS CLI, no SSH
+- **3-phase structure**: Triage → Enrich → Report with MUST/SHOULD/MAY priority levels
+- **Guardrails**: Escalation conditions and safety ratings (GREEN/YELLOW/RED) for every action
+- **Grounded evidence**: All conclusions cite specific finding IDs from the `errors` and `search` tools
+
+---
+
+## Time-Bounded Log Analysis
+
+All analysis tools enforce time-bounded log filtering to prevent historical errors from polluting active incident investigation.
+
+### How It Works
+
+Every tool that reads or analyzes logs (`errors`, `search`, `correlate`, `summarize`, `quick_triage`) accepts optional time window parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `incident_time` | ISO8601 timestamp of the incident. Analysis window = incident_time ± 5 minutes |
+| `start_time` + `end_time` | Explicit UTC window (ISO8601). Used exactly as provided |
+| *(none)* | Defaults to last 10 minutes from current UTC time |
+
+### Resolution Rules
+
+1. If `start_time` AND `end_time` provided → use exactly
+2. If `incident_time` provided → window = [incident_time - 5min, incident_time + 5min]
+3. If nothing provided → window = [now_utc - 10min, now_utc]
+4. Maximum window size: 24 hours (safety cap)
+
+### Response Metadata
+
+Every response includes:
+- `window_start_utc` / `window_end_utc` — the exact UTC window used
+- `resolution_reason` — how the window was determined (e.g., "explicit incident window provided", "no incident time; default last 10 minutes")
+- `time_window_filter` — counts of findings excluded outside the window and unparseable timestamps
+
+### Example Tool Calls
+
+With incident time (± 5 min padding):
+```json
+{
+  "instanceId": "i-0abc123",
+  "incident_time": "2026-02-13T09:10:00Z"
+}
+```
+
+With explicit window:
+```json
+{
+  "instanceId": "i-0abc123",
+  "start_time": "2026-02-13T09:00:00Z",
+  "end_time": "2026-02-13T09:30:00Z"
+}
+```
+
+Without time (defaults to last 10 minutes):
+```json
+{
+  "instanceId": "i-0abc123"
+}
+```
 
 ---
 
