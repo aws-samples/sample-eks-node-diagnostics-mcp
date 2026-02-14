@@ -7553,57 +7553,88 @@ TXT_SIZE=$(stat -c%s "$TXT_FILE" 2>/dev/null || stat -f%z "$TXT_FILE" 2>/dev/nul
 PACKET_COUNT=$(wc -l < "$TXT_FILE" 2>/dev/null || echo "0")
 echo "Decoded $PACKET_COUNT packets to text"
 
-# Generate stats JSON with protocol breakdown and top talkers
+# Generate stats JSON with protocol breakdown and top talkers (using Python for valid JSON)
 echo "Generating capture statistics..."
-cat > /tmp/gen_stats_{timestamp}.sh << 'STATSEOF'
-#!/bin/bash
-PCAP="$1"
-OUT="$2"
-TOTAL=$(tcpdump -nn -r "$PCAP" 2>/dev/null | wc -l)
-TCP_COUNT=$(tcpdump -nn -r "$PCAP" tcp 2>/dev/null | wc -l)
-UDP_COUNT=$(tcpdump -nn -r "$PCAP" udp 2>/dev/null | wc -l)
-ICMP_COUNT=$(tcpdump -nn -r "$PCAP" icmp 2>/dev/null | wc -l)
-ARP_COUNT=$(tcpdump -nn -r "$PCAP" arp 2>/dev/null | wc -l)
-DNS_COUNT=$(tcpdump -nn -r "$PCAP" 'port 53' 2>/dev/null | wc -l)
-HTTPS_COUNT=$(tcpdump -nn -r "$PCAP" 'port 443' 2>/dev/null | wc -l)
-HTTP_COUNT=$(tcpdump -nn -r "$PCAP" 'port 80' 2>/dev/null | wc -l)
-SYN_COUNT=$(tcpdump -nn -r "$PCAP" 'tcp[tcpflags] & (tcp-syn) != 0' 2>/dev/null | wc -l)
-RST_COUNT=$(tcpdump -nn -r "$PCAP" 'tcp[tcpflags] & (tcp-rst) != 0' 2>/dev/null | wc -l)
-RETRANS=$(tcpdump -nn -r "$PCAP" 2>/dev/null | grep -ci 'retransmit\|retrans' || echo "0")
-# Top source IPs
-TOP_SRC=$(tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{{print $3}}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -10 | awk '{{printf "    \\"%s\\": %s,\\n", $2, $1}}' | sed '$ s/,$//')
-# Top destination IPs
-TOP_DST=$(tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{{print $5}}' | sed 's/:$//' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | head -10 | awk '{{printf "    \\"%s\\": %s,\\n", $2, $1}}' | sed '$ s/,$//')
-cat > "$OUT" << JSONEOF
-{{
-  "totalPackets": $TOTAL,
-  "protocols": {{
-    "tcp": $TCP_COUNT,
-    "udp": $UDP_COUNT,
-    "icmp": $ICMP_COUNT,
-    "arp": $ARP_COUNT
-  }},
-  "ports": {{
-    "dns_53": $DNS_COUNT,
-    "http_80": $HTTP_COUNT,
-    "https_443": $HTTPS_COUNT
-  }},
-  "tcpFlags": {{
-    "syn": $SYN_COUNT,
-    "rst": $RST_COUNT
-  }},
-  "possibleRetransmits": $RETRANS,
-  "topSourceIPs": {{
-$TOP_SRC
-  }},
-  "topDestinationIPs": {{
-$TOP_DST
-  }}
+if command -v python3 &>/dev/null; then
+    python3 - "$PCAP_FILE" "$STATS_FILE" << 'PYSTATS'
+import subprocess, json, sys, re
+from collections import Counter
+
+pcap, out = sys.argv[1], sys.argv[2]
+
+def tcpdump_count(extra_args=None):
+    cmd = ['tcpdump', '-nn', '-r', pcap] + (extra_args or [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return len([l for l in r.stdout.strip().split('\n') if l])
+    except Exception:
+        return 0
+
+def tcpdump_lines():
+    try:
+        r = subprocess.run(['tcpdump', '-nn', '-r', pcap], capture_output=True, text=True, timeout=60)
+        return [l for l in r.stdout.strip().split('\n') if l]
+    except Exception:
+        return []
+
+lines = tcpdump_lines()
+total = len(lines)
+
+# Extract IPs from tcpdump output: field 3 = src (IP.port), field 5 = dst (IP.port:)
+ip_port_re = re.compile(r'^(\d+\.\d+\.\d+\.\d+)\.\d+$')
+src_counter, dst_counter = Counter(), Counter()
+for line in lines:
+    parts = line.split()
+    if len(parts) >= 5:
+        # Source: field index 2 (0-based), format "IP.port"
+        m = ip_port_re.match(parts[2])
+        if m:
+            src_counter[m.group(1)] += 1
+        # Destination: field index 4, format "IP.port:" (trailing colon)
+        dst_raw = parts[4].rstrip(':')
+        m = ip_port_re.match(dst_raw)
+        if m:
+            dst_counter[m.group(1)] += 1
+
+retrans = sum(1 for l in lines if 'retransmit' in l.lower() or 'retrans' in l.lower())
+
+stats = {{
+    "totalPackets": total,
+    "protocols": {{
+        "tcp": tcpdump_count(['tcp']),
+        "udp": tcpdump_count(['udp']),
+        "icmp": tcpdump_count(['icmp']),
+        "arp": tcpdump_count(['arp']),
+    }},
+    "ports": {{
+        "dns_53": tcpdump_count(['port', '53']),
+        "http_80": tcpdump_count(['port', '80']),
+        "https_443": tcpdump_count(['port', '443']),
+    }},
+    "tcpFlags": {{
+        "syn": tcpdump_count(['tcp[tcpflags] & (tcp-syn) != 0']),
+        "rst": tcpdump_count(['tcp[tcpflags] & (tcp-rst) != 0']),
+    }},
+    "possibleRetransmits": retrans,
+    "topSourceIPs": dict(src_counter.most_common(10)),
+    "topDestinationIPs": dict(dst_counter.most_common(10)),
 }}
-JSONEOF
-STATSEOF
-chmod +x /tmp/gen_stats_{timestamp}.sh
-/tmp/gen_stats_{timestamp}.sh "$PCAP_FILE" "$STATS_FILE" 2>/dev/null || echo '{{"error":"stats generation failed"}}' > "$STATS_FILE"
+
+with open(out, 'w') as f:
+    json.dump(stats, f, indent=2)
+print(f"Stats generated: {{total}} packets")
+PYSTATS
+else
+    # Fallback: minimal stats without top talkers if python3 not available
+    TOTAL=$(tcpdump -nn -r "$PCAP_FILE" 2>/dev/null | wc -l)
+    TCP_COUNT=$(tcpdump -nn -r "$PCAP_FILE" tcp 2>/dev/null | wc -l)
+    UDP_COUNT=$(tcpdump -nn -r "$PCAP_FILE" udp 2>/dev/null | wc -l)
+    ICMP_COUNT=$(tcpdump -nn -r "$PCAP_FILE" icmp 2>/dev/null | wc -l)
+    echo '{{"totalPackets":'$TOTAL',"protocols":{{"tcp":'$TCP_COUNT',"udp":'$UDP_COUNT',"icmp":'$ICMP_COUNT'}},"topSourceIPs":{{}},"topDestinationIPs":{{}}}}' > "$STATS_FILE"
+fi
+if [ ! -f "$STATS_FILE" ] || [ ! -s "$STATS_FILE" ]; then
+    echo '{{"error":"stats generation failed"}}' > "$STATS_FILE"
+fi
 
 # Upload all artifacts to S3 (non-fatal — node may lack S3 permissions)
 # IMPORTANT: disable set -e for uploads — these are best-effort and must not kill the script
@@ -7666,7 +7697,7 @@ echo ""
 echo "===INLINE_TXT_END==="
 
 # Cleanup
-rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" /tmp/gen_stats_{timestamp}.sh 2>/dev/null || true
+rm -f "$PCAP_FILE" "$TXT_FILE" "$STATS_FILE" 2>/dev/null || true
 echo "DONE"
 exit 0
 """
@@ -7952,10 +7983,432 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
         return error_response(500, f'Failed to poll tcpdump status: {str(e)}')
 
 
+def _analyze_dns_packets(lines: list) -> Dict:
+    """Analyze DNS queries in decoded tcpdump lines.
+    Detects ndots search-domain expansion (normal), NXDomain storms, and real failures."""
+    dns_re = re.compile(
+        r'>\s+\S+\.53:\s+\d+\+?\s+(A|AAAA|CNAME|MX|SRV|PTR|TXT|SOA|NS)\?\s+(\S+)',
+        re.IGNORECASE,
+    )
+    nxdomain_re = re.compile(r'NXDomain', re.IGNORECASE)
+    k8s_svc_suffix = re.compile(
+        r'\.svc\.cluster\.local\..*\.svc\.cluster\.local',
+        re.IGNORECASE,
+    )
+
+    queries = []
+    nxdomain_count = 0
+    ndots_expansion_queries = []
+    total_dns = 0
+
+    for line in lines:
+        m = dns_re.search(line)
+        if m:
+            total_dns += 1
+            qtype = m.group(1).upper()
+            qname = m.group(2).rstrip('.')
+            queries.append({'type': qtype, 'name': qname})
+            if k8s_svc_suffix.search(qname):
+                ndots_expansion_queries.append(qname)
+        if nxdomain_re.search(line):
+            nxdomain_count += 1
+
+    if total_dns == 0:
+        return {}
+
+    result: Dict = {
+        'totalDnsQueries': total_dns,
+        'nxdomainResponses': nxdomain_count,
+        'anomalies': [],
+    }
+
+    if ndots_expansion_queries:
+        unique = list(set(ndots_expansion_queries))[:10]
+        result['ndotsSearchDomainExpansion'] = {
+            'count': len(ndots_expansion_queries),
+            'isNormalBehavior': True,
+            'explanation': (
+                'Queries with doubled Kubernetes suffixes (e.g., '
+                'name.ns.svc.cluster.local.ns.svc.cluster.local) are NORMAL. '
+                'With the default ndots:5, the glibc resolver appends each '
+                '/etc/resolv.conf search domain to names with fewer than 5 dots '
+                'before trying the name as-is. These NXDomain responses are '
+                'expected and harmless. To reduce them: use a trailing dot on '
+                'FQDNs, lower ndots to 2, or use short service names.'
+            ),
+            'exampleQueries': unique,
+        }
+        result['anomalies'].append({
+            'type': 'ndots_search_expansion',
+            'severity': 'info',
+            'message': (
+                f'{len(ndots_expansion_queries)} DNS queries show ndots:5 search-domain '
+                f'expansion (doubled .svc.cluster.local suffixes). This is NORMAL '
+                f'Kubernetes DNS behavior, not a misconfiguration. The queries get '
+                f'NXDomain but the correct resolution succeeds afterward.'
+            ),
+        })
+    elif nxdomain_count > total_dns * 0.5 and total_dns > 10:
+        result['anomalies'].append({
+            'type': 'high_nxdomain_rate',
+            'severity': 'warning',
+            'message': (
+                f'{nxdomain_count} NXDomain responses out of {total_dns} DNS queries '
+                f'({(nxdomain_count/total_dns)*100:.0f}%) — possible DNS misconfiguration '
+                f'or queries for non-existent services.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_tcp_rst_patterns(lines: list) -> Dict:
+    """Detect TCP RST patterns that are normal in Kubernetes.
+    Health probes (liveness/readiness) open a TCP connection and immediately close it,
+    producing RST packets. kube-proxy DNAT race during pod termination also causes RSTs.
+    These are expected and should not be flagged as connection failures.
+    Ref: https://docs.aws.amazon.com/prescriptive-guidance/latest/ha-resiliency-amazon-eks-apps/probes-checks.html"""
+    rst_re = re.compile(r'Flags\s+\[R\.?\]|Flags\s+\[R\]', re.IGNORECASE)
+    syn_re = re.compile(r'Flags\s+\[S\]', re.IGNORECASE)
+    fin_re = re.compile(r'Flags\s+\[F\.?\]', re.IGNORECASE)
+    # Health probe pattern: SYN then RST within a few packets to same port, short-lived
+    # Detect port 10250 (kubelet), 10256 (kube-proxy health), 15021 (istio), common probe ports
+    probe_port_re = re.compile(r'\.\s*(10250|10256|10257|10259|15021|8080|8443|80|443)\s*[>:]')
+
+    total_rst = 0
+    probe_rst = 0
+    short_lived_rst = 0
+    rst_lines_sample = []
+
+    # Track connections: (src, dst, port) -> packet count
+    connections: Dict[str, int] = {}
+
+    for line in lines:
+        if rst_re.search(line):
+            total_rst += 1
+            if probe_port_re.search(line):
+                probe_rst += 1
+            if len(rst_lines_sample) < 5:
+                rst_lines_sample.append(line.strip()[:200])
+
+    if total_rst == 0:
+        return {}
+
+    result: Dict = {'totalRstPackets': total_rst, 'anomalies': []}
+
+    if probe_rst > 0:
+        result['healthProbeRsts'] = {
+            'count': probe_rst,
+            'isNormalBehavior': True,
+            'explanation': (
+                'TCP RST packets to kubelet (10250), kube-proxy health (10256), '
+                'or common HTTP ports after very short connections are NORMAL. '
+                'Kubernetes liveness/readiness probes open a TCP connection to verify '
+                'the port is listening, then close it immediately — producing a RST. '
+                'This is expected probe behavior, not a connection failure.'
+            ),
+        }
+        result['anomalies'].append({
+            'type': 'health_probe_rst',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{probe_rst} TCP RST packets detected on health-check ports '
+                f'(10250/10256/8080/etc). This is NORMAL Kubernetes health probe '
+                f'behavior — probes open and immediately close TCP connections.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_kube_proxy_dnat(lines: list) -> Dict:
+    """Detect kube-proxy DNAT patterns where both ClusterIP and PodIP appear for the same flow.
+    When a pod connects to a ClusterIP Service, kube-proxy/iptables performs DNAT to rewrite
+    the destination to a backend PodIP. In tcpdump on the node, you see BOTH the original
+    ClusterIP destination AND the DNATed PodIP — this looks like duplicate or phantom traffic
+    but is completely normal kube-proxy behavior.
+    Ref: https://docs.aws.amazon.com/eks/latest/best-practices/hybrid-nodes-app-network-traffic.html"""
+    # Detect 10.x.x.x (typical ClusterIP range) and pod IPs in same capture
+    cluster_ip_re = re.compile(r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\.\d+\b')
+    # Look for the same source talking to two different IPs on the same port
+    flow_re = re.compile(
+        r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)'
+    )
+
+    src_dst_pairs: Dict[str, set] = {}  # src.port -> set of dst IPs
+    for line in lines:
+        m = flow_re.search(line)
+        if m:
+            src_ip, src_port, dst_ip, dst_port = m.groups()
+            key = f"{src_ip}:{src_port}->{dst_port}"
+            if key not in src_dst_pairs:
+                src_dst_pairs[key] = set()
+            src_dst_pairs[key].add(dst_ip)
+
+    # Find flows where same src:port->dstPort talks to multiple dst IPs (DNAT indicator)
+    dnat_flows = {k: v for k, v in src_dst_pairs.items() if len(v) > 1}
+
+    if not dnat_flows:
+        return {}
+
+    examples = []
+    for key, dsts in list(dnat_flows.items())[:5]:
+        examples.append(f"{key} -> {', '.join(sorted(dsts))}")
+
+    return {
+        'dnatFlowCount': len(dnat_flows),
+        'isNormalBehavior': True,
+        'explanation': (
+            'Flows where the same source connects to multiple destination IPs on the '
+            'same port are typically kube-proxy DNAT in action. When a pod connects to '
+            'a ClusterIP Service, iptables rewrites the destination to a backend pod IP. '
+            'tcpdump on the node captures BOTH the pre-DNAT (ClusterIP) and post-DNAT '
+            '(PodIP) packets, making it look like duplicate traffic. This is normal.'
+        ),
+        'exampleFlows': examples,
+        'anomalies': [{
+            'type': 'kube_proxy_dnat',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{len(dnat_flows)} flows show the same source connecting to multiple '
+                f'destination IPs on the same port. This is likely kube-proxy DNAT — '
+                f'ClusterIP being rewritten to backend PodIP. NORMAL behavior.'
+            ),
+        }],
+    }
+
+
+def _analyze_vpc_cni_snat(lines: list) -> Dict:
+    """Detect VPC CNI SNAT where pod IP is translated to node IP for external traffic.
+    By default, VPC CNI SNATs pod traffic destined outside the VPC — the source IP changes
+    from the pod's IP to the node's primary ENI IP. In tcpdump you see outbound packets
+    with the node IP as source instead of the pod IP. This is expected.
+    Ref: https://docs.aws.amazon.com/eks/latest/userguide/external-snat.html"""
+    # Detect traffic to external IPs (non-RFC1918, non-cluster)
+    flow_re = re.compile(
+        r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)'
+    )
+    private_re = re.compile(r'^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)')
+
+    external_flows = 0
+    for line in lines:
+        m = flow_re.search(line)
+        if m:
+            dst_ip = m.group(3)
+            if not private_re.match(dst_ip) and not dst_ip.startswith('127.'):
+                external_flows += 1
+
+    if external_flows < 5:
+        return {}
+
+    return {
+        'externalTrafficFlows': external_flows,
+        'isNormalBehavior': True,
+        'explanation': (
+            'Traffic to external (non-RFC1918) IPs undergoes SNAT by the VPC CNI plugin. '
+            'The pod source IP is translated to the node primary ENI IP before leaving '
+            'the VPC. In tcpdump on the node, outbound external packets show the node IP '
+            'as source, not the pod IP. This is default VPC CNI behavior '
+            '(AWS_VPC_K8S_CNI_EXTERNALSNAT=false). Inbound responses are reverse-NATed '
+            'back to the pod IP.'
+        ),
+        'anomalies': [{
+            'type': 'vpc_cni_snat',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{external_flows} packets to external IPs detected. Source IP translation '
+                f'(SNAT) from pod IP to node IP is NORMAL VPC CNI behavior for traffic '
+                f'leaving the VPC.'
+            ),
+        }],
+    }
+
+
+def _analyze_tcp_keepalives(lines: list) -> Dict:
+    """Detect TCP keepalive packets on idle connections.
+    Long-lived connections (e.g., gRPC, database pools, websockets) send periodic TCP
+    keepalive probes to prevent idle timeout by NAT gateways (350s), NLBs, or conntrack.
+    These appear as small packets with ack flag on established connections. Normal behavior.
+    Ref: https://aws.amazon.com/blogs/networking-and-content-delivery/implementing-long-running-tcp-connections-within-vpc-networking/"""
+    # Keepalives are typically: small ack-only packets, often with length 0
+    keepalive_re = re.compile(r'Flags\s+\[\.?\].*length\s+0', re.IGNORECASE)
+    total_keepalive_candidates = 0
+
+    for line in lines:
+        if keepalive_re.search(line) and 'ack' in line.lower():
+            total_keepalive_candidates += 1
+
+    if total_keepalive_candidates < 10:
+        return {}
+
+    return {
+        'keepaliveCandidates': total_keepalive_candidates,
+        'isNormalBehavior': True,
+        'explanation': (
+            'Zero-length ACK packets on established connections are typically TCP keepalive '
+            'probes. Applications and kernels send these to prevent idle connection timeout '
+            'by NAT Gateway (350s idle timeout), NLB, or conntrack table eviction. This is '
+            'expected for long-lived connections like gRPC streams, database connection pools, '
+            'and websockets.'
+        ),
+        'anomalies': [{
+            'type': 'tcp_keepalive',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{total_keepalive_candidates} zero-length ACK packets detected (likely TCP '
+                f'keepalives). This is NORMAL for long-lived connections preventing idle '
+                f'timeout by NAT Gateway/NLB/conntrack.'
+            ),
+        }],
+    }
+
+
+def _analyze_icmp_expected(lines: list) -> Dict:
+    """Detect expected ICMP patterns in Kubernetes.
+    ICMP port-unreachable during rolling updates (old pod IP, new pod not yet ready),
+    ICMP fragmentation-needed for PMTUD, and ICMP redirect from VPC routing are all normal.
+    Ref: https://docs.aws.amazon.com/eks/latest/best-practices/vpc-cni.html"""
+    icmp_unreach_re = re.compile(r'ICMP.*unreachable', re.IGNORECASE)
+    icmp_frag_re = re.compile(r'ICMP.*frag.*needed|ICMP.*too\s+big', re.IGNORECASE)
+    icmp_redirect_re = re.compile(r'ICMP.*redirect', re.IGNORECASE)
+
+    unreachable = 0
+    frag_needed = 0
+    redirect = 0
+
+    for line in lines:
+        if icmp_unreach_re.search(line):
+            unreachable += 1
+        if icmp_frag_re.search(line):
+            frag_needed += 1
+        if icmp_redirect_re.search(line):
+            redirect += 1
+
+    total = unreachable + frag_needed + redirect
+    if total == 0:
+        return {}
+
+    result: Dict = {'anomalies': []}
+
+    if frag_needed > 0:
+        result['pmtudFragNeeded'] = {
+            'count': frag_needed,
+            'isNormalBehavior': True,
+            'explanation': (
+                'ICMP "fragmentation needed" (type 3 code 4) or "packet too big" messages '
+                'are part of Path MTU Discovery (PMTUD). This is the network telling the '
+                'sender to reduce packet size. Normal for VPC traffic crossing different MTU '
+                'boundaries (e.g., 9001 jumbo frames to 1500 standard).'
+            ),
+        }
+        result['anomalies'].append({
+            'type': 'pmtud_frag_needed',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{frag_needed} ICMP fragmentation-needed packets detected. This is NORMAL '
+                f'Path MTU Discovery behavior.'
+            ),
+        })
+
+    if unreachable > 0 and unreachable < 20:
+        result['icmpUnreachable'] = {
+            'count': unreachable,
+            'isNormalBehavior': True,
+            'explanation': (
+                'A small number of ICMP port/host unreachable messages is normal during '
+                'rolling updates, pod termination, or when UDP services are briefly '
+                'unavailable. The VPC CNI 30-second IP cooldown cache means old pod IPs '
+                'may receive traffic briefly after pod deletion.'
+            ),
+        }
+        result['anomalies'].append({
+            'type': 'icmp_unreachable_transient',
+            'severity': 'info',
+            'isNormalBehavior': True,
+            'message': (
+                f'{unreachable} ICMP unreachable packets detected. Small numbers are NORMAL '
+                f'during rolling updates or pod termination (VPC CNI 30s IP cooldown).'
+            ),
+        })
+    elif unreachable >= 20:
+        result['anomalies'].append({
+            'type': 'icmp_unreachable_high',
+            'severity': 'warning',
+            'isNormalBehavior': False,
+            'message': (
+                f'{unreachable} ICMP unreachable packets detected — this is higher than '
+                f'expected for normal rolling updates. Investigate for misconfigured '
+                f'services, missing endpoints, or network policy blocks.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_coredns_transients(lines: list) -> Dict:
+    """Detect brief DNS failures that occur during CoreDNS scaling events.
+    When CoreDNS pods scale down, there is a propagation delay for kube-proxy to update
+    iptables rules. During this window, DNS queries may be sent to a terminating CoreDNS pod
+    and get SERVFAIL or timeout. Setting lameduck duration in CoreDNS mitigates this.
+    Ref: https://docs.aws.amazon.com/eks/latest/best-practices/scale-cluster-services.html"""
+    servfail_re = re.compile(r'SERVFAIL|ServFail', re.IGNORECASE)
+    dns_timeout_re = re.compile(r'>\s+\S+\.53:.*\[.*\].*no\s+response', re.IGNORECASE)
+
+    servfail_count = 0
+    for line in lines:
+        if servfail_re.search(line):
+            servfail_count += 1
+
+    if servfail_count == 0:
+        return {}
+
+    if servfail_count < 10:
+        return {
+            'servfailCount': servfail_count,
+            'isNormalBehavior': True,
+            'explanation': (
+                'A small number of SERVFAIL responses can occur during CoreDNS pod scaling '
+                'events. When a CoreDNS pod terminates, there is a brief window where '
+                'kube-proxy iptables rules still route DNS queries to the terminating pod. '
+                'The CoreDNS lameduck plugin mitigates this by delaying shutdown. A few '
+                'SERVFAILs during scaling are transient and self-resolving.'
+            ),
+            'anomalies': [{
+                'type': 'coredns_scaling_transient',
+                'severity': 'info',
+                'isNormalBehavior': True,
+                'message': (
+                    f'{servfail_count} DNS SERVFAIL responses detected. Small numbers are '
+                    f'NORMAL during CoreDNS scaling events (lameduck propagation delay).'
+                ),
+            }],
+        }
+    else:
+        return {
+            'servfailCount': servfail_count,
+            'anomalies': [{
+                'type': 'high_servfail_rate',
+                'severity': 'warning',
+                'isNormalBehavior': False,
+                'message': (
+                    f'{servfail_count} DNS SERVFAIL responses detected — this exceeds '
+                    f'normal CoreDNS scaling transients. Investigate CoreDNS health, '
+                    f'resource limits, and upstream DNS connectivity.'
+                ),
+            }],
+        }
+
+
 def tcpdump_analyze(arguments: Dict) -> Dict:
     """
     Read and analyze a completed tcpdump capture from S3.
     Returns decoded packet text, protocol statistics, and top talkers.
+
 
     Inputs:
         instanceId: EC2 instance ID (required)
@@ -8111,6 +8564,60 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
                 results['decodedPackets'] = {'error': f'Failed to read text summary: {str(e)}'}
         else:
             results['decodedPackets'] = {'error': 'No text summary file found — capture may still be in progress'}
+
+    # DNS analysis — scan decoded packets for DNS patterns
+    if section in ('summary', 'all') and decoded_lines:
+        dns_analysis = _analyze_dns_packets(decoded_lines)
+        if dns_analysis:
+            results['dnsAnalysis'] = dns_analysis
+            # Merge DNS anomalies into the main anomalies list
+            if 'anomalies' in results:
+                results['anomalies'].extend(dns_analysis.get('anomalies', []))
+            else:
+                results['anomalies'] = dns_analysis.get('anomalies', [])
+
+    # Expected behavior analysis — detect normal K8s/EKS network patterns
+    # Each analyzer is independent and returns its own findings
+    if section in ('summary', 'all') and decoded_lines:
+        expected_behaviors = {}
+        expected_anomalies = []
+
+        tcp_rst = _analyze_tcp_rst_patterns(decoded_lines)
+        if tcp_rst:
+            expected_behaviors['tcpRstPatterns'] = tcp_rst
+            expected_anomalies.extend(tcp_rst.get('anomalies', []))
+
+        dnat = _analyze_kube_proxy_dnat(decoded_lines)
+        if dnat:
+            expected_behaviors['kubeProxyDnat'] = dnat
+            expected_anomalies.extend(dnat.get('anomalies', []))
+
+        snat = _analyze_vpc_cni_snat(decoded_lines)
+        if snat:
+            expected_behaviors['vpcCniSnat'] = snat
+            expected_anomalies.extend(snat.get('anomalies', []))
+
+        keepalive = _analyze_tcp_keepalives(decoded_lines)
+        if keepalive:
+            expected_behaviors['tcpKeepalives'] = keepalive
+            expected_anomalies.extend(keepalive.get('anomalies', []))
+
+        icmp = _analyze_icmp_expected(decoded_lines)
+        if icmp:
+            expected_behaviors['icmpPatterns'] = icmp
+            expected_anomalies.extend(icmp.get('anomalies', []))
+
+        coredns = _analyze_coredns_transients(decoded_lines)
+        if coredns:
+            expected_behaviors['corednsTransients'] = coredns
+            expected_anomalies.extend(coredns.get('anomalies', []))
+
+        if expected_behaviors:
+            results['expectedBehaviors'] = expected_behaviors
+            if 'anomalies' in results:
+                results['anomalies'].extend(expected_anomalies)
+            else:
+                results['anomalies'] = expected_anomalies
 
     # Presigned URL for pcap download
     if s3_key_pcap:

@@ -269,6 +269,22 @@ safety_ratings:
   diagnosis: "Branch ENIs have separate security groups. Pod A's SG does not allow traffic from Pod B's SG and vice versa."
   resolution: "Operator action: update the security groups assigned to pods to allow traffic from each other's SGs."
 
+- symptoms: "tcpdump shows outbound packets to external (non-RFC1918) IPs with the node IP as source instead of the pod IP"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. By default, VPC CNI performs SNAT (Source NAT) on pod traffic destined outside the VPC, translating the pod source IP to the node's primary ENI IP. This is controlled by AWS_VPC_K8S_CNI_EXTERNALSNAT (default: false, meaning SNAT is enabled). See https://docs.aws.amazon.com/eks/latest/userguide/external-snat.html"
+  resolution: "No action required — this is default VPC CNI behavior. If pods need to preserve their source IP for external traffic (e.g., for VPN or Direct Connect peers), set AWS_VPC_K8S_CNI_EXTERNALSNAT=true on the aws-node DaemonSet."
+
+- symptoms: "tcpdump shows a small number of ICMP port-unreachable or host-unreachable messages during or shortly after a rolling update or pod deletion"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. When a pod is deleted, VPC CNI places the pod's IP in a 30-second cooldown cache before recycling it. During this window, kube-proxy iptables rules on other nodes may still route traffic to the old pod IP, resulting in ICMP unreachable responses. This is a transient condition that resolves once all nodes update their iptables rules. See https://docs.aws.amazon.com/eks/latest/best-practices/vpc-cni.html"
+  resolution: "No action required if the count is small and occurs during deployments. If persistent, check that kube-proxy is running and syncing rules on all nodes. Ensure pods have proper preStop hooks to allow graceful connection draining."
+
+- symptoms: "tcpdump shows zero-length ACK packets (TCP keepalives) on long-lived connections like gRPC, database pools, or websockets"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. Applications and kernels send TCP keepalive probes to prevent idle connection timeout by NAT Gateway (350s idle timeout), NLB, or conntrack table eviction. These appear as small ACK-only packets with length 0 on established connections. See https://aws.amazon.com/blogs/networking-and-content-delivery/implementing-long-running-tcp-connections-within-vpc-networking/"
+  resolution: "No action required — keepalives are essential for maintaining long-lived connections through stateful network devices. If connections are still dropping, check that the keepalive interval is shorter than the NAT Gateway/NLB idle timeout (350s)."
+
+- symptoms: "tcpdump shows ICMP 'fragmentation needed' or 'packet too big' messages"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. These are Path MTU Discovery (PMTUD) messages indicating the network is telling the sender to reduce packet size. Common when traffic crosses MTU boundaries (e.g., 9001 jumbo frames on EC2 to 1500 standard MTU on VPN/internet)."
+  resolution: "No action required — PMTUD is working correctly. If application performance is affected, ensure the application respects the DF (Don't Fragment) bit and adjusts MSS accordingly. Check MTU settings on all interfaces in the path."
+
 ## Examples
 
 ```

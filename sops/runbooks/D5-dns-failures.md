@@ -120,6 +120,14 @@ safety_ratings:
   diagnosis: "Security group rules are blocking DNS traffic (TCP/UDP port 53) from the pod CIDR range to CoreDNS pods."
   resolution: "Operator action: update security groups to allow TCP and UDP port 53 from the pod CIDR range to the CoreDNS pod IPs or the node security group."
 
+- symptoms: "tcpdump or DNS logs show queries with doubled/repeated domain suffixes such as 'myservice.mynamespace.svc.cluster.local.mynamespace.svc.cluster.local' — these queries return NXDomain but the final correct query succeeds"
+  diagnosis: "THIS IS NORMAL BEHAVIOR — NOT A MISCONFIGURATION. With the default ndots:5 setting, the glibc resolver treats any name with fewer than 5 dots as 'not fully qualified' and appends each search domain from /etc/resolv.conf before trying the name as-is. A standard Kubernetes resolv.conf has search domains like 'mynamespace.svc.cluster.local svc.cluster.local cluster.local ec2.internal'. When a pod resolves 'myservice.mynamespace.svc.cluster.local' (4 dots, which is < ndots:5), the resolver first tries appending the first search domain, producing 'myservice.mynamespace.svc.cluster.local.mynamespace.svc.cluster.local'. This gets NXDomain, then the next search domain is tried, and so on until the correct resolution succeeds. This generates 3-5 extra NXDomain queries per lookup but is functionally correct and expected."
+  resolution: "No action required — this is working as designed. If the extra DNS queries are causing performance concerns (CoreDNS load, latency), the operator can: (1) add a trailing dot to FQDNs in application config (e.g., 'myservice.mynamespace.svc.cluster.local.') to bypass search domain expansion entirely, (2) lower ndots to 2 in the pod spec dnsConfig, or (3) use short service names (e.g., 'myservice' or 'myservice.mynamespace') which resolve correctly on the first search domain attempt. See https://docs.aws.amazon.com/eks/latest/best-practices/scale-cluster-services.html"
+
+- symptoms: "tcpdump shows a small number of DNS SERVFAIL responses, but DNS resolution generally works"
+  diagnosis: "THIS IS NORMAL BEHAVIOR during CoreDNS scaling events. When CoreDNS pods scale down, there is a propagation delay for kube-proxy to update iptables rules. During this brief window, DNS queries may be routed to a terminating CoreDNS pod and receive SERVFAIL. The CoreDNS lameduck plugin mitigates this by delaying shutdown. A few SERVFAILs are transient and self-resolving."
+  resolution: "No action required if the count is small (<10) and transient. If persistent, check CoreDNS health and ensure the lameduck plugin is configured in the Corefile. See https://docs.aws.amazon.com/eks/latest/best-practices/scale-cluster-services.html"
+
 ## Examples
 
 ```

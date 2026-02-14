@@ -248,6 +248,14 @@ safety_ratings:
   diagnosis: "Version skew between kube-proxy addon and cluster. Can cause compatibility issues with API changes."
   resolution: "Operator action: update kube-proxy addon to match cluster version via 'aws eks update-addon --cluster-name <name> --addon-name kube-proxy --addon-version <version>'."
 
+- symptoms: "tcpdump shows the same source connecting to both a ClusterIP (10.x.x.x) and a different PodIP on the same destination port — appears as duplicate or phantom traffic"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. kube-proxy performs DNAT (Destination NAT) on ClusterIP Service traffic, rewriting the destination from the ClusterIP to a backend PodIP. tcpdump on the node captures BOTH the pre-DNAT packet (to ClusterIP) and the post-DNAT packet (to PodIP), making it look like the same source is talking to two different destinations. This is standard iptables/IPVS Service routing."
+  resolution: "No action required — this is working as designed. If you need to trace a specific flow, filter tcpdump by the pod IP rather than the ClusterIP to see only the actual backend traffic."
+
+- symptoms: "tcpdump shows TCP RST packets on ports 10250, 10256, 8080, or other health-check ports after very short-lived connections"
+  diagnosis: "THIS IS NORMAL BEHAVIOR. Kubernetes liveness and readiness probes open a TCP connection to verify the port is listening, then immediately close it. This produces TCP RST packets. kubelet probes on port 10250, kube-proxy health on 10256, and application probes on 8080/443 all exhibit this pattern. See https://docs.aws.amazon.com/prescriptive-guidance/latest/ha-resiliency-amazon-eks-apps/probes-checks.html"
+  resolution: "No action required — these RSTs are expected probe behavior, not connection failures. A high RST rate from probes alone is not a concern."
+
 ## Examples
 
 ```
