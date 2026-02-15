@@ -7546,12 +7546,24 @@ if [ "$FILE_SIZE" -eq 0 ]; then
     echo "WARNING: Capture file is empty — no packets matched the filter"
 fi
 
-# Decode pcap to human-readable text summary (first 2000 packets max)
+# Decode pcap to human-readable text summary (first 5000 packets max)
 echo "Decoding pcap to text summary..."
-tcpdump -nn -r "$PCAP_FILE" 2>/dev/null | head -5000 > "$TXT_FILE" || true
+# Use -c 5000 instead of piping through head to avoid SIGPIPE under set -euo pipefail
+tcpdump -nn -r "$PCAP_FILE" -c 5000 > "$TXT_FILE" 2>/dev/null || true
 TXT_SIZE=$(stat -c%s "$TXT_FILE" 2>/dev/null || stat -f%z "$TXT_FILE" 2>/dev/null || echo "0")
 PACKET_COUNT=$(wc -l < "$TXT_FILE" 2>/dev/null || echo "0")
-echo "Decoded $PACKET_COUNT packets to text"
+echo "Decoded $PACKET_COUNT packets to text (txt_size=$TXT_SIZE)"
+
+# If decode produced empty output, log diagnostics and retry
+if [ "$TXT_SIZE" -eq 0 ] || [ "$PACKET_COUNT" -eq 0 ]; then
+    echo "WARNING: Text decode produced empty output."
+    echo "Pcap file details:"
+    ls -la "$PCAP_FILE" 2>/dev/null || true
+    file "$PCAP_FILE" 2>/dev/null || true
+    # Retry with verbose stderr to diagnose
+    echo "Retry with stderr:"
+    tcpdump -nn -r "$PCAP_FILE" -c 10 2>&1 || true
+fi
 
 # Generate stats JSON with protocol breakdown and top talkers (using Python for valid JSON)
 echo "Generating capture statistics..."
@@ -7566,14 +7578,14 @@ def tcpdump_count(extra_args=None):
     cmd = ['tcpdump', '-nn', '-r', pcap] + (extra_args or [])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return len([l for l in r.stdout.strip().split('\n') if l])
+        return len([l for l in r.stdout.strip().splitlines() if l])
     except Exception:
         return 0
 
 def tcpdump_lines():
     try:
         r = subprocess.run(['tcpdump', '-nn', '-r', pcap], capture_output=True, text=True, timeout=60)
-        return [l for l in r.stdout.strip().split('\n') if l]
+        return [l for l in r.stdout.strip().splitlines() if l]
     except Exception:
         return []
 
