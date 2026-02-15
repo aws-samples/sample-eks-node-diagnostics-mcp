@@ -186,3 +186,98 @@ patterns:
       "DISABLE_TCP_EARLY_DEMUX=true is breaking TCP connections on the node."
     repo_proof: "cmd/aws-vpc-cni-init/main.go — procSys.Set('net/ipv4/tcp_early_demux', '0')"
     guardrail_ref: null
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P10: NETWORK_POLICY_ENFORCING_MODE confused with SGP enforcing mode
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P10-network-policy-vs-sgp-enforcing
+    trigger_words: ["NETWORK_POLICY_ENFORCING_MODE", "network policy strict", "default deny"]
+    hallucination_risk: CRITICAL
+    why_llms_get_this_wrong: >
+      Both settings contain "ENFORCING_MODE" and both have a "strict" option.
+      LLMs conflate them because the names are nearly identical. But they
+      control completely different subsystems with different code paths.
+    actual_behavior: >
+      NETWORK_POLICY_ENFORCING_MODE controls Kubernetes NetworkPolicy enforcement
+      via aws-network-policy-agent (eBPF). "strict" = default-deny until
+      NetworkPolicy allows. POD_SECURITY_GROUP_ENFORCING_MODE controls veth
+      naming for SGP pods. They share zero code paths.
+    common_false_claim: >
+      "NETWORK_POLICY_ENFORCING_MODE=strict is the same as SGP strict mode
+      and blocks traffic to pods without security groups."
+    repo_proof: "pkg/ipamd/ipamd.go — two separate env var reads, two separate code paths"
+    guardrail_ref: G9-network-policy-enforcing-mode
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P11: DISABLE_NETWORK_RESOURCE_PROVISIONING sounds like it breaks networking
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P11-disable-network-resource-provisioning
+    trigger_words: ["DISABLE_NETWORK_RESOURCE_PROVISIONING", "disable network", "resource provisioning"]
+    hallucination_risk: HIGH
+    why_llms_get_this_wrong: >
+      "DISABLE_NETWORK" in the name sounds like it disables networking.
+      LLMs pattern-match "disable" + "network" to "networking is broken."
+    actual_behavior: >
+      This only disables ENI provisioning during pod init — used when an
+      external controller manages ENIs. Existing networking is unaffected.
+      The name is misleading but the behavior is narrow.
+    common_false_claim: >
+      "DISABLE_NETWORK_RESOURCE_PROVISIONING=true disables all pod networking."
+    repo_proof: "pkg/ipamd/ipamd.go — only skips ENI creation in tryAllocateENI()"
+    guardrail_ref: G20-disable-network-resource-provisioning
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P12: WARM_IP_TARGET confused with max pods limit
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P12-warm-ip-vs-max-pods
+    trigger_words: ["WARM_IP_TARGET", "warm IP", "max pods", "pod limit"]
+    hallucination_risk: MEDIUM
+    why_llms_get_this_wrong: >
+      "IP TARGET" sounds like a limit on IPs available for pods. LLMs
+      assume it caps the number of pods that can run.
+    actual_behavior: >
+      WARM_IP_TARGET controls pre-allocation of FREE IPs in the warm pool.
+      It does NOT limit max pods. Max pods is kubelet --max-pods (set by
+      EKS bootstrap based on instance ENI/IP limits). IPAMD only checks:
+      if totalIPs >= maxPods, pool is not low (prevents over-allocation).
+    common_false_claim: >
+      "WARM_IP_TARGET=5 means only 5 pods can run on the node."
+    repo_proof: "pkg/ipamd/ipamd.go — getWarmIPTarget() only affects warm pool, not max pods"
+    guardrail_ref: G21-warm-ip-vs-max-pods
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P13: AWS_VPC_ENI_MTU confused with pod MTU
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P13-eni-mtu-vs-pod-mtu
+    trigger_words: ["AWS_VPC_ENI_MTU", "ENI MTU", "pod MTU", "MTU 9001"]
+    hallucination_risk: LOW
+    why_llms_get_this_wrong: >
+      LLMs see "ENI MTU" and assume it's the MTU inside pods. They don't
+      know about the separate POD_MTU setting.
+    actual_behavior: >
+      AWS_VPC_ENI_MTU sets host ENI MTU (eth0, eth1). POD_MTU sets pod
+      veth MTU. If POD_MTU=0 (default), pods inherit ENI MTU. They are
+      configured in different files and applied at different layers.
+    common_false_claim: >
+      "Setting AWS_VPC_ENI_MTU=1500 changes the MTU inside all pods."
+    repo_proof: "pkg/networkutils/network.go — GetEthernetMTU() vs cmd/aws-vpc-cni/main.go — envPodMTU"
+    guardrail_ref: G22-eni-mtu-vs-pod-mtu
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P14: Empty route table flagged as broken (normal with multiple ENIs)
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P14-empty-route-table-multi-eni
+    trigger_words: ["empty route table", "no default gateway", "missing routes", "route table empty"]
+    hallucination_risk: MEDIUM
+    why_llms_get_this_wrong: >
+      Traditional Linux networking expects a default gateway in the main
+      route table. LLMs flag its absence as critical. On EKS multi-ENI
+      nodes, per-ENI policy routing replaces the main table.
+    actual_behavior: >
+      VPC CNI creates per-ENI route tables (2, 3, 4...) with ip rules
+      directing pod traffic. The main route table may be empty or minimal.
+      This is NORMAL and EXPECTED on multi-ENI nodes.
+    common_false_claim: >
+      "The main route table has no default gateway — routing is broken."
+    repo_proof: "pkg/networkutils/network.go — SetupENINetwork() creates per-ENI tables"
+    guardrail_ref: G23-empty-route-table-multi-eni

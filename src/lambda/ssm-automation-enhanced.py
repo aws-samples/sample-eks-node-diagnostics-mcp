@@ -6482,6 +6482,53 @@ def network_diagnostics(arguments: Dict) -> Dict:
             'running. New services/endpoints will NOT be reflected until API server connectivity is restored.'
         )
 
+        # ANTI-HALLUCINATION: NETWORK_POLICY_ENFORCING_MODE vs POD_SECURITY_GROUP_ENFORCING_MODE
+        eks_context['guardrails'].append(
+            'CRITICAL ANTI-HALLUCINATION: NETWORK_POLICY_ENFORCING_MODE and POD_SECURITY_GROUP_ENFORCING_MODE '
+            'are COMPLETELY DIFFERENT settings. NETWORK_POLICY_ENFORCING_MODE controls Kubernetes NetworkPolicy '
+            'enforcement via aws-network-policy-agent (eBPF). "strict" = default-deny until NetworkPolicy allows. '
+            'POD_SECURITY_GROUP_ENFORCING_MODE controls veth naming for SGP-annotated pods ONLY. '
+            'They share the word "enforcing" but have ZERO overlap in code paths. '
+            'Do NOT confuse them. Do NOT claim one affects the other.'
+        )
+
+        # ANTI-HALLUCINATION: DISABLE_NETWORK_RESOURCE_PROVISIONING
+        disable_nrp = cni_env.get('DISABLE_NETWORK_RESOURCE_PROVISIONING', 'false')
+        if disable_nrp.lower() == 'true':
+            eks_context['guardrails'].append(
+                'DISABLE_NETWORK_RESOURCE_PROVISIONING=true: This ONLY disables ENI provisioning during pod init. '
+                'It does NOT disable networking. Used when an external controller manages ENIs. '
+                'Existing pod networking is UNAFFECTED. The name is misleading — do NOT claim it breaks networking.'
+            )
+
+        # ANTI-HALLUCINATION: WARM_IP_TARGET is NOT max pods
+        eks_context['guardrails'].append(
+            'ANTI-HALLUCINATION: WARM_IP_TARGET controls pre-allocation of FREE IPs in the warm pool. '
+            'It does NOT limit max pods. Max pods is kubelet --max-pods (set by EKS bootstrap based on '
+            'instance ENI/IP limits). Do NOT claim WARM_IP_TARGET caps the number of running pods.'
+        )
+
+        # ANTI-HALLUCINATION: AWS_VPC_ENI_MTU vs POD_MTU
+        eks_context['guardrails'].append(
+            'ANTI-HALLUCINATION: AWS_VPC_ENI_MTU (default 9001) sets host ENI MTU (eth0, eth1). '
+            'POD_MTU (default 0 = use ENI MTU) sets pod veth MTU. They are different settings. '
+            'Do NOT claim AWS_VPC_ENI_MTU directly controls pod MTU — POD_MTU does that.'
+        )
+
+        # ANTI-HALLUCINATION: Empty main route table on multi-ENI nodes
+        eks_context['guardrails'].append(
+            'ANTI-HALLUCINATION: On multi-ENI EKS nodes, an empty or minimal main route table is NORMAL. '
+            'VPC CNI creates per-ENI route tables (table 2, 3, 4...) with policy routing rules. '
+            'Check "ip rule list" and "ip route show table 2" before flagging routing as broken.'
+        )
+
+        # ANTI-HALLUCINATION: Conntrack exhaustion is kernel-level, not CNI/kube-proxy
+        eks_context['guardrails'].append(
+            'ANTI-HALLUCINATION: "nf_conntrack: table full" is a kernel resource exhaustion issue. '
+            'Do NOT blame VPC CNI or kube-proxy. Fix: increase nf_conntrack_max via kube-proxy '
+            'conntrack.min/conntrack.maxPerCore settings in kube-proxy-config ConfigMap.'
+        )
+
         # Clean up internal flags from results
         if 'iptables' in results and '_snat_present' in results['iptables']:
             del results['iptables']['_snat_present']

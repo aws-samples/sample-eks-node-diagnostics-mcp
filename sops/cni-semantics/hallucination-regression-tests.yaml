@@ -231,3 +231,162 @@ tests:
       pkg/networkutils/network.go line 441 — updateHostIptablesRules()
       returns nil immediately when v6Enabled=true. No SNAT or connmark
       rules are created in IPv6 mode by design.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T9: Network policy strict vs SGP strict confusion
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T9-network-policy-strict-vs-sgp-strict
+    guardrail_ref: G9-network-policy-enforcing-mode
+    pattern_ref: P10-network-policy-vs-sgp-enforcing
+    description: >
+      NETWORK_POLICY_ENFORCING_MODE=strict is set AND
+      POD_SECURITY_GROUP_ENFORCING_MODE=strict is set. A pod without
+      NetworkPolicy is being blocked. Agent must blame network policy,
+      not SGP.
+    misleading_config:
+      - "POD_SECURITY_GROUP_ENFORCING_MODE=strict in aws-node env"
+      - "ENABLE_POD_ENI=true in aws-node env"
+    real_injected_failure:
+      - "NETWORK_POLICY_ENFORCING_MODE=strict is set"
+      - "Pod has NO NetworkPolicy allowing ingress"
+      - "aws-network-policy-agent is running and enforcing"
+    symptoms:
+      - "Pod cannot receive any traffic"
+      - "Pod has no vpc.amazonaws.com/pod-eni annotation"
+      - "iptables KUBE-SERVICES chain is populated (kube-proxy works)"
+    assertion: >
+      Agent MUST NOT blame POD_SECURITY_GROUP_ENFORCING_MODE.
+      Agent MUST identify NETWORK_POLICY_ENFORCING_MODE=strict as cause.
+      Agent MUST note pod lacks NetworkPolicy allowing traffic.
+      Agent MUST note pod has no pod-eni annotation (SGP not involved).
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T10: nm-cloud-setup present vs actual routing issue
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T10-nm-cloud-setup-vs-sg-issue
+    guardrail_ref: G10-nm-cloud-setup
+    pattern_ref: null
+    description: >
+      nm-cloud-setup is detected (table 30200/30400 present), but the
+      real failure is a security group blocking pod traffic, not
+      nm-cloud-setup overwriting ip rules.
+    misleading_config:
+      - "nm-cloud-setup.service is active"
+      - "ip rule list shows table 30200 and 30400 entries"
+      - "RHEL 8 AMI in use"
+    real_injected_failure:
+      - "Security group on secondary ENI has no inbound rule for pod CIDR"
+      - "Per-ENI ip rules are intact (nm-cloud-setup hasn't overwritten them yet)"
+    symptoms:
+      - "Pods on secondary ENI cannot receive traffic from other nodes"
+      - "Pods on primary ENI work fine"
+      - "ip rule list shows correct per-ENI rules alongside table 30200"
+    assertion: >
+      Agent SHOULD flag nm-cloud-setup as a risk but MUST NOT blame it
+      as root cause if per-ENI ip rules are intact.
+      Agent MUST identify security group as the actual root cause.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T11: iptables-legacy vs nftables visibility
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T11-iptables-nftables-visibility
+    guardrail_ref: G11-iptables-nftables
+    pattern_ref: null
+    description: >
+      Host OS uses nftables but VPC CNI uses iptables-legacy. Agent sees
+      no CNI chains in nft output and incorrectly flags CNI as broken.
+    misleading_config:
+      - "nft list ruleset shows no AWS-SNAT-CHAIN-0"
+      - "Host OS is RHEL 8.6+ with nftables as default"
+      - "VPC CNI version < 1.13.1"
+    real_injected_failure:
+      - "iptables-legacy -t nat -L shows AWS-SNAT-CHAIN-0 correctly"
+      - "CNI is working fine in iptables-legacy mode"
+      - "Real issue: kube-proxy using nftables mode can't see CNI's iptables rules"
+    symptoms:
+      - "nft list ruleset shows no CNI chains"
+      - "iptables-save shows CNI chains correctly"
+      - "Service routing works (kube-proxy in nftables mode)"
+    assertion: >
+      Agent MUST NOT flag missing CNI chains in nft output as broken.
+      Agent MUST check iptables-save separately from nft list.
+      Agent MUST note the iptables-legacy vs nftables mode mismatch.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T12: IP cooldown transient errors vs actual IPAM failure
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T12-ip-cooldown-vs-ipam-failure
+    guardrail_ref: G12-ip-cooldown-transient
+    pattern_ref: null
+    description: >
+      ipamd logs show "IP not in datastore" messages during a pod churn
+      event. Agent incorrectly diagnoses IPAMD as broken.
+    misleading_config:
+      - "ipamd logs: 'IP not in datastore' messages (3 occurrences in 30s)"
+      - "IP_COOLDOWN_PERIOD=30"
+      - "Recent pod deletions visible in kubelet logs"
+    real_injected_failure:
+      - "Messages are transient — they stop after 30 seconds"
+      - "Real issue: subnet has only 5 IPs remaining (near exhaustion)"
+    symptoms:
+      - "Transient 'IP not in datastore' messages during pod churn"
+      - "New pods eventually get IPs but slowly"
+      - "ipamd logs show 'InsufficientCidrBlocks' after cooldown window"
+    assertion: >
+      Agent MUST NOT blame IPAMD or recommend restarting aws-node for
+      transient cooldown messages.
+      Agent MUST identify subnet IP exhaustion as the real issue.
+      Agent MUST note that cooldown messages lasting < 30s are normal.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T13: Conntrack exhaustion vs kube-proxy failure
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T13-conntrack-exhaustion-vs-kube-proxy
+    guardrail_ref: G16-conntrack-exhaustion
+    pattern_ref: null
+    description: >
+      dmesg shows "nf_conntrack: table full" and service routing is
+      intermittently failing. Agent blames kube-proxy or VPC CNI.
+    misleading_config:
+      - "kube-proxy logs show no errors"
+      - "VPC CNI aws-node pod is healthy"
+      - "AWS-SNAT-CHAIN-0 and KUBE-SERVICES chains are populated"
+    real_injected_failure:
+      - "nf_conntrack_count = nf_conntrack_max (table full)"
+      - "New connections being dropped at kernel level"
+      - "Node is running an ingress controller with high connection rate"
+    symptoms:
+      - "Intermittent service unreachability"
+      - "dmesg: 'nf_conntrack: table full, dropping packet'"
+      - "Existing long-lived connections work, new connections fail"
+    assertion: >
+      Agent MUST NOT blame kube-proxy or VPC CNI.
+      Agent MUST identify conntrack table exhaustion as root cause.
+      Agent MUST recommend increasing nf_conntrack_max via kube-proxy config.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T14: kube-proxy IPVS mode vs "missing iptables chains"
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T14-ipvs-mode-missing-iptables
+    guardrail_ref: G19-kube-proxy-ipvs
+    pattern_ref: null
+    description: >
+      kube-proxy is in IPVS mode. Agent sees no KUBE-SVC-* chains in
+      iptables and incorrectly flags kube-proxy as broken.
+    misleading_config:
+      - "iptables-save shows no KUBE-SVC-* or KUBE-SEP-* chains"
+      - "KUBE-SERVICES chain has minimal rules"
+    real_injected_failure:
+      - "kube-proxy is in IPVS mode (--proxy-mode=ipvs)"
+      - "ipvsadm -L shows all service entries correctly"
+      - "Real issue: ip_vs_rr kernel module not loaded on one node"
+    symptoms:
+      - "Service routing works on most nodes"
+      - "One node has no IPVS entries (ipvsadm -L empty)"
+      - "iptables shows no KUBE-SVC chains on any node (expected in IPVS)"
+    assertion: >
+      Agent MUST NOT flag missing KUBE-SVC iptables chains as broken
+      when kube-proxy is in IPVS mode.
+      Agent MUST check ipvsadm output instead of iptables.
+      Agent MUST identify missing ip_vs_rr kernel module as root cause
+      on the affected node.

@@ -68,3 +68,13 @@ Compare the repo-defined preconditions against the actual incident evidence:
 4. **NEVER claim prefix delegation changes routing** — PD only changes IP allocation strategy.
 5. **NEVER claim IPv6 mode has SNAT rules** — updateHostIptablesRules() returns nil for v6.
 6. **NEVER claim CNI config is cluster-wide** — All config is node-local via os.Getenv.
+7. **NEVER confuse NETWORK_POLICY_ENFORCING_MODE with POD_SECURITY_GROUP_ENFORCING_MODE** — They are completely different subsystems (eBPF network policy vs SGP veth naming).
+8. **NEVER claim DISABLE_NETWORK_RESOURCE_PROVISIONING breaks networking** — It only disables ENI provisioning, not existing networking.
+9. **NEVER claim WARM_IP_TARGET limits max pods** — It controls warm pool pre-allocation, not pod capacity.
+10. **NEVER confuse AWS_VPC_ENI_MTU with POD_MTU** — ENI MTU is host-level, POD_MTU is pod veth-level.
+11. **NEVER flag empty main route table as broken on multi-ENI nodes** — Per-ENI policy routing replaces the main table.
+12. **NEVER flag missing KUBE-SVC chains as broken in IPVS mode** — IPVS uses kernel hash tables, not iptables chains.
+13. **NEVER blame IPAMD for transient "IP not in datastore" during cooldown** — 30s cooldown after pod deletion is normal.
+14. **NEVER blame VPC CNI or kube-proxy for conntrack table exhaustion** — It's a kernel resource limit, fix via nf_conntrack_max.
+15. **NEVER claim nm-cloud-setup is compatible with VPC CNI** — It overwrites per-ENI ip rules, breaking pod networking.
+16. **NEVER restart kube-proxy during API server outages** — Static stability keeps existing rules working.
