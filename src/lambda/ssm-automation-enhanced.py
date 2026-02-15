@@ -18,7 +18,7 @@ import os
 import re
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -5509,12 +5509,54 @@ def network_diagnostics(arguments: Dict) -> Dict:
     try:
         # Find the actual extracted bundle prefix (eks_{instance_id}_{execution_id}/extracted/)
         bundle_files = []
+        bundle_timestamps = {}  # key -> last_modified datetime
         search_result = safe_s3_list(f"eks_{instance_id}", max_keys=500)
         if search_result.get('success'):
-            bundle_files = [obj['key'] for obj in search_result.get('objects', []) if '/extracted/' in obj.get('key', '')]
+            for obj in search_result.get('objects', []):
+                key = obj.get('key', '')
+                if '/extracted/' in key:
+                    bundle_files.append(key)
+                    if obj.get('last_modified'):
+                        bundle_timestamps[key] = obj['last_modified']
 
         if not bundle_files:
             return error_response(404, f'No extracted log bundle found for {instance_id}. Run collect first.')
+
+        # If multiple bundles exist (multiple collect runs), use only the LATEST one
+        # Bundle key format: eks_{instance_id}_{execution_id}/extracted/...
+        # Group by bundle prefix (everything before /extracted/)
+        from collections import defaultdict
+        bundles_by_prefix = defaultdict(list)
+        for f in bundle_files:
+            prefix_part = f.split('/extracted/')[0] if '/extracted/' in f else f
+            bundles_by_prefix[prefix_part].append(f)
+
+        if len(bundles_by_prefix) > 1:
+            # Multiple bundles — pick the one with the newest file
+            latest_prefix = max(
+                bundles_by_prefix.keys(),
+                key=lambda p: max(
+                    (bundle_timestamps.get(f, datetime.min.replace(tzinfo=None)) for f in bundles_by_prefix[p]),
+                    default=datetime.min
+                )
+            )
+            bundle_files = bundles_by_prefix[latest_prefix]
+
+        # Calculate bundle age for staleness warning
+        bundle_age_minutes = None
+        bundle_collected_at = None
+        if bundle_timestamps:
+            newest_ts = max(
+                (ts for ts in bundle_timestamps.values() if ts is not None),
+                default=None
+            )
+            if newest_ts:
+                # Ensure timezone-aware comparison
+                now_utc = datetime.now(timezone.utc)
+                if newest_ts.tzinfo is None:
+                    newest_ts = newest_ts.replace(tzinfo=timezone.utc)
+                bundle_age_minutes = int((now_utc - newest_ts).total_seconds() / 60)
+                bundle_collected_at = newest_ts.isoformat()
 
         def find_files(patterns):
             """Find bundle files matching any of the given patterns."""
@@ -6605,22 +6647,123 @@ def network_diagnostics(arguments: Dict) -> Dict:
             pass  # SOP matching is best-effort
 
         sop_hint = ' Use get_sop to review the recommended SOPs for detailed remediation steps.' if recommended_sops else ''
-        response_data = {
-            'instanceId': instance_id,
-            'sections': sections,
-            'diagnostics': results,
-            'eksNetworkingContext': eks_context,
-            'issuesSummary': {
-                'total': total_issues,
-                'critical': critical_issues,
-                'warning': warning_issues,
-                'issues': issues_found,
-            },
-            'confidence': confidence,
-            'gaps': gaps,
-            'overallAssessment': _network_assessment(issues_found),
-            'nextStep': f'Review eksNetworkingContext guardrails before concluding on any networking issue. Use search tool only if you need a SPECIFIC pattern not already surfaced.{sop_hint}' if issues_found else 'No networking issues detected in the bundle.',
+
+        # =================================================================
+        # CRITICAL WARNINGS & ROOT CAUSE RANKING
+        # These appear FIRST in the response to prevent the agent from
+        # forming incorrect hypotheses before seeing the real issues.
+        # =================================================================
+        critical_warnings = []
+        root_cause_ranking = []
+
+        # Detect T1 scenario: empty KUBE-SERVICES + SGP config present
+        kube_svc_empty = any(
+            'KUBE-SERVICES chain is EMPTY' in i.get('message', '') or
+            'KUBE-SERVICES chain missing' in i.get('message', '')
+            for i in issues_found
+        )
+        sgp_config_present = cni_flags.get('podEni', False) or cni_flags.get('sgpMode', '') == 'strict'
+
+        if kube_svc_empty:
+            critical_warnings.append(
+                '>>> STOP: KUBE-SERVICES CHAIN IS EMPTY OR MISSING. '
+                'This means kube-proxy is NOT running or NOT syncing on this node. '
+                'ALL service ClusterIP/NodePort routing is broken. '
+                'This is the ROOT CAUSE of any service connectivity failure. '
+                'Do NOT blame VPC CNI config, SGP, podSGEnforcingMode, or any other CNI setting. '
+                'The VPC CNI NEVER touches KUBE-SERVICES — that chain is 100% owned by kube-proxy. '
+                'FIX: Check if kube-proxy pod is running on this node. <<<'
+            )
+            root_cause_ranking.append({
+                'rank': 1,
+                'cause': 'kube-proxy not running/syncing on this node',
+                'confidence': 'VERY HIGH',
+                'evidence': 'KUBE-SERVICES chain is empty — zero KUBE-SVC rules',
+                'owner': 'kube-proxy (NOT VPC CNI)',
+                'action': 'Check kube-proxy DaemonSet scheduling and pod status on this node',
+            })
+            if sgp_config_present:
+                critical_warnings.append(
+                    '>>> WARNING: podSGEnforcingMode=strict IS PRESENT but is NOT the cause. '
+                    'SGP enforcing mode ONLY affects pods with vpc.amazonaws.com/pod-eni annotation. '
+                    'It CANNOT empty the KUBE-SERVICES chain. It CANNOT block unannotated pods. '
+                    'The real problem is kube-proxy — see root cause ranking above. <<<'
+                )
+
+        # Detect kube-proxy not running (from kube_proxy section)
+        kp_data = results.get('kube_proxy', {})
+        kp_not_found = 'not found' in str(kp_data.get('issues', [])).lower() or not kp_data.get('versionInfo')
+        if kp_not_found and not kube_svc_empty:
+            root_cause_ranking.append({
+                'rank': 2,
+                'cause': 'kube-proxy process/config not found on node',
+                'confidence': 'HIGH',
+                'evidence': 'kube-proxy section returned no version or config data',
+                'owner': 'kube-proxy DaemonSet',
+                'action': 'Verify kube-proxy DaemonSet is scheduled to this node',
+            })
+
+        # Add CNI-related root causes only if they have real evidence
+        for issue in issues_found:
+            if issue.get('severity') == 'critical' and issue.get('section') != 'iptables':
+                root_cause_ranking.append({
+                    'rank': len(root_cause_ranking) + 1,
+                    'cause': issue['message'],
+                    'confidence': 'MEDIUM',
+                    'evidence': f"Detected in {issue['section']} section",
+                    'owner': issue['section'],
+                    'action': 'Review section details',
+                })
+
+        # Build response with CRITICAL_WARNINGS FIRST
+        response_data = {}
+
+        # These go FIRST so the agent sees them before any config data
+        if critical_warnings:
+            response_data['CRITICAL_WARNINGS'] = critical_warnings
+        if root_cause_ranking:
+            response_data['rootCauseRanking'] = root_cause_ranking
+
+        response_data['instanceId'] = instance_id
+
+        # Bundle freshness info — warn agent if analyzing stale data
+        STALE_THRESHOLD_MINUTES = 15
+        if bundle_age_minutes is not None:
+            response_data['bundleInfo'] = {
+                'collectedAt': bundle_collected_at,
+                'ageMinutes': bundle_age_minutes,
+                'isStale': bundle_age_minutes > STALE_THRESHOLD_MINUTES,
+            }
+            if bundle_age_minutes > STALE_THRESHOLD_MINUTES:
+                stale_warning = (
+                    f'>>> STALE DATA: This log bundle is {bundle_age_minutes} minutes old '
+                    f'(collected at {bundle_collected_at}). '
+                    f'The node state may have changed since collection. '
+                    f'Run the collect tool first to get fresh logs before drawing conclusions. <<<'
+                )
+                if 'CRITICAL_WARNINGS' not in response_data:
+                    response_data['CRITICAL_WARNINGS'] = []
+                # Prepend staleness warning so agent sees it first
+                response_data['CRITICAL_WARNINGS'].insert(0, stale_warning)
+
+        response_data['issuesSummary'] = {
+            'total': total_issues,
+            'critical': critical_issues,
+            'warning': warning_issues,
+            'issues': issues_found,
         }
+        response_data['overallAssessment'] = _network_assessment(issues_found)
+        response_data['eksNetworkingContext'] = eks_context
+        response_data['sections'] = sections
+        response_data['diagnostics'] = results
+        response_data['confidence'] = confidence
+        response_data['gaps'] = gaps
+        response_data['nextStep'] = (
+            f'FIRST: Read CRITICAL_WARNINGS and rootCauseRanking above — they identify the real issue. '
+            f'THEN: Review eksNetworkingContext guardrails before concluding on any networking issue. '
+            f'Do NOT blame VPC CNI config for issues owned by kube-proxy.{sop_hint}'
+            if issues_found else 'No networking issues detected in the bundle.'
+        )
         if recommended_sops:
             response_data['recommendedSOPs'] = recommended_sops
 
@@ -6635,6 +6778,17 @@ def _network_assessment(issues: List[Dict]) -> str:
     if not issues:
         return "HEALTHY — No networking issues detected in the log bundle."
     critical = [i for i in issues if i.get('severity') == 'critical']
+
+    # Special case: kube-proxy is the root cause — call it out explicitly
+    kube_proxy_down = any('KUBE-SERVICES' in i.get('message', '') for i in critical)
+    if kube_proxy_down:
+        return (
+            "CRITICAL — kube-proxy is NOT running or NOT syncing on this node. "
+            "KUBE-SERVICES chain is empty. ALL service routing (ClusterIP, NodePort) is broken. "
+            "This is the PRIMARY root cause. Do NOT investigate VPC CNI config, SGP, or "
+            "podSGEnforcingMode — they are NOT involved. Fix kube-proxy first."
+        )
+
     if critical:
         sections = set(i['section'] for i in critical)
         return f"CRITICAL — {len(critical)} critical networking issues in: {', '.join(sections)}. Immediate investigation needed."

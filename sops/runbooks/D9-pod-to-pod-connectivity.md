@@ -61,6 +61,22 @@ MAY:
 
 ## Phase 2 — Enrich
 
+### ⚠️ MANDATORY PRE-CHECK: Read CRITICAL_WARNINGS First
+
+Before investigating ANY VPC CNI configuration, you MUST:
+1. Check the `network_diagnostics` response for `CRITICAL_WARNINGS` and `rootCauseRanking` fields
+2. If `CRITICAL_WARNINGS` exists, the root cause is ALREADY IDENTIFIED — do not investigate further
+3. If `rootCauseRanking` shows kube-proxy as rank 1, the issue is kube-proxy NOT VPC CNI
+4. Do NOT form hypotheses about podSGEnforcingMode, SNAT, or any CNI config until you have ruled out kube-proxy
+
+### ⚠️ MANDATORY: kube-proxy vs CNI Ownership Check
+
+If service connectivity (ClusterIP, NodePort) is failing:
+- KUBE-SERVICES chain empty → kube-proxy issue, NOT CNI. Stop investigating CNI.
+- KUBE-SERVICES chain populated → kube-proxy is fine, investigate CNI/routing/SG.
+
+The VPC CNI NEVER creates, modifies, or reads KUBE-SERVICES chains. The string "KUBE-SERVICES" does not appear anywhere in the VPC CNI codebase. If KUBE-SERVICES is empty, no amount of CNI config changes will fix it.
+
 MUST work through these layers in order to isolate where packets are dropped:
 
 ### 2A — VPC CNI Health and Pod IP Assignment
