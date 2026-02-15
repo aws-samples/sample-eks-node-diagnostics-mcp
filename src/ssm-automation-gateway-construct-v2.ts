@@ -207,6 +207,22 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     this.logsBucket.grantReadWrite(this.ssmAutomationRole);
     if (this.encryptionKey) {
       this.encryptionKey.grantEncryptDecrypt(this.ssmAutomationRole);
+
+      // Allow any principal in this account to use the key for S3 uploads
+      // This is needed for EC2 instance roles (EKS worker nodes) to upload
+      // tcpdump captures and other artifacts via `aws s3 cp`
+      this.encryptionKey.addToResourcePolicy(new iam.PolicyStatement({
+        sid: 'AllowAccountPrincipalsEncrypt',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.AccountRootPrincipal()],
+        actions: ['kms:GenerateDataKey', 'kms:Encrypt', 'kms:Decrypt', 'kms:DescribeKey'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: {
+            'aws:PrincipalAccount': cdk.Stack.of(this).account,
+          },
+        },
+      }));
     }
 
     // Bucket policy to allow EC2 instances in the account to upload logs
