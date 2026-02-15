@@ -97,6 +97,14 @@ aws sso login --profile your-profile
 export AWS_PROFILE=your-profile
 ```
 
+### 6. crictl on Worker Nodes (for pod-level tcpdump)
+
+To capture network traffic inside a specific pod using `tcpdump_capture` with `podName`/`podNamespace`, the worker nodes need `crictl` installed to resolve the pod to a container PID. EKS-optimized AMIs include it by default, but custom AMIs may not.
+
+**Install crictl:** https://github.com/kubernetes-sigs/cri-tools/blob/master/docs/crictl.md
+
+> **Note:** Node-level captures (without `podName`) do not require crictl — they capture directly on the host network interface.
+
 ---
 
 ## Deployment
