@@ -8141,6 +8141,13 @@ exit 0
                     'podName': pod_name or None,
                     'podNamespace': pod_namespace if pod_name else None,
                     'startedAt': timestamp,
+                    'captureScope': 'podNamespace' if (pod_name or container_pid) else 'hostNamespace',
+                    'nsenterUsed': bool(pod_name or container_pid),
+                    'networkNamespace': (
+                        f'pod/{pod_namespace}/{pod_name}' if pod_name
+                        else f'container/PID-{container_pid}' if container_pid
+                        else 'host'
+                    ),
                 }),
             )
         except Exception:
@@ -8157,6 +8164,13 @@ exit 0
             'containerPid': container_pid or None,
             'podName': pod_name or None,
             'podNamespace': pod_namespace if pod_name else None,
+            'captureScope': 'podNamespace' if (pod_name or container_pid) else 'hostNamespace',
+            'nsenterUsed': bool(pod_name or container_pid),
+            'networkNamespace': (
+                f'pod/{pod_namespace}/{pod_name}' if pod_name
+                else f'container/PID-{container_pid}' if container_pid
+                else 'host'
+            ),
             's3Key': s3_key,
             's3KeyTxt': s3_key_txt,
             's3KeyStats': s3_key_stats,
@@ -8809,6 +8823,537 @@ def _analyze_coredns_transients(lines: list) -> Dict:
         }
 
 
+def _analyze_syn_flood(lines: list) -> Dict:
+    """Detect SYN flood / connection flood patterns.
+    A high ratio of SYN packets without corresponding SYN-ACK indicates either a SYN flood
+    attack or an overwhelmed service that can't accept connections fast enough."""
+    syn_re = re.compile(r'Flags\s+\[S\]', re.IGNORECASE)
+    synack_re = re.compile(r'Flags\s+\[S\.\]', re.IGNORECASE)
+    flow_re = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)')
+
+    syn_count = 0
+    synack_count = 0
+    syn_sources: Dict[str, int] = {}
+    syn_targets: Dict[str, int] = {}
+
+    for line in lines:
+        if synack_re.search(line):
+            synack_count += 1
+        elif syn_re.search(line):
+            syn_count += 1
+            m = flow_re.search(line)
+            if m:
+                src_ip = m.group(1)
+                dst = f"{m.group(3)}:{m.group(4)}"
+                syn_sources[src_ip] = syn_sources.get(src_ip, 0) + 1
+                syn_targets[dst] = syn_targets.get(dst, 0) + 1
+
+    if syn_count < 20:
+        return {}
+
+    result: Dict = {
+        'synCount': syn_count,
+        'synAckCount': synack_count,
+        'anomalies': [],
+    }
+
+    # Half-open ratio: SYN without SYN-ACK
+    if synack_count > 0:
+        half_open_ratio = (syn_count - synack_count) / syn_count
+    else:
+        half_open_ratio = 1.0 if syn_count > 0 else 0
+
+    top_sources = sorted(syn_sources.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_targets = sorted(syn_targets.items(), key=lambda x: x[1], reverse=True)[:5]
+    result['topSynSources'] = [{'ip': ip, 'count': c} for ip, c in top_sources]
+    result['topSynTargets'] = [{'target': t, 'count': c} for t, c in top_targets]
+
+    if half_open_ratio > 0.7 and syn_count > 50:
+        result['anomalies'].append({
+            'type': 'syn_flood',
+            'severity': 'critical',
+            'message': (
+                f'{syn_count} SYN packets but only {synack_count} SYN-ACK responses '
+                f'({half_open_ratio*100:.0f}% unanswered). Possible SYN flood attack or '
+                f'target service is overwhelmed/unreachable. Top source: '
+                f'{top_sources[0][0]} ({top_sources[0][1]} SYNs).'
+            ),
+        })
+    elif half_open_ratio > 0.4:
+        result['anomalies'].append({
+            'type': 'connection_pressure',
+            'severity': 'warning',
+            'message': (
+                f'{syn_count} SYN packets with {synack_count} SYN-ACK responses '
+                f'({half_open_ratio*100:.0f}% unanswered). Service may be under connection '
+                f'pressure or accept queue is full (check net.core.somaxconn).'
+            ),
+        })
+    elif syn_count > 200:
+        result['anomalies'].append({
+            'type': 'high_connection_rate',
+            'severity': 'info',
+            'message': (
+                f'{syn_count} new TCP connections in capture window. High but connections '
+                f'are being accepted ({synack_count} SYN-ACKs). Monitor for scaling needs.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_tcp_window_zero(lines: list) -> Dict:
+    """Detect TCP window zero events indicating receiver backpressure.
+    When a pod's receive buffer is full, it advertises window size 0, telling the sender
+    to stop. This indicates the application can't consume data fast enough — common with
+    overwhelmed services, slow consumers, or memory pressure."""
+    win_zero_re = re.compile(r'win\s+0\b', re.IGNORECASE)
+    flow_re = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)')
+
+    zero_window_count = 0
+    affected_flows: Dict[str, int] = {}
+
+    for line in lines:
+        if win_zero_re.search(line):
+            zero_window_count += 1
+            m = flow_re.search(line)
+            if m:
+                flow = f"{m.group(1)}:{m.group(2)}->{m.group(3)}:{m.group(4)}"
+                affected_flows[flow] = affected_flows.get(flow, 0) + 1
+
+    if zero_window_count == 0:
+        return {}
+
+    top_flows = sorted(affected_flows.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    result: Dict = {
+        'zeroWindowCount': zero_window_count,
+        'affectedFlows': len(affected_flows),
+        'topAffectedFlows': [{'flow': f, 'count': c} for f, c in top_flows],
+        'anomalies': [],
+    }
+
+    if zero_window_count > 20:
+        result['anomalies'].append({
+            'type': 'tcp_window_zero_critical',
+            'severity': 'critical',
+            'message': (
+                f'{zero_window_count} TCP zero-window events across {len(affected_flows)} '
+                f'flows. Receiver cannot consume data fast enough — application is overwhelmed. '
+                f'Check pod memory limits, application processing capacity, and consider '
+                f'horizontal scaling. Most affected: {top_flows[0][0]} ({top_flows[0][1]}x).'
+            ),
+        })
+    elif zero_window_count > 5:
+        result['anomalies'].append({
+            'type': 'tcp_window_zero_warning',
+            'severity': 'warning',
+            'message': (
+                f'{zero_window_count} TCP zero-window events detected. Receiver is '
+                f'experiencing backpressure — may indicate slow application processing '
+                f'or insufficient memory for socket buffers.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_retransmissions(lines: list) -> Dict:
+    """Detect TCP retransmission patterns indicating packet loss or network congestion.
+    Retransmissions show up as duplicate sequence numbers. High retransmission rates
+    indicate packet loss (security group drops, NACL drops, ENA throttling, or congestion)."""
+    retrans_re = re.compile(r'retransmit|retrans', re.IGNORECASE)
+    dup_ack_re = re.compile(r'dup\s+ack|duplicate\s+ack', re.IGNORECASE)
+    flow_re = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)')
+
+    retrans_count = 0
+    dup_ack_count = 0
+    retrans_flows: Dict[str, int] = {}
+
+    # Also detect retransmissions by looking for repeated seq numbers
+    seq_re = re.compile(r'seq\s+(\d+)[:\s]')
+    seen_seqs: Dict[str, set] = {}  # flow -> set of seq numbers
+
+    for line in lines:
+        if retrans_re.search(line):
+            retrans_count += 1
+            m = flow_re.search(line)
+            if m:
+                flow = f"{m.group(1)}->{m.group(3)}:{m.group(4)}"
+                retrans_flows[flow] = retrans_flows.get(flow, 0) + 1
+        if dup_ack_re.search(line):
+            dup_ack_count += 1
+
+        # Track seq numbers per flow for duplicate detection
+        m_flow = flow_re.search(line)
+        m_seq = seq_re.search(line)
+        if m_flow and m_seq:
+            flow_key = f"{m_flow.group(1)}->{m_flow.group(3)}:{m_flow.group(4)}"
+            seq_num = m_seq.group(1)
+            if flow_key not in seen_seqs:
+                seen_seqs[flow_key] = set()
+            if seq_num in seen_seqs[flow_key]:
+                retrans_count += 1
+                retrans_flows[flow_key] = retrans_flows.get(flow_key, 0) + 1
+            seen_seqs[flow_key].add(seq_num)
+
+    if retrans_count == 0 and dup_ack_count == 0:
+        return {}
+
+    top_flows = sorted(retrans_flows.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    result: Dict = {
+        'retransmissionCount': retrans_count,
+        'duplicateAckCount': dup_ack_count,
+        'affectedFlows': len(retrans_flows),
+        'topRetransmitFlows': [{'flow': f, 'count': c} for f, c in top_flows],
+        'anomalies': [],
+    }
+
+    total_packets = len(lines)
+    retrans_pct = (retrans_count / total_packets * 100) if total_packets > 0 else 0
+
+    if retrans_pct > 5:
+        result['anomalies'].append({
+            'type': 'high_retransmission_rate',
+            'severity': 'critical',
+            'message': (
+                f'{retrans_count} retransmissions ({retrans_pct:.1f}% of packets). '
+                f'Severe packet loss — check ENA throttling (linklocal_allowance_exceeded), '
+                f'security group/NACL drops, or network congestion. '
+                f'{len(retrans_flows)} flows affected.'
+            ),
+        })
+    elif retrans_pct > 1:
+        result['anomalies'].append({
+            'type': 'moderate_retransmission_rate',
+            'severity': 'warning',
+            'message': (
+                f'{retrans_count} retransmissions ({retrans_pct:.1f}% of packets). '
+                f'Moderate packet loss detected. Check for ENA bandwidth/PPS throttling '
+                f'or intermittent network issues.'
+            ),
+        })
+    elif retrans_count > 0:
+        result['anomalies'].append({
+            'type': 'low_retransmissions',
+            'severity': 'info',
+            'message': (
+                f'{retrans_count} retransmissions detected ({retrans_pct:.1f}%). '
+                f'Low level — within normal range for most workloads.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_connection_refused(lines: list) -> Dict:
+    """Detect connection refused patterns (RST immediately after SYN).
+    This indicates the target port is not listening — common when a pod hasn't started,
+    a service endpoint is stale, or a NetworkPolicy is blocking traffic."""
+    flow_re = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)')
+    syn_re = re.compile(r'Flags\s+\[S\]', re.IGNORECASE)
+    rst_re = re.compile(r'Flags\s+\[R\.?\]', re.IGNORECASE)
+
+    # Track SYN -> RST pairs (connection refused = RST right after SYN)
+    recent_syns: Dict[str, str] = {}  # "dst:port" -> src line
+    refused: Dict[str, int] = {}  # "dst:port" -> count
+
+    for line in lines:
+        m = flow_re.search(line)
+        if not m:
+            continue
+        src_ip, src_port, dst_ip, dst_port = m.groups()
+
+        if syn_re.search(line):
+            key = f"{dst_ip}:{dst_port}"
+            recent_syns[key] = src_ip
+        elif rst_re.search(line):
+            # RST coming FROM the destination back to source
+            reverse_key = f"{src_ip}:{src_port}"
+            if reverse_key in recent_syns:
+                refused[reverse_key] = refused.get(reverse_key, 0) + 1
+
+    if not refused:
+        return {}
+
+    top_refused = sorted(refused.items(), key=lambda x: x[1], reverse=True)[:10]
+    total_refused = sum(refused.values())
+
+    result: Dict = {
+        'totalConnectionRefused': total_refused,
+        'uniqueTargets': len(refused),
+        'topRefusedTargets': [{'target': t, 'count': c} for t, c in top_refused],
+        'anomalies': [],
+    }
+
+    if total_refused > 50:
+        result['anomalies'].append({
+            'type': 'mass_connection_refused',
+            'severity': 'critical',
+            'message': (
+                f'{total_refused} connections refused across {len(refused)} targets. '
+                f'Services are not listening or pods are not ready. Top target: '
+                f'{top_refused[0][0]} ({top_refused[0][1]}x refused). Check pod readiness, '
+                f'service endpoints, and NetworkPolicy rules.'
+            ),
+        })
+    elif total_refused > 10:
+        result['anomalies'].append({
+            'type': 'connection_refused',
+            'severity': 'warning',
+            'message': (
+                f'{total_refused} connections refused to {len(refused)} targets. '
+                f'Some services may not be ready or endpoints are stale.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_traffic_burst(lines: list) -> Dict:
+    """Detect traffic bursts by analyzing packet timestamps.
+    Identifies periods of abnormally high packet rates that could indicate
+    DDoS, thundering herd, or misconfigured retry storms."""
+    ts_re = re.compile(r'^(\d{2}:\d{2}:\d{2}\.\d+)\s')
+
+    # Group packets by second
+    packets_per_second: Dict[str, int] = {}
+    for line in lines:
+        m = ts_re.match(line)
+        if m:
+            ts = m.group(1).split('.')[0]  # truncate to second
+            packets_per_second[ts] = packets_per_second.get(ts, 0) + 1
+
+    if len(packets_per_second) < 5:
+        return {}
+
+    rates = list(packets_per_second.values())
+    avg_rate = sum(rates) / len(rates)
+    max_rate = max(rates)
+    max_ts = max(packets_per_second, key=packets_per_second.get)
+
+    # Find burst periods (>3x average)
+    burst_seconds = [(ts, count) for ts, count in packets_per_second.items()
+                     if count > avg_rate * 3 and count > 20]
+    burst_seconds.sort(key=lambda x: x[1], reverse=True)
+
+    result: Dict = {
+        'avgPacketsPerSecond': round(avg_rate, 1),
+        'maxPacketsPerSecond': max_rate,
+        'peakTime': max_ts,
+        'captureDurationSeconds': len(packets_per_second),
+        'anomalies': [],
+    }
+
+    if burst_seconds:
+        result['burstPeriods'] = [{'time': ts, 'packetsPerSecond': c}
+                                  for ts, c in burst_seconds[:10]]
+        if max_rate > avg_rate * 10 and max_rate > 100:
+            result['anomalies'].append({
+                'type': 'extreme_traffic_burst',
+                'severity': 'critical',
+                'message': (
+                    f'Extreme traffic burst: {max_rate} pps at {max_ts} vs average '
+                    f'{avg_rate:.0f} pps ({max_rate/avg_rate:.0f}x spike). '
+                    f'{len(burst_seconds)} burst periods detected. Possible DDoS, '
+                    f'retry storm, or thundering herd.'
+                ),
+            })
+        elif burst_seconds:
+            result['anomalies'].append({
+                'type': 'traffic_burst',
+                'severity': 'warning',
+                'message': (
+                    f'Traffic bursts detected: peak {max_rate} pps at {max_ts} vs '
+                    f'average {avg_rate:.0f} pps. {len(burst_seconds)} periods exceeded '
+                    f'3x average rate.'
+                ),
+            })
+
+    return result
+
+
+def _analyze_top_talkers(lines: list) -> Dict:
+    """Identify top bandwidth consumers and communication patterns.
+    Helps identify which pods/IPs are generating the most traffic and whether
+    traffic distribution is skewed (one pod hogging bandwidth)."""
+    flow_re = re.compile(
+        r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+).*length\s+(\d+)'
+    )
+
+    src_bytes: Dict[str, int] = {}
+    dst_bytes: Dict[str, int] = {}
+    src_packets: Dict[str, int] = {}
+    dst_packets: Dict[str, int] = {}
+    flow_bytes: Dict[str, int] = {}
+
+    for line in lines:
+        m = flow_re.search(line)
+        if m:
+            src_ip, src_port, dst_ip, dst_port, length = m.groups()
+            length = int(length)
+            src_bytes[src_ip] = src_bytes.get(src_ip, 0) + length
+            dst_bytes[dst_ip] = dst_bytes.get(dst_ip, 0) + length
+            src_packets[src_ip] = src_packets.get(src_ip, 0) + 1
+            dst_packets[dst_ip] = dst_packets.get(dst_ip, 0) + 1
+            flow_key = f"{src_ip}->{dst_ip}:{dst_port}"
+            flow_bytes[flow_key] = flow_bytes.get(flow_key, 0) + length
+
+    if not src_bytes:
+        return {}
+
+    top_src = sorted(src_bytes.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_dst = sorted(dst_bytes.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_flows = sorted(flow_bytes.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    total_bytes = sum(src_bytes.values())
+
+    result: Dict = {
+        'totalBytes': total_bytes,
+        'totalBytesHuman': f'{total_bytes/1024:.1f} KB' if total_bytes < 1048576 else f'{total_bytes/1048576:.1f} MB',
+        'uniqueSources': len(src_bytes),
+        'uniqueDestinations': len(dst_bytes),
+        'topSenders': [{'ip': ip, 'bytes': b, 'packets': src_packets.get(ip, 0)}
+                       for ip, b in top_src],
+        'topReceivers': [{'ip': ip, 'bytes': b, 'packets': dst_packets.get(ip, 0)}
+                         for ip, b in top_dst],
+        'topFlows': [{'flow': f, 'bytes': b} for f, b in top_flows],
+        'anomalies': [],
+    }
+
+    # Check for traffic skew — one source dominating
+    if top_src and total_bytes > 0:
+        top_pct = (top_src[0][1] / total_bytes) * 100
+        if top_pct > 80 and len(src_bytes) > 3:
+            result['anomalies'].append({
+                'type': 'traffic_skew',
+                'severity': 'warning',
+                'message': (
+                    f'Traffic heavily skewed: {top_src[0][0]} sends {top_pct:.0f}% of all '
+                    f'bytes ({top_src[0][1]} bytes). Possible bandwidth hog or '
+                    f'misconfigured client retry loop.'
+                ),
+            })
+
+    return result
+
+
+def _analyze_mtu_fragmentation(lines: list) -> Dict:
+    """Detect MTU/fragmentation issues from packet captures.
+    Fragmented packets indicate MTU mismatch. In EKS, the VPC MTU is typically 9001
+    (jumbo frames) but tunnels (VPN, VXLAN) or cross-AZ traffic may have lower MTU.
+    Excessive fragmentation causes performance degradation and can break PMTUD."""
+    frag_re = re.compile(r'frag\s+\d+|offset\s+\d+|flags\s+\[.*MF.*\]', re.IGNORECASE)
+    df_re = re.compile(r'flags\s+\[.*DF.*\]', re.IGNORECASE)
+    length_re = re.compile(r'length\s+(\d+)')
+
+    frag_count = 0
+    df_count = 0
+    large_packets = 0  # packets > 1500 bytes (jumbo)
+
+    for line in lines:
+        if frag_re.search(line):
+            frag_count += 1
+        if df_re.search(line):
+            df_count += 1
+        m = length_re.search(line)
+        if m and int(m.group(1)) > 1500:
+            large_packets += 1
+
+    if frag_count == 0 and large_packets == 0:
+        return {}
+
+    result: Dict = {
+        'fragmentedPackets': frag_count,
+        'dontFragmentPackets': df_count,
+        'jumboPackets': large_packets,
+        'anomalies': [],
+    }
+
+    if frag_count > 20:
+        result['anomalies'].append({
+            'type': 'excessive_fragmentation',
+            'severity': 'warning',
+            'message': (
+                f'{frag_count} fragmented packets detected. MTU mismatch likely — '
+                f'check if traffic crosses VPN tunnels, VXLAN overlays, or different '
+                f'MTU boundaries. Consider setting pod MTU explicitly or enabling PMTUD. '
+                f'EKS VPC default MTU is 9001 (jumbo frames).'
+            ),
+        })
+    elif frag_count > 0:
+        result['anomalies'].append({
+            'type': 'minor_fragmentation',
+            'severity': 'info',
+            'message': (
+                f'{frag_count} fragmented packets. Low level — may be normal for '
+                f'cross-region or VPN traffic.'
+            ),
+        })
+
+    return result
+
+
+def _analyze_conntrack_pressure(lines: list) -> Dict:
+    """Estimate conntrack table pressure from unique connection count.
+    Each TCP/UDP flow consumes a conntrack entry. Default nf_conntrack_max is 131072.
+    High unique flow counts in a short capture window suggest conntrack exhaustion risk."""
+    flow_re = re.compile(
+        r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)'
+    )
+
+    unique_flows = set()
+    for line in lines:
+        m = flow_re.search(line)
+        if m:
+            # Bidirectional: normalize so A->B and B->A count as one flow
+            src = f"{m.group(1)}:{m.group(2)}"
+            dst = f"{m.group(3)}:{m.group(4)}"
+            flow = tuple(sorted([src, dst]))
+            unique_flows.add(flow)
+
+    if len(unique_flows) < 100:
+        return {}
+
+    result: Dict = {
+        'uniqueFlows': len(unique_flows),
+        'anomalies': [],
+    }
+
+    # Default conntrack max is 131072; warn at 50% observed in a short window
+    if len(unique_flows) > 50000:
+        result['anomalies'].append({
+            'type': 'conntrack_exhaustion_risk',
+            'severity': 'critical',
+            'message': (
+                f'{len(unique_flows)} unique flows observed in capture window. '
+                f'Default nf_conntrack_max is 131072 — node may be at risk of '
+                f'conntrack table exhaustion. Check: '
+                f'cat /proc/sys/net/netfilter/nf_conntrack_count vs nf_conntrack_max. '
+                f'Symptoms: "nf_conntrack: table full, dropping packet" in dmesg.'
+            ),
+        })
+    elif len(unique_flows) > 10000:
+        result['anomalies'].append({
+            'type': 'high_flow_count',
+            'severity': 'warning',
+            'message': (
+                f'{len(unique_flows)} unique flows in capture window. Monitor conntrack '
+                f'usage — high flow counts can exhaust the conntrack table '
+                f'(default max 131072).'
+            ),
+        })
+    else:
+        result['anomalies'].append({
+            'type': 'flow_count_info',
+            'severity': 'info',
+            'message': f'{len(unique_flows)} unique flows observed. Within normal range.',
+        })
+
+    return result
+
+
 def tcpdump_analyze(arguments: Dict) -> Dict:
     """
     Read and analyze a completed tcpdump capture from S3.
@@ -8912,6 +9457,12 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
             'filter': metadata.get('filter', 'none'),
             'durationSeconds': metadata.get('durationSeconds', 0),
             'startedAt': metadata.get('startedAt', 'unknown'),
+            'captureScope': metadata.get('captureScope', 'hostNamespace'),
+            'nsenterUsed': metadata.get('nsenterUsed', False),
+            'networkNamespace': metadata.get('networkNamespace', 'host'),
+            'podName': metadata.get('podName'),
+            'podNamespace': metadata.get('podNamespace'),
+            'containerPid': metadata.get('containerPid'),
         },
     }
     if capture_age_warning:
@@ -8972,6 +9523,8 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
         results['anomalies'] = anomalies
 
     # Read decoded text summary
+    # NOTE: all_lines holds the FULL packet set for analysis; decoded_lines is truncated for response payload
+    all_lines = []
     if section in ('summary', 'all'):
         decoded_lines = []
         if s3_key_txt:
@@ -8980,13 +9533,14 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
                 if resp.get('success') and resp.get('content'):
                     all_lines = resp['content'].split('\n')
 
-                    # Apply text filter if provided
+                    # Apply text filter if provided (only for display, not analysis)
+                    display_lines = all_lines
                     if text_filter:
                         pattern = re.compile(re.escape(text_filter), re.IGNORECASE)
-                        all_lines = [l for l in all_lines if pattern.search(l)]
+                        display_lines = [l for l in all_lines if pattern.search(l)]
 
-                    total_lines = len(all_lines)
-                    decoded_lines = all_lines[:max_packets]
+                    total_lines = len(display_lines)
+                    decoded_lines = display_lines[:max_packets]
 
                     results['decodedPackets'] = {
                         'lines': decoded_lines,
@@ -8994,6 +9548,7 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
                         'returnedPackets': len(decoded_lines),
                         'truncated': total_lines > max_packets,
                         'filter': text_filter or 'none',
+                        'analyzedPackets': len(all_lines),
                     }
                 else:
                     results['decodedPackets'] = {'error': 'Text summary file is empty or unreadable'}
@@ -9002,9 +9557,9 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
         else:
             results['decodedPackets'] = {'error': 'No text summary file found — capture may still be in progress'}
 
-    # DNS analysis — scan decoded packets for DNS patterns
-    if section in ('summary', 'all') and decoded_lines:
-        dns_analysis = _analyze_dns_packets(decoded_lines)
+    # DNS analysis — scan ALL packets (not just truncated display lines)
+    if section in ('summary', 'all') and all_lines:
+        dns_analysis = _analyze_dns_packets(all_lines)
         if dns_analysis:
             results['dnsAnalysis'] = dns_analysis
             # Merge DNS anomalies into the main anomalies list
@@ -9013,41 +9568,82 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
             else:
                 results['anomalies'] = dns_analysis.get('anomalies', [])
 
-    # Expected behavior analysis — detect normal K8s/EKS network patterns
+    # Expected behavior analysis — run on ALL lines for full coverage
     # Each analyzer is independent and returns its own findings
-    if section in ('summary', 'all') and decoded_lines:
+    if section in ('summary', 'all') and all_lines:
         expected_behaviors = {}
         expected_anomalies = []
 
-        tcp_rst = _analyze_tcp_rst_patterns(decoded_lines)
+        tcp_rst = _analyze_tcp_rst_patterns(all_lines)
         if tcp_rst:
             expected_behaviors['tcpRstPatterns'] = tcp_rst
             expected_anomalies.extend(tcp_rst.get('anomalies', []))
 
-        dnat = _analyze_kube_proxy_dnat(decoded_lines)
+        dnat = _analyze_kube_proxy_dnat(all_lines)
         if dnat:
             expected_behaviors['kubeProxyDnat'] = dnat
             expected_anomalies.extend(dnat.get('anomalies', []))
 
-        snat = _analyze_vpc_cni_snat(decoded_lines)
+        snat = _analyze_vpc_cni_snat(all_lines)
         if snat:
             expected_behaviors['vpcCniSnat'] = snat
             expected_anomalies.extend(snat.get('anomalies', []))
 
-        keepalive = _analyze_tcp_keepalives(decoded_lines)
+        keepalive = _analyze_tcp_keepalives(all_lines)
         if keepalive:
             expected_behaviors['tcpKeepalives'] = keepalive
             expected_anomalies.extend(keepalive.get('anomalies', []))
 
-        icmp = _analyze_icmp_expected(decoded_lines)
+        icmp = _analyze_icmp_expected(all_lines)
         if icmp:
             expected_behaviors['icmpPatterns'] = icmp
             expected_anomalies.extend(icmp.get('anomalies', []))
 
-        coredns = _analyze_coredns_transients(decoded_lines)
+        coredns = _analyze_coredns_transients(all_lines)
         if coredns:
             expected_behaviors['corednsTransients'] = coredns
             expected_anomalies.extend(coredns.get('anomalies', []))
+
+        # ── Deep network analysis (complex issue detection) ──
+        syn_flood = _analyze_syn_flood(all_lines)
+        if syn_flood:
+            expected_behaviors['synFloodDetection'] = syn_flood
+            expected_anomalies.extend(syn_flood.get('anomalies', []))
+
+        win_zero = _analyze_tcp_window_zero(all_lines)
+        if win_zero:
+            expected_behaviors['tcpWindowZero'] = win_zero
+            expected_anomalies.extend(win_zero.get('anomalies', []))
+
+        retrans = _analyze_retransmissions(all_lines)
+        if retrans:
+            expected_behaviors['retransmissions'] = retrans
+            expected_anomalies.extend(retrans.get('anomalies', []))
+
+        conn_refused = _analyze_connection_refused(all_lines)
+        if conn_refused:
+            expected_behaviors['connectionRefused'] = conn_refused
+            expected_anomalies.extend(conn_refused.get('anomalies', []))
+
+        burst = _analyze_traffic_burst(all_lines)
+        if burst:
+            expected_behaviors['trafficBurst'] = burst
+            expected_anomalies.extend(burst.get('anomalies', []))
+
+        talkers = _analyze_top_talkers(all_lines)
+        if talkers:
+            expected_behaviors['topTalkers'] = talkers
+            expected_anomalies.extend(talkers.get('anomalies', []))
+
+        mtu_frag = _analyze_mtu_fragmentation(all_lines)
+        if mtu_frag:
+            expected_behaviors['mtuFragmentation'] = mtu_frag
+            expected_anomalies.extend(mtu_frag.get('anomalies', []))
+
+        conntrack = _analyze_conntrack_pressure(all_lines)
+        if conntrack:
+            expected_behaviors['conntrackPressure'] = conntrack
+            expected_anomalies.extend(conntrack.get('anomalies', []))
 
         if expected_behaviors:
             results['expectedBehaviors'] = expected_behaviors
