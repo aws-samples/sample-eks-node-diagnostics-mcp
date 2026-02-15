@@ -1733,6 +1733,91 @@ def generate_manifest(bucket, prefix, extracted_files, archive_key, archive_size
     except Exception as e:
         print(f"Warning: Failed to generate manifest.json: {str(e)}")
 
+def cleanup_old_bundles(bucket, current_archive_key, max_bundles_to_keep=2):
+    """Delete old bundles for the same instance, keeping only the N most recent.
+    
+    Bundle key format: eks_{instance_id}_{execution_id}.tar.gz
+    We group by instance_id, sort by LastModified, and delete the oldest.
+    """
+    try:
+        # Extract instance_id from key: eks_{instance_id}_{execution_id}.tar.gz
+        parts = current_archive_key.split('_')
+        if len(parts) < 3 or not parts[0].startswith('e'):
+            print(f"Cannot parse instance from key: {current_archive_key}, skipping cleanup")
+            return
+        
+        # instance_id is between first and last underscore-separated UUID
+        # Key format: eks_i-0014be4d4a0ea0543_94dc3448-b94b-470b-8f2d-99b81aad4c53.tar.gz
+        # or: ecs_i-0014be4d4a0ea0543_94dc3448-b94b-470b-8f2d-99b81aad4c53.tar.gz
+        prefix_type = parts[0]  # "eks" or "ecs"
+        instance_id = parts[1]  # "i-0014be4d4a0ea0543"
+        bundle_prefix = f"{prefix_type}_{instance_id}_"
+        
+        # List all archives for this instance
+        paginator = s3_client.get_paginator('list_objects_v2')
+        archives = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=bundle_prefix):
+            for obj in page.get('Contents', []):
+                k = obj['Key']
+                if k.endswith('.tar.gz') or k.endswith('.zip'):
+                    archives.append({
+                        'key': k,
+                        'last_modified': obj['LastModified'],
+                    })
+        
+        if len(archives) <= max_bundles_to_keep:
+            print(f"Only {len(archives)} bundles for {instance_id}, nothing to clean up")
+            return
+        
+        # Sort newest first, delete everything beyond max_bundles_to_keep
+        archives.sort(key=lambda a: a['last_modified'], reverse=True)
+        to_delete = archives[max_bundles_to_keep:]
+        
+        for old in to_delete:
+            old_key = old['key']
+            # Derive the extracted prefix from the archive key
+            if old_key.endswith('.tar.gz'):
+                extracted_prefix = old_key[:-7] + '/extracted/'
+            elif old_key.endswith('.zip'):
+                extracted_prefix = old_key[:-4] + '/extracted/'
+            else:
+                continue
+            
+            # Delete all extracted files for this bundle
+            del_keys = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=extracted_prefix):
+                for obj in page.get('Contents', []):
+                    del_keys.append({'Key': obj['Key']})
+            
+            # Also delete the archive itself and any manifest/findings_index
+            bundle_base = old_key.rsplit('.', 1)[0] if '.tar.' in old_key else old_key[:-4]
+            for page in paginator.paginate(Bucket=bucket, Prefix=bundle_base):
+                for obj in page.get('Contents', []):
+                    del_keys.append({'Key': obj['Key']})
+            
+            # Add the archive key itself
+            del_keys.append({'Key': old_key})
+            
+            # Deduplicate
+            seen = set()
+            unique_keys = []
+            for dk in del_keys:
+                if dk['Key'] not in seen:
+                    seen.add(dk['Key'])
+                    unique_keys.append(dk)
+            
+            if unique_keys:
+                # S3 delete_objects supports max 1000 keys per call
+                for i in range(0, len(unique_keys), 1000):
+                    batch = unique_keys[i:i+1000]
+                    s3_client.delete_objects(Bucket=bucket, Delete={'Objects': batch, 'Quiet': True})
+                print(f"Cleaned up old bundle: {old_key} ({len(unique_keys)} objects deleted)")
+        
+        print(f"Bundle cleanup complete for {instance_id}: kept {max_bundles_to_keep}, deleted {len(to_delete)} old bundles")
+    except Exception as e:
+        # Cleanup is best-effort — never fail the extraction because of it
+        print(f"Warning: Bundle cleanup failed (non-fatal): {str(e)}")
+
 def lambda_handler(event, context):
     print(f"Received event: {json.dumps(event)}")
     
@@ -1769,6 +1854,9 @@ def lambda_handler(event, context):
             
             # Trigger findings indexer
             trigger_findings_indexer(bucket, prefix, len(extracted_files))
+            
+            # Clean up old bundles — keep only the 2 most recent per instance
+            cleanup_old_bundles(bucket, key, max_bundles_to_keep=2)
             
         except (zipfile.BadZipFile, tarfile.TarError) as e:
             print(f"Error: {key} is not a valid archive: {str(e)}")

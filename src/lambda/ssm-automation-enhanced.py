@@ -1390,53 +1390,53 @@ def annotate_findings_with_baselines(findings: List[Dict], cluster_name: str) ->
 def find_findings_index(prefix: str) -> Optional[str]:
     """
     Find the findings index file for a log collection.
-    Searches for the most recent findings_index.json file.
+    Searches for the most recent findings_index.json file in the LATEST bundle only.
     
     Prefix format: eks_{instance_id} (without trailing slash or execution_id)
     Actual S3 structure: eks_{instance_id}_{execution_id}/extracted/findings_index.json
     """
-    # List all objects with this prefix (will match eks_i-xxx_* patterns)
-    list_result = safe_s3_list(prefix, max_keys=500)
+    # Extract instance_id from prefix (e.g., "eks_i-0014be4d4a0ea0543" -> "i-0014be4d4a0ea0543")
+    parts = prefix.split('_', 1)
+    instance_id = parts[1] if len(parts) > 1 else prefix
+    scheme = parts[0] if len(parts) > 1 else 'eks'
     
-    if list_result['success']:
-        # Find all findings index files and get the most recent one
-        index_files = [
-            obj for obj in list_result['objects']
-            if FINDINGS_INDEX_FILE in obj['key']
-        ]
-        
-        if index_files:
-            # Sort by last modified (most recent first)
-            index_files.sort(key=lambda x: x.get('last_modified', ''), reverse=True)
-            return index_files[0]['key']
+    bundle_info = find_latest_bundle_files(instance_id, prefix_scheme=scheme)
+    if not bundle_info['success']:
+        return None
     
-    return None
+    # Find findings index in the latest bundle only
+    index_files = [f for f in bundle_info['files'] if FINDINGS_INDEX_FILE in f]
+    return index_files[0] if index_files else None
 
 
 def scan_and_index_errors(instance_id: str, severity_filter: str, time_window: Dict = None) -> Dict:
     """Scan logs and build error index on-demand, filtered by time window."""
     prefix = f'eks_{instance_id}'
     
-    # List files to scan
-    list_result = safe_s3_list(prefix, max_keys=5000)
+    # Use shared latest-bundle discovery
+    bundle_info = find_latest_bundle_files(instance_id)
     
-    if not list_result['success']:
+    if not bundle_info['success']:
         return success_response({
             'instanceId': instance_id,
             'findings': [],
             'totalFindings': 0,
             'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0},
             'cached': False,
-            'warning': list_result.get('error', 'Failed to list log files'),
+            'warning': bundle_info.get('error', 'Failed to list log files'),
             **(TimeWindowResolver.window_metadata(time_window) if time_window else {}),
         })
     
-    # Filter for text files in extracted folder
+    # Build obj-like dicts for size filtering (need size info from all_objects)
+    latest_keys = set(bundle_info['files'])
+    size_map = {obj['key']: obj['size'] for obj in bundle_info['all_objects']}
+    
+    # Filter for text files in latest extracted bundle only
     files_to_scan = [
-        obj for obj in list_result['objects']
-        if '/extracted/' in obj['key']
-        and not any(obj['key'].endswith(ext) for ext in ['.tar.gz', '.zip', '.gz', '.bin', '.so'])
-        and obj['size'] < 10485760  # Skip files >10MB
+        {'key': k, 'size': size_map.get(k, 0)}
+        for k in latest_keys
+        if not any(k.endswith(ext) for ext in ['.tar.gz', '.zip', '.gz', '.bin', '.so'])
+        and size_map.get(k, 0) < 10485760  # Skip files >10MB
     ]
     
     findings = []
@@ -2536,6 +2536,79 @@ def safe_s3_list(prefix: str, max_keys: int = 1000) -> Dict:
         }
 
 
+def find_latest_bundle_files(instance_id: str, prefix_scheme: str = 'eks') -> Dict:
+    """
+    Shared helper: discover the LATEST extracted bundle for an instance.
+    Returns only files from the most recent bundle (by last_modified timestamp).
+    
+    Returns:
+        {
+            'success': True/False,
+            'files': [list of S3 keys in the latest bundle],
+            'bundle_prefix': 'eks_{id}_{exec_id}',
+            'bundle_age_minutes': int or None,
+            'bundle_collected_at': ISO string or None,
+            'all_objects': [raw S3 objects for non-extracted use cases],
+            'error': str (only if success=False),
+        }
+    """
+    search_result = safe_s3_list(f"{prefix_scheme}_{instance_id}", max_keys=5000)
+    if not search_result.get('success'):
+        return {'success': False, 'files': [], 'all_objects': [], 'error': search_result.get('error', 'S3 list failed')}
+
+    all_objects = search_result.get('objects', [])
+    bundle_files = []
+    bundle_timestamps = {}
+    for obj in all_objects:
+        key = obj.get('key', '')
+        if '/extracted/' in key:
+            bundle_files.append(key)
+            if obj.get('last_modified'):
+                bundle_timestamps[key] = obj['last_modified']
+
+    if not bundle_files:
+        return {'success': False, 'files': [], 'all_objects': all_objects, 'error': f'No extracted log bundle found for {instance_id}. Run collect first.'}
+
+    # Group by bundle prefix (everything before /extracted/)
+    from collections import defaultdict
+    bundles_by_prefix = defaultdict(list)
+    for f in bundle_files:
+        prefix_part = f.split('/extracted/')[0] if '/extracted/' in f else f
+        bundles_by_prefix[prefix_part].append(f)
+
+    # Pick the bundle with the newest file
+    latest_prefix = max(
+        bundles_by_prefix.keys(),
+        key=lambda p: max(
+            (bundle_timestamps.get(f, datetime.min.replace(tzinfo=None)) for f in bundles_by_prefix[p]),
+            default=datetime.min
+        )
+    )
+    latest_files = bundles_by_prefix[latest_prefix]
+
+    # Calculate bundle age
+    bundle_age_minutes = None
+    bundle_collected_at = None
+    if bundle_timestamps:
+        ts_values = [ts for f in latest_files for ts in [bundle_timestamps.get(f)] if ts is not None]
+        if ts_values:
+            newest_ts = max(ts_values)
+            now_utc = datetime.now(timezone.utc)
+            if newest_ts.tzinfo is None:
+                newest_ts = newest_ts.replace(tzinfo=timezone.utc)
+            bundle_age_minutes = int((now_utc - newest_ts).total_seconds() / 60)
+            bundle_collected_at = newest_ts.isoformat()
+
+    return {
+        'success': True,
+        'files': latest_files,
+        'bundle_prefix': latest_prefix,
+        'bundle_age_minutes': bundle_age_minutes,
+        'bundle_collected_at': bundle_collected_at,
+        'all_objects': all_objects,
+    }
+
+
 def list_sops(arguments: Dict) -> Dict:
     """List all SOPs in the SOP S3 bucket."""
     sop_bucket = os.environ.get('SOP_BUCKET_NAME', '')
@@ -2967,10 +3040,10 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
             except Exception as e:
                 return error_response(500, f'Failed to get execution details: {str(e)}')
         
-        # List all files using safe helper
-        list_result = safe_s3_list(prefix, max_keys=5000)
+        # Use shared latest-bundle discovery
+        bundle_info = find_latest_bundle_files(instance_id)
         
-        if not list_result['success']:
+        if not bundle_info['success']:
             # Return partial result even if listing fails
             return success_response({
                 'complete': False,
@@ -2982,19 +3055,19 @@ def validate_bundle_completeness(arguments: Dict) -> Dict:
                 'hasFindingsIndex': False,
                 'instanceId': instance_id,
                 'manifest': [],
-                'warning': list_result.get('error', 'Failed to list files'),
+                'warning': bundle_info.get('error', 'Failed to list files'),
                 'nextStep': 'Check if log collection completed successfully'
             })
         
-        # Filter for extracted files
+        # Filter for extracted files — already filtered to latest bundle
+        size_map = {obj['key']: obj for obj in bundle_info['all_objects']}
         all_files = [
-            obj for obj in list_result['objects']
-            if '/extracted/' in obj['key']
+            size_map[k] for k in bundle_info['files'] if k in size_map
         ]
         
-        
-        manifest_data = None
-        manifest_files = [obj for obj in list_result['objects'] if obj['key'].endswith('manifest.json')]
+        # Manifest: look in the latest bundle prefix
+        manifest_files = [obj for obj in bundle_info['all_objects'] 
+                         if obj['key'].endswith('manifest.json') and obj['key'].startswith(bundle_info['bundle_prefix'])]
         if manifest_files:
             manifest_files.sort(key=lambda x: x.get('last_modified', ''), reverse=True)
             manifest_read = safe_s3_read(manifest_files[0]['key'])
@@ -3543,11 +3616,10 @@ def search_logs_deep(arguments: Dict) -> Dict:
                 if log_type in LOG_TYPE_PATTERNS:
                     file_patterns.extend(LOG_TYPE_PATTERNS[log_type])
         
-        # List files to search using safe helper
-        prefix = f'eks_{instance_id}'
-        list_result = safe_s3_list(prefix, max_keys=5000)
+        # Use shared latest-bundle discovery
+        bundle_info = find_latest_bundle_files(instance_id)
         
-        if not list_result['success']:
+        if not bundle_info['success']:
             return success_response({
                 'instanceId': instance_id,
                 'query': query,
@@ -3556,22 +3628,20 @@ def search_logs_deep(arguments: Dict) -> Dict:
                 'totalMatches': 0,
                 'results': [],
                 'truncated': False,
-                'warning': list_result.get('error', 'Failed to list log files'),
+                'warning': bundle_info.get('error', 'Failed to list log files'),
                 'nextStep': 'Check if logs exist with validate'
             })
         
-        # Filter files to search
+        # Filter files to search — already scoped to latest bundle
         files_to_search = []
         large_file_count = 0
-        for obj in list_result['objects']:
-            key = obj['key']
-            if '/extracted/' not in key:
-                continue
+        size_map = {obj['key']: obj['size'] for obj in bundle_info['all_objects']}
+        for key in bundle_info['files']:
             if any(key.endswith(ext) for ext in ['.tar.gz', '.zip', '.gz', '.bin', '.so']):
                 continue
             
-            
-            if obj['size'] > 52428800:  # Only skip truly huge files >50MB
+            fsize = size_map.get(key, 0)
+            if fsize > 52428800:  # Only skip truly huge files >50MB
                 large_file_count += 1
                 continue
             
@@ -3582,7 +3652,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
             
             files_to_search.append({
                 'key': key,
-                'size': obj['size']
+                'size': fsize
             })
         
         # Handle no files found
@@ -4940,14 +5010,11 @@ def compare_nodes(arguments: Dict) -> Dict:
                     nf = [{'error': f'Could not load findings: {str(e)}'}]
 
             if compare_fields in ('config', 'all'):
-                # Find the actual extracted bundle prefix (eks_{iid}_{execution_id}/extracted/)
-                list_result = safe_s3_list(f"eks_{iid}", max_keys=50)
+                # Use shared latest-bundle discovery
+                bundle_info = find_latest_bundle_files(iid)
                 extracted_prefix = None
-                if list_result.get('success'):
-                    for obj in list_result.get('objects', []):
-                        if '/extracted/' in obj['key']:
-                            extracted_prefix = obj['key'].split('/extracted/')[0] + '/extracted/'
-                            break
+                if bundle_info['success']:
+                    extracted_prefix = bundle_info['bundle_prefix'] + '/extracted/'
 
                 if extracted_prefix:
                     config_files = [
@@ -5507,56 +5574,33 @@ def network_diagnostics(arguments: Dict) -> Dict:
     issues_found = []
 
     try:
-        # Find the actual extracted bundle prefix (eks_{instance_id}_{execution_id}/extracted/)
-        bundle_files = []
-        bundle_timestamps = {}  # key -> last_modified datetime
-        search_result = safe_s3_list(f"eks_{instance_id}", max_keys=500)
-        if search_result.get('success'):
-            for obj in search_result.get('objects', []):
-                key = obj.get('key', '')
-                if '/extracted/' in key:
-                    bundle_files.append(key)
-                    if obj.get('last_modified'):
-                        bundle_timestamps[key] = obj['last_modified']
+        # Use shared latest-bundle discovery
+        bundle_info = find_latest_bundle_files(instance_id)
+        if not bundle_info['success']:
+            return error_response(404, bundle_info.get('error', f'No extracted log bundle found for {instance_id}. Run collect first.'))
 
-        if not bundle_files:
-            return error_response(404, f'No extracted log bundle found for {instance_id}. Run collect first.')
+        bundle_files = bundle_info['files']
+        bundle_age_minutes = bundle_info['bundle_age_minutes']
+        bundle_collected_at = bundle_info['bundle_collected_at']
 
-        # If multiple bundles exist (multiple collect runs), use only the LATEST one
-        # Bundle key format: eks_{instance_id}_{execution_id}/extracted/...
-        # Group by bundle prefix (everything before /extracted/)
-        from collections import defaultdict
-        bundles_by_prefix = defaultdict(list)
-        for f in bundle_files:
-            prefix_part = f.split('/extracted/')[0] if '/extracted/' in f else f
-            bundles_by_prefix[prefix_part].append(f)
-
-        if len(bundles_by_prefix) > 1:
-            # Multiple bundles — pick the one with the newest file
-            latest_prefix = max(
-                bundles_by_prefix.keys(),
-                key=lambda p: max(
-                    (bundle_timestamps.get(f, datetime.min.replace(tzinfo=None)) for f in bundles_by_prefix[p]),
-                    default=datetime.min
-                )
-            )
-            bundle_files = bundles_by_prefix[latest_prefix]
-
-        # Calculate bundle age for staleness warning
-        bundle_age_minutes = None
-        bundle_collected_at = None
-        if bundle_timestamps:
-            newest_ts = max(
-                (ts for ts in bundle_timestamps.values() if ts is not None),
-                default=None
-            )
-            if newest_ts:
-                # Ensure timezone-aware comparison
-                now_utc = datetime.now(timezone.utc)
-                if newest_ts.tzinfo is None:
-                    newest_ts = newest_ts.replace(tzinfo=timezone.utc)
-                bundle_age_minutes = int((now_utc - newest_ts).total_seconds() / 60)
-                bundle_collected_at = newest_ts.isoformat()
+        # HARD BLOCK: Do NOT analyze stale bundles — force fresh collection
+        STALE_THRESHOLD_MINUTES = 15
+        if bundle_age_minutes is not None and bundle_age_minutes > STALE_THRESHOLD_MINUTES:
+            return error_response(409, (
+                f'STALE BUNDLE: The log bundle for {instance_id} is {bundle_age_minutes} minutes old '
+                f'(collected at {bundle_collected_at}). The node state has likely changed since then. '
+                f'You MUST run the collect tool first to gather fresh logs, wait for it to complete '
+                f'(poll status until success), then call network_diagnostics again. '
+                f'Do NOT draw conclusions from stale data.'
+            ), {
+                'bundleInfo': {
+                    'collectedAt': bundle_collected_at,
+                    'ageMinutes': bundle_age_minutes,
+                    'isStale': True,
+                    'staleThresholdMinutes': STALE_THRESHOLD_MINUTES,
+                },
+                'action': 'Run collect tool, poll status until complete, then retry network_diagnostics',
+            })
 
         def find_files(patterns):
             """Find bundle files matching any of the given patterns."""
@@ -5575,7 +5619,7 @@ def network_diagnostics(arguments: Dict) -> Dict:
         fetch_sizes = {}  # key -> max_size
 
         if 'iptables' in sections:
-            keys = find_files(['iptables', 'ip-tables', 'iptable'])[:3]
+            keys = find_files(['iptables', 'ip-tables', 'iptable'])[:6]
             section_file_map['iptables'] = keys
             for k in keys: files_to_fetch.add(k); fetch_sizes[k] = 262144
         if 'cni' in sections:
@@ -5641,75 +5685,125 @@ def network_diagnostics(arguments: Dict) -> Dict:
         # =====================================================================
         if 'iptables' in sections:
             ipt_data = {'raw': None, 'chainCount': 0, 'ruleCount': 0, 'natRules': [], 'kubeProxyRules': [], 'snatRules': [], 'dnatRules': [], 'issues': []}
+
+            # BUG FIX: Parse ALL iptables files and merge results.
+            # KUBE-SVC/DNAT/SNAT/MASQUERADE rules live in the NAT table (iptables-nat.txt),
+            # while FORWARD policy and filter chains live in iptables-filter.txt.
+            # Previously we broke after the first file (usually iptables-filter.txt sorted first),
+            # which meant kubeSvcRuleCount was always 0 even when kube-proxy was healthy.
             ipt_files = find_files(['iptables', 'ip-tables', 'iptable'])
-            for f in ipt_files[:3]:
+
+            # Accumulate across ALL iptables files
+            all_lines_merged = []       # all lines from all files
+            all_nat_rules = []
+            all_snat_rules = []
+            all_dnat_rules = []
+            all_kube_rules = []
+            all_aws_cni_chains = []
+            all_forward_policy = []
+            total_rule_count = 0
+            total_chain_count = 0
+            source_files = []
+
+            # Prefer iptables-save.txt (contains ALL tables) if available, otherwise merge individual files
+            save_file = None
+            nat_file = None
+            filter_file = None
+            for f in ipt_files:
+                fl = f.lower()
+                if 'iptables-save' in fl or 'iptables_save' in fl:
+                    save_file = f
+                elif 'iptables-nat' in fl or 'iptables_nat' in fl:
+                    nat_file = f
+                elif 'iptables-filter' in fl or 'iptables_filter' in fl:
+                    filter_file = f
+
+            # Determine which files to parse: prefer save file, else merge all unique files
+            if save_file:
+                files_to_parse = [save_file]
+            else:
+                # Parse all available iptables files (filter, nat, mangle, etc.)
+                files_to_parse = ipt_files[:6]  # up to 6 files
+
+            for f in files_to_parse:
                 content = read_file_content(f)
-                if content:
-                    lines = content.split('\n')
-                    ipt_data['ruleCount'] = sum(1 for l in lines if l.strip() and not l.startswith('#') and not l.startswith('*') and not l.startswith(':'))
-                    ipt_data['chainCount'] = sum(1 for l in lines if l.startswith(':'))
-                    ipt_data['natRules'] = [l.strip() for l in lines if 'DNAT' in l or 'SNAT' in l or 'MASQUERADE' in l][:30]
-                    ipt_data['snatRules'] = [l.strip() for l in lines if 'SNAT' in l or 'MASQUERADE' in l][:20]
-                    ipt_data['dnatRules'] = [l.strip() for l in lines if 'DNAT' in l][:20]
-                    ipt_data['kubeProxyRules'] = [l.strip() for l in lines if 'KUBE-' in l][:30]
-                    # AWS VPC CNI specific chains
-                    ipt_data['awsCniChains'] = [l.strip() for l in lines if 'AWS-SNAT' in l or 'AWS-CONNMARK' in l or 'PREROUTING' in l][:20]
+                if not content:
+                    continue
+                lines = content.splitlines()
+                source_files.append(f)
+                all_lines_merged.extend(lines)
 
-                    # --- FORWARD policy check (EKS guardrail) ---
-                    # Custom AMIs often set iptables FORWARD policy to DROP which breaks pod networking.
-                    # AWS docs: "If using a custom AMI, make sure to set the iptables forward policy to ACCEPT under kubelet.service"
-                    forward_policy_lines = [l.strip() for l in lines if ':FORWARD' in l]
-                    ipt_data['forwardPolicy'] = forward_policy_lines[:5] if forward_policy_lines else []
-                    has_forward_drop = any('DROP' in l for l in forward_policy_lines)
-                    if has_forward_drop:
-                        ipt_data['issues'].append(
-                            'iptables FORWARD policy is DROP — this breaks pod networking on EKS. '
-                            'Custom AMIs must set FORWARD policy to ACCEPT under kubelet.service. '
-                            'Fix: add "ExecStartPre=/sbin/iptables -P FORWARD ACCEPT" to kubelet.service.'
-                        )
-                        issues_found.append({'section': 'iptables', 'severity': 'critical',
-                                             'message': 'iptables FORWARD policy is DROP (breaks pod networking on custom AMIs)'})
+                total_rule_count += sum(1 for l in lines if l.strip() and not l.startswith('#') and not l.startswith('*') and not l.startswith(':'))
+                total_chain_count += sum(1 for l in lines if l.startswith(':'))
+                all_nat_rules.extend(l.strip() for l in lines if 'DNAT' in l or 'SNAT' in l or 'MASQUERADE' in l)
+                all_snat_rules.extend(l.strip() for l in lines if 'SNAT' in l or 'MASQUERADE' in l)
+                all_dnat_rules.extend(l.strip() for l in lines if 'DNAT' in l)
+                all_kube_rules.extend(l.strip() for l in lines if 'KUBE-' in l)
+                all_aws_cni_chains.extend(l.strip() for l in lines if 'AWS-SNAT' in l or 'AWS-CONNMARK' in l or 'PREROUTING' in l)
+                all_forward_policy.extend(l.strip() for l in lines if ':FORWARD' in l)
 
-                    # Check for issues
-                    if ipt_data['ruleCount'] == 0:
-                        ipt_data['issues'].append('No iptables rules found — kube-proxy may not be running')
-                        issues_found.append({'section': 'iptables', 'severity': 'critical', 'message': 'No iptables rules found'})
-                    if not any('KUBE-SERVICES' in l for l in lines):
-                        ipt_data['issues'].append('KUBE-SERVICES chain missing — kube-proxy not configured')
-                        issues_found.append({'section': 'iptables', 'severity': 'warning', 'message': 'KUBE-SERVICES chain missing'})
+            ipt_data['ruleCount'] = total_rule_count
+            ipt_data['chainCount'] = total_chain_count
+            ipt_data['natRules'] = all_nat_rules[:30]
+            ipt_data['snatRules'] = all_snat_rules[:20]
+            ipt_data['dnatRules'] = all_dnat_rules[:20]
+            ipt_data['kubeProxyRules'] = all_kube_rules[:30]
+            ipt_data['awsCniChains'] = all_aws_cni_chains[:20]
+            ipt_data['sourceFiles'] = source_files
+            # Keep legacy sourceFile for backward compat
+            ipt_data['sourceFile'] = source_files[0] if source_files else None
 
-                    # CRITICAL CHECK: KUBE-SERVICES chain exists but has NO KUBE-SVC rules
-                    # This means kube-proxy is not syncing rules — ClusterIP traffic will time out
-                    has_kube_services_chain = any('KUBE-SERVICES' in l for l in lines)
-                    kube_svc_rules = [l for l in lines if 'KUBE-SVC-' in l]
-                    ipt_data['kubeSvcRuleCount'] = len(kube_svc_rules)
-                    if has_kube_services_chain and len(kube_svc_rules) == 0:
-                        ipt_data['issues'].append(
-                            'CRITICAL: KUBE-SERVICES chain EXISTS but contains ZERO KUBE-SVC rules. '
-                            'This means kube-proxy is NOT syncing service rules on this node. '
-                            'ALL ClusterIP/NodePort service traffic will TIME OUT because there are no '
-                            'DNAT rules to translate Service IPs to pod IPs. '
-                            'Root cause: kube-proxy is either not running, was recently restarted and has not '
-                            'synced yet, or cannot reach the API server. '
-                            'CHECK IMMEDIATELY: Is kube-proxy pod running on this node? '
-                            '(kubectl get pods -n kube-system -l k8s-app=kube-proxy --field-selector spec.nodeName=<node>)'
-                        )
-                        issues_found.append({'section': 'iptables', 'severity': 'critical',
-                                             'message': 'KUBE-SERVICES chain is EMPTY (0 KUBE-SVC rules) — kube-proxy not syncing, all ClusterIP traffic will fail'})
+            if all_lines_merged:
+                # --- FORWARD policy check (EKS guardrail) ---
+                ipt_data['forwardPolicy'] = all_forward_policy[:5] if all_forward_policy else []
+                has_forward_drop = any('DROP' in l for l in all_forward_policy)
+                if has_forward_drop:
+                    ipt_data['issues'].append(
+                        'iptables FORWARD policy is DROP — this breaks pod networking on EKS. '
+                        'Custom AMIs must set FORWARD policy to ACCEPT under kubelet.service. '
+                        'Fix: add "ExecStartPre=/sbin/iptables -P FORWARD ACCEPT" to kubelet.service.'
+                    )
+                    issues_found.append({'section': 'iptables', 'severity': 'critical',
+                                         'message': 'iptables FORWARD policy is DROP (breaks pod networking on custom AMIs)'})
 
-                    # Check VPC CNI SNAT — cross-reference with CNI config for external SNAT
-                    has_snat = any('SNAT' in l or 'MASQUERADE' in l for l in lines)
-                    has_aws_snat_chain = any('AWS-SNAT-CHAIN' in l for l in lines)
-                    ipt_data['_snat_present'] = has_snat  # internal flag for cross-reference
-                    if not has_snat:
-                        # Defer severity — will be adjusted after CNI section if external SNAT is enabled
-                        ipt_data['issues'].append('No SNAT/MASQUERADE rules found in iptables (see eksNetworkingContext for interpretation)')
-                        issues_found.append({'section': 'iptables', 'severity': 'info',
-                                             'message': 'No SNAT rules — may be expected if AWS_VPC_K8S_CNI_EXTERNALSNAT=true (NAT gateway handles SNAT)'})
-                    if has_aws_snat_chain:
-                        ipt_data['vpcCniSnat'] = 'AWS-SNAT-CHAIN present (VPC CNI managing SNAT)'
-                    ipt_data['sourceFile'] = f
-                    break
+                # Check for issues
+                if total_rule_count == 0:
+                    ipt_data['issues'].append('No iptables rules found — kube-proxy may not be running')
+                    issues_found.append({'section': 'iptables', 'severity': 'critical', 'message': 'No iptables rules found'})
+                if not any('KUBE-SERVICES' in l for l in all_lines_merged):
+                    ipt_data['issues'].append('KUBE-SERVICES chain missing — kube-proxy not configured')
+                    issues_found.append({'section': 'iptables', 'severity': 'warning', 'message': 'KUBE-SERVICES chain missing'})
+
+                # CRITICAL CHECK: KUBE-SERVICES chain exists but has NO KUBE-SVC rules
+                # Now checks across ALL tables (filter + nat + save) so nat table KUBE-SVC rules are counted
+                has_kube_services_chain = any('KUBE-SERVICES' in l for l in all_lines_merged)
+                kube_svc_rules = [l for l in all_lines_merged if 'KUBE-SVC-' in l]
+                ipt_data['kubeSvcRuleCount'] = len(kube_svc_rules)
+                if has_kube_services_chain and len(kube_svc_rules) == 0:
+                    ipt_data['issues'].append(
+                        'CRITICAL: KUBE-SERVICES chain EXISTS but contains ZERO KUBE-SVC rules. '
+                        'This means kube-proxy is NOT syncing service rules on this node. '
+                        'ALL ClusterIP/NodePort service traffic will TIME OUT because there are no '
+                        'DNAT rules to translate Service IPs to pod IPs. '
+                        'Root cause: kube-proxy is either not running, was recently restarted and has not '
+                        'synced yet, or cannot reach the API server. '
+                        'CHECK IMMEDIATELY: Is kube-proxy pod running on this node? '
+                        '(kubectl get pods -n kube-system -l k8s-app=kube-proxy --field-selector spec.nodeName=<node>)'
+                    )
+                    issues_found.append({'section': 'iptables', 'severity': 'critical',
+                                         'message': 'KUBE-SERVICES chain is EMPTY (0 KUBE-SVC rules) — kube-proxy not syncing, all ClusterIP traffic will fail'})
+
+                # Check VPC CNI SNAT — cross-reference with CNI config for external SNAT
+                has_snat = any('SNAT' in l or 'MASQUERADE' in l for l in all_lines_merged)
+                has_aws_snat_chain = any('AWS-SNAT-CHAIN' in l for l in all_lines_merged)
+                ipt_data['_snat_present'] = has_snat
+                if not has_snat:
+                    ipt_data['issues'].append('No SNAT/MASQUERADE rules found in iptables (see eksNetworkingContext for interpretation)')
+                    issues_found.append({'section': 'iptables', 'severity': 'info',
+                                         'message': 'No SNAT rules — may be expected if AWS_VPC_K8S_CNI_EXTERNALSNAT=true (NAT gateway handles SNAT)'})
+                if has_aws_snat_chain:
+                    ipt_data['vpcCniSnat'] = 'AWS-SNAT-CHAIN present (VPC CNI managing SNAT)'
+
             results['iptables'] = ipt_data
 
         # =====================================================================
@@ -6726,25 +6820,13 @@ def network_diagnostics(arguments: Dict) -> Dict:
 
         response_data['instanceId'] = instance_id
 
-        # Bundle freshness info — warn agent if analyzing stale data
-        STALE_THRESHOLD_MINUTES = 15
+        # Bundle freshness info (stale bundles are already rejected above, so this is always fresh)
         if bundle_age_minutes is not None:
             response_data['bundleInfo'] = {
                 'collectedAt': bundle_collected_at,
                 'ageMinutes': bundle_age_minutes,
-                'isStale': bundle_age_minutes > STALE_THRESHOLD_MINUTES,
+                'isStale': False,
             }
-            if bundle_age_minutes > STALE_THRESHOLD_MINUTES:
-                stale_warning = (
-                    f'>>> STALE DATA: This log bundle is {bundle_age_minutes} minutes old '
-                    f'(collected at {bundle_collected_at}). '
-                    f'The node state may have changed since collection. '
-                    f'Run the collect tool first to get fresh logs before drawing conclusions. <<<'
-                )
-                if 'CRITICAL_WARNINGS' not in response_data:
-                    response_data['CRITICAL_WARNINGS'] = []
-                # Prepend staleness warning so agent sees it first
-                response_data['CRITICAL_WARNINGS'].insert(0, stale_warning)
 
         response_data['issuesSummary'] = {
             'total': total_issues,
@@ -6833,9 +6915,12 @@ def storage_diagnostics(arguments: Dict) -> Dict:
     try:
         # Find extracted bundle files
         bundle_files = []
-        search_result = safe_s3_list(f"eks_{instance_id}", max_keys=500)
-        if search_result.get('success'):
-            bundle_files = [obj['key'] for obj in search_result.get('objects', []) if '/extracted/' in obj.get('key', '')]
+        # Use shared latest-bundle discovery
+        bundle_info = find_latest_bundle_files(instance_id)
+        if bundle_info['success']:
+            bundle_files = bundle_info['files']
+        else:
+            bundle_files = []
 
         if not bundle_files:
             return error_response(404, f'No extracted log bundle found for {instance_id}. Run collect first.')
