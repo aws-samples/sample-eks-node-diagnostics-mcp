@@ -266,6 +266,18 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       memoryLimit: 256,
     });
 
+    // Auto-deploy CNI semantics (guardrails, hallucination patterns, regression tests)
+    // These are repo-anchored reference docs derived from amazon-vpc-cni-k8s source.
+    // The agent can fetch them at runtime via get_sop('cni-semantics/...') for
+    // self-checking diagnoses against known hallucination patterns and claim enforcement.
+    new s3deploy.BucketDeployment(this, 'CniSemanticsDeployment', {
+      sources: [s3deploy.Source.asset(path.join(__dirname, '..', 'sops', 'cni-semantics'))],
+      destinationBucket: this.sopBucket,
+      destinationKeyPrefix: 'cni-semantics/',
+      prune: true,
+      memoryLimit: 256,
+    });
+
     // ========================================================================
     // UNZIP LAMBDA FUNCTION
     // ========================================================================

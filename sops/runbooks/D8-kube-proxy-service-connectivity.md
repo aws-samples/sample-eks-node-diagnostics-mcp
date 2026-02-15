@@ -177,6 +177,9 @@ MAY:
 
 ## Guardrails
 
+anti_hallucination:
+  - "CRITICAL: POD_SECURITY_GROUP_ENFORCING_MODE (podSGEnforcingMode) does NOT create a default-deny for unannotated pods. It ONLY affects pods that have the vpc.amazonaws.com/pod-eni annotation (Security Groups for Pods). In strict mode, annotated pods use their branch ENI exclusively instead of falling back to the primary ENI. Pods WITHOUT SGP annotations are COMPLETELY UNAFFECTED — they use the primary ENI and normal VPC routing. Do NOT blame podSGEnforcingMode for service connectivity failures on pods without SGP annotations. If ClusterIP traffic is failing, check kube-proxy health and KUBE-SERVICES iptables chain FIRST."
+
 escalation_conditions:
   - "kube-proxy CrashLoopBackOff on all nodes — cluster-wide service outage"
   - "kube-proxy cannot reach API server — check cluster endpoint and network"

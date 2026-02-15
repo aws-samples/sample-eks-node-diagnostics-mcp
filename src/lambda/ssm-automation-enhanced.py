@@ -5636,6 +5636,25 @@ def network_diagnostics(arguments: Dict) -> Dict:
                         ipt_data['issues'].append('KUBE-SERVICES chain missing — kube-proxy not configured')
                         issues_found.append({'section': 'iptables', 'severity': 'warning', 'message': 'KUBE-SERVICES chain missing'})
 
+                    # CRITICAL CHECK: KUBE-SERVICES chain exists but has NO KUBE-SVC rules
+                    # This means kube-proxy is not syncing rules — ClusterIP traffic will time out
+                    has_kube_services_chain = any('KUBE-SERVICES' in l for l in lines)
+                    kube_svc_rules = [l for l in lines if 'KUBE-SVC-' in l]
+                    ipt_data['kubeSvcRuleCount'] = len(kube_svc_rules)
+                    if has_kube_services_chain and len(kube_svc_rules) == 0:
+                        ipt_data['issues'].append(
+                            'CRITICAL: KUBE-SERVICES chain EXISTS but contains ZERO KUBE-SVC rules. '
+                            'This means kube-proxy is NOT syncing service rules on this node. '
+                            'ALL ClusterIP/NodePort service traffic will TIME OUT because there are no '
+                            'DNAT rules to translate Service IPs to pod IPs. '
+                            'Root cause: kube-proxy is either not running, was recently restarted and has not '
+                            'synced yet, or cannot reach the API server. '
+                            'CHECK IMMEDIATELY: Is kube-proxy pod running on this node? '
+                            '(kubectl get pods -n kube-system -l k8s-app=kube-proxy --field-selector spec.nodeName=<node>)'
+                        )
+                        issues_found.append({'section': 'iptables', 'severity': 'critical',
+                                             'message': 'KUBE-SERVICES chain is EMPTY (0 KUBE-SVC rules) — kube-proxy not syncing, all ClusterIP traffic will fail'})
+
                     # Check VPC CNI SNAT — cross-reference with CNI config for external SNAT
                     has_snat = any('SNAT' in l or 'MASQUERADE' in l for l in lines)
                     has_aws_snat_chain = any('AWS-SNAT-CHAIN' in l for l in lines)
@@ -6303,6 +6322,18 @@ def network_diagnostics(arguments: Dict) -> Dict:
                 f'In "standard" mode, SGP pods use VPC CNI SNAT like regular pods. '
                 f'Trunk ENI changes ENI attachment behavior — do NOT flag extra ENIs as anomalous.'
             )
+
+        # ANTI-HALLUCINATION GUARDRAIL: podSGEnforcingMode does NOT block unannotated pods
+        eks_context['guardrails'].append(
+            'CRITICAL ANTI-HALLUCINATION: POD_SECURITY_GROUP_ENFORCING_MODE (podSGEnforcingMode) '
+            'does NOT create a default-deny for unannotated pods. It ONLY affects pods that have '
+            'the vpc.amazonaws.com/pod-eni annotation (security groups per pod). '
+            '"strict" mode means SGP-annotated pods use their branch ENI for ALL traffic instead of '
+            'falling back to the primary ENI. Pods WITHOUT SGP annotations are COMPLETELY UNAFFECTED — '
+            'they use the primary ENI and normal VPC routing as usual. '
+            'Do NOT blame podSGEnforcingMode for connectivity failures on pods without SGP annotations. '
+            'This is a COMMON MISDIAGNOSIS.'
+        )
 
         # Cross-reference: network policy strict mode
         np_mode = cni_flags.get('networkPolicyMode', '')
