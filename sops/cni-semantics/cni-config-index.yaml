@@ -429,6 +429,23 @@
   non_effects:
     - "Does NOT affect IPv4 SNAT rules"
 
+- key_name: ENABLE_V4_EGRESS
+  source_file_path: cmd/aws-vpc-cni/main.go
+  parse_location: "envEnIPv4Egress — utils.GetBoolAsStringEnvVar"
+  default_value: "true"
+  semantic_summary: >
+    Enables IPv4 egress support on IPv6 clusters. Configures egress-v4
+    plugin for IPv4 outbound traffic from IPv6 pods. Default true means
+    IPv4 egress is enabled by default on IPv6 clusters.
+  preconditions:
+    - "Cluster must be IPv6 mode"
+  observable_signals:
+    - "egress-v4 plugin configuration in 10-aws.conflist"
+    - "169.254.172.0/22 IPAM subnet for egress-v4"
+  non_effects:
+    - "Does NOT affect IPv6 pod networking"
+    - "Does NOT affect IPv4 clusters (only relevant for IPv6 clusters)"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3: CNI Plugin Environment Variables (cmd/aws-vpc-cni/main.go)
@@ -536,6 +553,55 @@
 # SECTION 4: Init Container Environment Variables (cmd/aws-vpc-cni-init/main.go)
 # These are read by the aws-vpc-cni-init container during node bootstrap
 # ─────────────────────────────────────────────────────────────────────────────
+
+- key_name: ENABLE_IMDS_ONLY_MODE
+  source_file_path: utils/constants.go
+  parse_location: "utils.EnvEnableImdsOnlyMode — utils.GetBoolAsStringEnvVar"
+  default_value: "false"
+  semantic_summary: >
+    When true, IPAMD skips EC2 API calls and uses only IMDS metadata to
+    discover ENI information. Also implicitly disables ENI provisioning
+    and leaked ENI cleanup. Used in environments where EC2 API access is
+    restricted or unavailable.
+  preconditions:
+    - "IMDS must be accessible from the node"
+  observable_signals:
+    - "ipamd logs: 'ENABLE_IMDS_ONLY_MODE is enabled, skipping EC2 API call'"
+    - "No EC2 DescribeNetworkInterfaces calls from IPAMD"
+  non_effects:
+    - "Does NOT disable pod networking"
+    - "Does NOT affect iptables rules"
+    - "Does NOT affect kube-proxy"
+
+- key_name: AWS_VPC_K8S_CNI_BACKING_STORE
+  source_file_path: pkg/ipamd/ipamd.go
+  parse_location: "dsBackingStorePath() — os.Getenv"
+  default_value: "/var/run/aws-node/ipam.json"
+  semantic_summary: >
+    Path where IPAMD persists its IP-to-container allocation state.
+    Used for crash recovery — on restart, IPAMD reads this file to
+    reconstruct its datastore without losing track of assigned IPs.
+  preconditions: []
+  observable_signals:
+    - "File exists at specified path with JSON content"
+  non_effects:
+    - "Does NOT affect networking behavior"
+    - "Does NOT affect iptables rules"
+
+- key_name: MY_NODE_NAME
+  source_file_path: pkg/ipamd/ipamd.go
+  parse_location: "os.Getenv(envNodeName)"
+  default_value: '""'
+  semantic_summary: >
+    Kubernetes node name, set via Downward API in the aws-node DaemonSet.
+    Used by IPAMD to identify itself when querying the K8s API for node
+    status (e.g., checking if node is schedulable).
+  preconditions:
+    - "Must be set via Downward API (fieldRef: spec.nodeName)"
+  observable_signals:
+    - "aws-node pod env: MY_NODE_NAME=<node-name>"
+  non_effects:
+    - "Does NOT affect networking behavior"
 
 - key_name: DISABLE_TCP_EARLY_DEMUX
   source_file_path: cmd/aws-vpc-cni-init/main.go

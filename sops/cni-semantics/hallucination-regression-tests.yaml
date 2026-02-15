@@ -390,3 +390,53 @@ tests:
       Agent MUST check ipvsadm output instead of iptables.
       Agent MUST identify missing ip_vs_rr kernel module as root cause
       on the affected node.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T15: ENABLE_IMDS_ONLY_MODE present, but subnet exhaustion is the problem
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T15-imds-only-mode-vs-subnet-exhaustion
+    guardrail_ref: G27-imds-only-mode
+    pattern_ref: P15-imds-only-mode-sounds-like-disable
+    description: >
+      ENABLE_IMDS_ONLY_MODE=true is set. New pods can't get IPs. Agent
+      incorrectly blames IMDS-only mode for breaking ENI management.
+    misleading_config:
+      - "ENABLE_IMDS_ONLY_MODE=true in aws-node env"
+      - "ipamd logs: 'skipping EC2 API call and using IMDS metadata only'"
+      - "No EC2 DescribeNetworkInterfaces calls visible"
+    real_injected_failure:
+      - "Subnet has < 5 available IPs"
+      - "ipamd logs: 'InsufficientFreeAddressesInSubnet'"
+      - "Existing pods work fine"
+    symptoms:
+      - "New pods stuck in ContainerCreating"
+      - "Existing pods have connectivity"
+      - "ipamd logs show IP allocation failures"
+    assertion: >
+      Agent MUST NOT blame ENABLE_IMDS_ONLY_MODE for IP allocation failures.
+      Agent MUST identify subnet IP exhaustion as root cause.
+      Agent MUST note that existing pods working proves networking is fine.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T16: V4/V6 egress confusion — wrong egress var for cluster mode
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: T16-v4-v6-egress-wrong-cluster-mode
+    guardrail_ref: G28-v4-v6-egress-confusion
+    pattern_ref: P16-v4-v6-egress-confusion
+    description: >
+      IPv4 cluster has ENABLE_V4_EGRESS=true set. IPv6 egress doesn't work.
+      Agent incorrectly blames ENABLE_V4_EGRESS for not working.
+    misleading_config:
+      - "ENABLE_V4_EGRESS=true in aws-node env"
+      - "Cluster is IPv4 mode (ENABLE_IPv4=true)"
+    real_injected_failure:
+      - "ENABLE_V6_EGRESS is not set (should be true for IPv6 egress on IPv4 cluster)"
+      - "No egress-v6 plugin in 10-aws.conflist"
+    symptoms:
+      - "Pods cannot reach IPv6 endpoints"
+      - "IPv4 connectivity works fine"
+      - "No CNI-E6-* chains in ip6tables"
+    assertion: >
+      Agent MUST NOT blame ENABLE_V4_EGRESS (it's for IPv6 clusters, irrelevant here).
+      Agent MUST identify that ENABLE_V6_EGRESS=true is needed for IPv6 egress on IPv4 clusters.
+      Agent MUST explain the counterintuitive naming convention.

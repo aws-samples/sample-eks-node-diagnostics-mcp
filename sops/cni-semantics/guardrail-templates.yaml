@@ -285,18 +285,19 @@ guardrails:
     repo_verified_correct_interpretation: >
       If the host OS uses nftables (RHEL 8.x+, Ubuntu 21.x+) but VPC CNI
       uses iptables-legacy mode, rules created by the CNI are invisible to
-      nft commands and vice versa. In VPC CNI v1.13.1+, ENABLE_NFTABLES is
-      deprecated — the CNI auto-detects iptables mode from kubelet. For older
-      versions, ENABLE_NFTABLES=true must be set explicitly.
+      nft commands and vice versa. In current VPC CNI versions (v1.13.1+),
+      the ENABLE_NFTABLES env var has been REMOVED — the CNI auto-detects
+      iptables mode from kubelet. The env var no longer exists in the codebase.
+      For older versions, manual configuration was required.
     required_evidence_to_blame:
       - "iptables-save shows no AWS-SNAT-CHAIN-0 but nft list ruleset does"
       - "Host OS is nftables-based (check: readlink /usr/sbin/iptables)"
-      - "VPC CNI version < 1.13.1 and ENABLE_NFTABLES not set"
+      - "VPC CNI version < 1.13.1 (older versions lacked auto-detection)"
     explicit_disqualifiers:
       - "If iptables-save shows CNI chains → iptables mode is working correctly"
       - "If VPC CNI >= 1.13.1 → auto-detection should handle this"
     repo_citation:
-      env_def: "pkg/networkutils/network.go — envEnableNftables"
+      env_def: "ENABLE_NFTABLES has been REMOVED from pkg/networkutils/network.go — auto-detection replaced it"
 
   # ─────────────────────────────────────────────────────────────────────────
   # G12: IP cooldown period — transient errors are normal
@@ -655,3 +656,53 @@ guardrails:
     repo_citation:
       env_def: "pkg/ipamd/ipamd.go — envManageENIsNonSchedulable"
       api_check: "pkg/ipamd/ipamd.go — isNodeNonSchedulable() real-time K8s API call"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # G27: ENABLE_IMDS_ONLY_MODE — does NOT disable networking
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: G27-imds-only-mode
+    category: ip_management
+    common_mistaken_interpretation: >
+      "ENABLE_IMDS_ONLY_MODE=true disables networking or breaks ENI management."
+    repo_verified_correct_interpretation: >
+      ENABLE_IMDS_ONLY_MODE=true only skips EC2 API calls (DescribeNetworkInterfaces)
+      and uses IMDS metadata exclusively for ENI discovery. It implicitly disables
+      ENI provisioning and leaked ENI cleanup (since those require EC2 API). Existing
+      pod networking is UNAFFECTED. Used in environments with restricted EC2 API access.
+    required_evidence_to_blame:
+      - "ENABLE_IMDS_ONLY_MODE=true AND new pods cannot get IPs"
+      - "ipamd logs show IMDS-related errors"
+    explicit_disqualifiers:
+      - "If existing pods work fine → IMDS-only mode is not breaking networking"
+      - "If EC2 API calls are succeeding → IMDS-only mode is not active"
+    repo_citation:
+      env_def: "utils/constants.go — EnvEnableImdsOnlyMode"
+      usage: "pkg/ipamd/ipamd.go — enableImdsOnlyMode() → disableENIProvisioning()"
+      ec2_skip: "pkg/awsutils/awsutils.go — 'skipping EC2 API call and using IMDS metadata only'"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # G28: ENABLE_V4_EGRESS vs ENABLE_V6_EGRESS — different cluster modes
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: G28-v4-v6-egress-confusion
+    category: egress
+    common_mistaken_interpretation: >
+      "ENABLE_V4_EGRESS and ENABLE_V6_EGRESS are the same thing or can be
+      used interchangeably."
+    repo_verified_correct_interpretation: >
+      These are for OPPOSITE cluster modes. ENABLE_V6_EGRESS=true enables
+      IPv6 egress on IPv4 clusters (egress-v6 plugin, ip6tables CNI-E6-* chains).
+      ENABLE_V4_EGRESS=true (default) enables IPv4 egress on IPv6 clusters
+      (egress-v4 plugin, iptables CNI-E4-* chains, 169.254.172.0/22 IPAM).
+      Using the wrong one for your cluster mode has no effect.
+    required_evidence_to_blame:
+      - "Egress traffic in the non-native IP family fails"
+      - "Correct egress env var for cluster mode is set"
+    explicit_disqualifiers:
+      - "If cluster is IPv4 → ENABLE_V4_EGRESS is irrelevant (it's for IPv6 clusters)"
+      - "If cluster is IPv6 → ENABLE_V6_EGRESS is irrelevant (it's for IPv4 clusters)"
+      - "Do NOT confuse which egress var applies to which cluster mode"
+    repo_citation:
+      v4_egress: "cmd/aws-vpc-cni/main.go — envEnIPv4Egress, default true"
+      v6_egress: "cmd/aws-vpc-cni/main.go — envEnIPv6Egress"
+      v4_chains: "cmd/egress-cni-plugin/snat/snat.go — CNI-E4-<containerID>"
+      v6_chains: "cmd/egress-cni-plugin/snat/snat.go — CNI-E6-<containerID>"

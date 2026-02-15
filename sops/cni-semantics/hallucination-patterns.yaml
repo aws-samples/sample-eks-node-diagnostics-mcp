@@ -281,3 +281,43 @@ patterns:
       "The main route table has no default gateway — routing is broken."
     repo_proof: "pkg/networkutils/network.go — SetupENINetwork() creates per-ENI tables"
     guardrail_ref: G23-empty-route-table-multi-eni
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P15: ENABLE_IMDS_ONLY_MODE sounds like it disables networking
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P15-imds-only-mode-sounds-like-disable
+    trigger_words: ["ENABLE_IMDS_ONLY_MODE", "IMDS only", "skip EC2 API"]
+    hallucination_risk: MEDIUM
+    why_llms_get_this_wrong: >
+      "IMDS only mode" sounds restrictive. LLMs may assume it disables
+      networking features or breaks ENI management entirely.
+    actual_behavior: >
+      ENABLE_IMDS_ONLY_MODE=true only changes how IPAMD discovers ENI
+      metadata — using IMDS instead of EC2 API. It implicitly disables
+      ENI provisioning and leaked ENI cleanup (which need EC2 API), but
+      existing pod networking is completely unaffected.
+    common_false_claim: >
+      "ENABLE_IMDS_ONLY_MODE=true is breaking pod networking because
+      IPAMD can't manage ENIs."
+    repo_proof: "pkg/awsutils/awsutils.go — only skips DescribeNetworkInterfaces, uses IMDS metadata instead"
+    guardrail_ref: G27-imds-only-mode
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # P16: ENABLE_V4_EGRESS confused with ENABLE_V6_EGRESS
+  # ─────────────────────────────────────────────────────────────────────────
+  - id: P16-v4-v6-egress-confusion
+    trigger_words: ["ENABLE_V4_EGRESS", "ENABLE_V6_EGRESS", "egress plugin", "egress-v4", "egress-v6"]
+    hallucination_risk: MEDIUM
+    why_llms_get_this_wrong: >
+      The naming is counterintuitive. ENABLE_V6_EGRESS is for IPv4 clusters
+      (enables IPv6 egress). ENABLE_V4_EGRESS is for IPv6 clusters (enables
+      IPv4 egress). LLMs assume V4 egress is for IPv4 clusters.
+    actual_behavior: >
+      ENABLE_V6_EGRESS=true → IPv4 cluster gets IPv6 egress capability
+      (egress-v6 plugin, ip6tables CNI-E6-* chains).
+      ENABLE_V4_EGRESS=true → IPv6 cluster gets IPv4 egress capability
+      (egress-v4 plugin, iptables CNI-E4-* chains, 169.254.172.0/22 IPAM).
+    common_false_claim: >
+      "ENABLE_V4_EGRESS controls IPv4 egress on IPv4 clusters."
+    repo_proof: "cmd/aws-vpc-cni/main.go lines 230-240 — V4 egress only in IPv6 mode, V6 egress only in IPv4 mode"
+    guardrail_ref: G28-v4-v6-egress-confusion

@@ -60,6 +60,24 @@ Compare the repo-defined preconditions against the actual incident evidence:
 | kube-proxy | 0x0000c000 | `pkg/networkutils/network.go` comment line 121 |
 | Calico | 0xffff0000 | `pkg/networkutils/network.go` comment line 122 |
 
+### Egress Plugin
+| Claim | Repo File | Function | Gate |
+|-------|-----------|----------|------|
+| V6 egress on IPv4 cluster | `cmd/aws-vpc-cni/main.go` | conflist generation | ENABLE_V6_EGRESS=true + IPv4 mode |
+| V4 egress on IPv6 cluster | `cmd/aws-vpc-cni/main.go` | conflist generation | ENABLE_V4_EGRESS=true + IPv6 mode |
+| Egress creates per-pod chains | `cmd/egress-cni-plugin/snat/snat.go` | Add() | CNI-E6-<containerID> or CNI-E4-<containerID> |
+
+### IMDS-Only Mode
+| Claim | Repo File | Function | Gate |
+|-------|-----------|----------|------|
+| IMDS-only skips EC2 API | `pkg/awsutils/awsutils.go` | DescribeAllENIs | ENABLE_IMDS_ONLY_MODE=true |
+| IMDS-only disables ENI provisioning | `pkg/ipamd/ipamd.go` | disableENIProvisioning() | enableImdsOnlyMode() returns true |
+
+### Removed/Deprecated Env Vars
+| Env Var | Status | Replacement |
+|---------|--------|-------------|
+| ENABLE_NFTABLES | REMOVED from codebase | Auto-detection from kubelet (v1.13.1+) |
+
 ## Anti-Hallucination Rules
 
 1. **NEVER claim SGP affects unannotated pods** — The PodVlanId gate in rpc_handler.go proves this is impossible.
@@ -78,3 +96,6 @@ Compare the repo-defined preconditions against the actual incident evidence:
 14. **NEVER blame VPC CNI or kube-proxy for conntrack table exhaustion** — It's a kernel resource limit, fix via nf_conntrack_max.
 15. **NEVER claim nm-cloud-setup is compatible with VPC CNI** — It overwrites per-ENI ip rules, breaking pod networking.
 16. **NEVER restart kube-proxy during API server outages** — Static stability keeps existing rules working.
+17. **NEVER claim ENABLE_IMDS_ONLY_MODE breaks networking** — It only changes ENI discovery from EC2 API to IMDS. Existing pod networking is unaffected.
+18. **NEVER confuse ENABLE_V4_EGRESS with ENABLE_V6_EGRESS** — V4 egress is for IPv6 clusters (enables IPv4 outbound). V6 egress is for IPv4 clusters (enables IPv6 outbound). The naming is counterintuitive.
+19. **NEVER reference ENABLE_NFTABLES as a current env var** — It has been REMOVED from the VPC CNI codebase. Auto-detection replaced it in v1.13.1+.

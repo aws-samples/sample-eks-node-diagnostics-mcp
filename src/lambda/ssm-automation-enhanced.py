@@ -6529,6 +6529,36 @@ def network_diagnostics(arguments: Dict) -> Dict:
             'conntrack.min/conntrack.maxPerCore settings in kube-proxy-config ConfigMap.'
         )
 
+        # ANTI-HALLUCINATION: ENABLE_IMDS_ONLY_MODE does NOT disable networking (G27)
+        imds_only = cni_env.get('ENABLE_IMDS_ONLY_MODE', 'false')
+        if imds_only.lower() == 'true':
+            eks_context['guardrails'].append(
+                'ENABLE_IMDS_ONLY_MODE=true: This ONLY skips EC2 API calls (DescribeNetworkInterfaces) '
+                'and uses IMDS metadata for ENI discovery. It implicitly disables ENI provisioning and '
+                'leaked ENI cleanup. Existing pod networking is UNAFFECTED. '
+                'Do NOT claim IMDS-only mode breaks networking — it only changes ENI discovery source.'
+            )
+
+        # ANTI-HALLUCINATION: ENABLE_V4_EGRESS vs ENABLE_V6_EGRESS confusion (G28)
+        v4_egress = cni_env.get('ENABLE_V4_EGRESS', '')
+        v6_egress = cni_env.get('ENABLE_V6_EGRESS', '')
+        ipv6_mode = cni_env.get('ENABLE_IPv6', 'false')
+        if v4_egress or v6_egress:
+            eks_context['guardrails'].append(
+                'ANTI-HALLUCINATION: ENABLE_V4_EGRESS and ENABLE_V6_EGRESS are for OPPOSITE cluster modes. '
+                'ENABLE_V6_EGRESS=true → IPv4 cluster gets IPv6 egress (egress-v6 plugin, ip6tables CNI-E6-* chains). '
+                'ENABLE_V4_EGRESS=true → IPv6 cluster gets IPv4 egress (egress-v4 plugin, iptables CNI-E4-* chains). '
+                f'Current cluster: IPv6={ipv6_mode}. '
+                'Do NOT confuse which egress var applies to which cluster mode.'
+            )
+
+        # ANTI-HALLUCINATION: ENABLE_NFTABLES has been REMOVED from VPC CNI codebase
+        eks_context['guardrails'].append(
+            'ANTI-HALLUCINATION: ENABLE_NFTABLES env var has been REMOVED from the VPC CNI codebase. '
+            'Auto-detection from kubelet replaced it in v1.13.1+. Do NOT reference ENABLE_NFTABLES '
+            'as a current configuration option. If iptables mode issues arise, check the CNI version.'
+        )
+
         # Clean up internal flags from results
         if 'iptables' in results and '_snat_present' in results['iptables']:
             del results['iptables']['_snat_present']
