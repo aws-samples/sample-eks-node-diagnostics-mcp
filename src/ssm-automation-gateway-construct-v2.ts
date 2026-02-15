@@ -230,6 +230,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     }
 
     // Bucket policy to allow EC2 instances in the account to upload logs
+    // Bucket policy to allow EC2 instances in the account to upload logs
     this.logsBucket.addToResourcePolicy(new iam.PolicyStatement({
       sid: 'AllowEC2InstancesUpload',
       effect: iam.Effect.ALLOW,

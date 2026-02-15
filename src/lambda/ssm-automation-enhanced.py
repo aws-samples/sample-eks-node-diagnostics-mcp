@@ -7435,7 +7435,52 @@ else
     echo "crictl not found on this node"
 fi
 
-# Method 2: docker (older EKS AMIs with dockershim)
+# Method 2: ctr (containerd native CLI — usually present even when crictl is not)
+if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
+    CTR=""
+    for p in /usr/local/bin/ctr /usr/bin/ctr $(which ctr 2>/dev/null); do
+        if [ -x "$p" ]; then CTR="$p"; break; fi
+    done
+    if [ -n "$CTR" ]; then
+        echo "Trying ctr ($CTR) to find pod container..."
+        # containerd uses k8s.io namespace for Kubernetes containers
+        # ctr containers ls does NOT show pod names — must inspect each container's labels
+        # First find non-pause container, then fall back to pause (sandbox) container
+        SANDBOX_CID=""
+        for cid in $($CTR -n k8s.io containers ls -q 2>/dev/null); do
+            INFO=$($CTR -n k8s.io containers info "$cid" 2>/dev/null || true)
+            if echo "$INFO" | grep -q '"io.kubernetes.pod.name": "{pod_name}"'; then
+                if echo "$INFO" | grep -q '"io.kubernetes.pod.namespace": "{pod_namespace}"'; then
+                    # Check if this is a pause/sandbox container
+                    if echo "$INFO" | grep -q '"io.kubernetes.cri.container-type": "sandbox"'; then
+                        SANDBOX_CID="$cid"
+                        echo "ctr: found sandbox container $cid (saving as fallback)"
+                    else
+                        echo "ctr: found app container $cid"
+                        CTR_PID=$($CTR -n k8s.io task ls 2>/dev/null | grep "$cid" | awk '{{print $2}}')
+                        if [ -n "$CTR_PID" ] && [ "$CTR_PID" != "0" ] && [ -e "/proc/$CTR_PID/ns/net" ]; then
+                            TARGET_PID="$CTR_PID"
+                            echo "ctr: resolved pid=$TARGET_PID"
+                            break
+                        fi
+                    fi
+                fi
+            fi
+        done
+        # Fall back to sandbox (pause) container — shares the same network namespace
+        if ([ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]) && [ -n "$SANDBOX_CID" ]; then
+            echo "ctr: using sandbox container $SANDBOX_CID"
+            CTR_PID=$($CTR -n k8s.io task ls 2>/dev/null | grep "$SANDBOX_CID" | awk '{{print $2}}')
+            if [ -n "$CTR_PID" ] && [ "$CTR_PID" != "0" ] && [ -e "/proc/$CTR_PID/ns/net" ]; then
+                TARGET_PID="$CTR_PID"
+                echo "ctr: resolved pid=$TARGET_PID via sandbox"
+            fi
+        fi
+        [ -z "$TARGET_PID" ] && echo "ctr: could not resolve pod '{pod_name}' in namespace '{pod_namespace}'"
+    fi
+fi
+
+# Method 3: docker (older EKS AMIs with dockershim)
 if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     if command -v docker &>/dev/null; then
         echo "Trying docker..."
@@ -7447,7 +7492,7 @@ if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     fi
 fi
 
-# Method 3: search /proc cgroups for the pod name (works with containerd/CRI-O)
+# Method 4: search /proc cgroups for the pod name (works with containerd/CRI-O)
 if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     echo "Trying /proc cgroup scan for pod name..."
     # Container PIDs have cgroup entries containing the pod UID or pod name
@@ -7464,7 +7509,7 @@ if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     done
 fi
 
-# Method 4: fallback — search /proc for pause or main container process
+# Method 5: fallback — search /proc for pause or main container process
 if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     echo "Trying /proc process scan..."
     # Look for any process whose network namespace differs from host and whose cgroup contains pod-related strings
@@ -7487,6 +7532,7 @@ if [ -z "$TARGET_PID" ] || [ "$TARGET_PID" = "0" ]; then
     echo ""
     echo "Debug info:"
     echo "  crictl binary: ${{CRICTL:-not found}}"
+    echo "  ctr binary: ${{CTR:-not found}}"
     echo "  containerd socket: $(ls -la /run/containerd/containerd.sock 2>/dev/null || echo 'not found')"
     echo "  docker: $(which docker 2>/dev/null || echo 'not found')"
     echo "  Running containers:"
