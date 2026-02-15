@@ -8834,9 +8834,44 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
     max_packets = min(int(arguments.get('maxPackets', 500)), 3000)
     text_filter = arguments.get('filter', '')
 
-    # Find the capture metadata
+    # ── Always find the LATEST capture for this instance ──
+    # Even if commandId is provided, we verify it is the latest capture.
+    # This prevents analyzing stale data when a newer capture exists.
     metadata = {}
-    if command_id:
+    latest_metadata = {}
+    try:
+        list_resp = safe_s3_list(f"tcpdump-commands/", max_keys=200)
+        if list_resp.get('success'):
+            candidates = []
+            for obj in list_resp.get('objects', []):
+                try:
+                    r = s3_client.get_object(Bucket=LOGS_BUCKET, Key=obj['key'])
+                    m = json.loads(r['Body'].read().decode('utf-8'))
+                    if m.get('instanceId') == instance_id:
+                        candidates.append(m)
+                except Exception:
+                    continue
+            if candidates:
+                candidates.sort(key=lambda x: x.get('startedAt', ''), reverse=True)
+                latest_metadata = candidates[0]
+    except Exception:
+        pass
+
+    if command_id and latest_metadata:
+        # commandId was provided — check if it matches the latest
+        if latest_metadata.get('commandId') == command_id:
+            metadata = latest_metadata
+        else:
+            # Requested commandId is NOT the latest — reject with guidance
+            return error_response(409,
+                f'commandId {command_id} is not the latest capture for {instance_id}. '
+                f'Latest capture is commandId={latest_metadata.get("commandId")} '
+                f'started at {latest_metadata.get("startedAt", "unknown")}. '
+                f'Omit commandId to auto-use the latest, or run a new tcpdump_capture.')
+    elif latest_metadata:
+        metadata = latest_metadata
+    elif command_id:
+        # No candidates found at all — try the specific commandId as fallback
         try:
             meta_resp = s3_client.get_object(
                 Bucket=LOGS_BUCKET,
@@ -8846,29 +8881,24 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
         except Exception:
             pass
 
-    # If no commandId, find the latest capture for this instance
-    if not metadata:
-        try:
-            list_resp = safe_s3_list(f"tcpdump-commands/", max_keys=200)
-            if list_resp.get('success'):
-                candidates = []
-                for obj in list_resp.get('objects', []):
-                    try:
-                        r = s3_client.get_object(Bucket=LOGS_BUCKET, Key=obj['key'])
-                        m = json.loads(r['Body'].read().decode('utf-8'))
-                        if m.get('instanceId') == instance_id:
-                            candidates.append(m)
-                    except Exception:
-                        continue
-                if candidates:
-                    # Sort by startedAt descending
-                    candidates.sort(key=lambda x: x.get('startedAt', ''), reverse=True)
-                    metadata = candidates[0]
-        except Exception:
-            pass
-
     if not metadata:
         return error_response(404, f'No tcpdump capture found for {instance_id}. Run tcpdump_capture first.')
+
+    # ── Staleness check ──
+    capture_age_warning = None
+    started_at = metadata.get('startedAt', '')
+    if started_at:
+        try:
+            capture_time = datetime.strptime(started_at, '%Y-%m-%dT%H:%M:%SZ')
+            age_seconds = (datetime.utcnow() - capture_time).total_seconds()
+            age_minutes = age_seconds / 60
+            if age_minutes > 15:
+                capture_age_warning = (
+                    f'This capture is {int(age_minutes)} minutes old (started {started_at}). '
+                    f'Network conditions may have changed. Consider running a fresh tcpdump_capture.'
+                )
+        except (ValueError, TypeError):
+            pass
 
     s3_key_txt = metadata.get('s3KeyTxt', '')
     s3_key_stats = metadata.get('s3KeyStats', '')
@@ -8884,6 +8914,8 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
             'startedAt': metadata.get('startedAt', 'unknown'),
         },
     }
+    if capture_age_warning:
+        results['stalenessWarning'] = capture_age_warning
 
     # Read stats
     if section in ('stats', 'all'):
