@@ -7654,7 +7654,7 @@ set +e
 UPLOAD_FAILURES=0
 
 echo "Uploading pcap to {s3_uri}..."
-aws s3 cp "$PCAP_FILE" "{s3_uri}" --quiet 2>&1
+aws s3 cp "$PCAP_FILE" "{s3_uri}" --no-progress 2>&1
 if [ $? -eq 0 ]; then
     echo "UPLOAD_PCAP=ok"
 else

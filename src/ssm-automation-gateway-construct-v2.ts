@@ -211,11 +211,15 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       // Allow any principal in this account to use the key for S3 uploads
       // This is needed for EC2 instance roles (EKS worker nodes) to upload
       // tcpdump captures and other artifacts via `aws s3 cp`
+      // IMPORTANT: Using AnyPrincipal with account condition (not AccountRootPrincipal)
+      // because AccountRootPrincipal delegates to IAM policies, and worker node roles
+      // typically don't have KMS identity-based policies. AnyPrincipal in a key policy
+      // grants direct access without requiring an identity-based policy.
       this.encryptionKey.addToResourcePolicy(new iam.PolicyStatement({
         sid: 'AllowAccountPrincipalsEncrypt',
         effect: iam.Effect.ALLOW,
-        principals: [new iam.AccountRootPrincipal()],
-        actions: ['kms:GenerateDataKey', 'kms:Encrypt', 'kms:Decrypt', 'kms:DescribeKey'],
+        principals: [new iam.AnyPrincipal()],
+        actions: ['kms:GenerateDataKey', 'kms:GenerateDataKey*', 'kms:Encrypt', 'kms:Decrypt', 'kms:DescribeKey', 'kms:ReEncrypt*'],
         resources: ['*'],
         conditions: {
           StringEquals: {
