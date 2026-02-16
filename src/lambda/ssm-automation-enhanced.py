@@ -5485,7 +5485,7 @@ def batch_collect(arguments: Dict) -> Dict:
             })
 
         # 7. Execute collections
-        batch_id = hashlib.md5(f"{cluster_name}-{datetime.utcnow().isoformat()}".encode()).hexdigest()[:12]
+        batch_id = hashlib.sha256(f"{cluster_name}-{datetime.utcnow().isoformat()}".encode(), usedforsecurity=False).hexdigest()[:12]
         executions = []
 
         for bucket in bucket_list:
