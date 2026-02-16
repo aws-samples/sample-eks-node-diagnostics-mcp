@@ -1930,10 +1930,41 @@ def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data:
         }
     }
     
-    # PASS 1: Analyze pre-indexed findings by category
+    # PASS 1: Analyze pre-indexed findings by category (with temporal weighting)
     category_scores = {}
     category_evidence = {}
-    
+
+    # Collect all timestamps from findings to compute recency weights
+    all_timestamps = []
+    for finding in findings:
+        ts = extract_timestamp(finding.get('sample', ''))
+        if ts:
+            try:
+                all_timestamps.append(datetime.fromisoformat(ts.replace('Z', '+00:00').replace('+00:00', '')))
+            except (ValueError, TypeError):
+                pass
+
+    reference_time = max(all_timestamps) if all_timestamps else datetime.utcnow()
+
+    def _recency_weight(timestamp_str):
+        """Return 1.0-2.0 multiplier: recent findings score higher."""
+        if not timestamp_str:
+            return 1.0
+        try:
+            ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00').replace('+00:00', ''))
+            age_minutes = (reference_time - ts).total_seconds() / 60.0
+            if age_minutes < 0:
+                age_minutes = 0
+            if age_minutes <= 5:
+                return 2.0
+            elif age_minutes <= 30:
+                return 1.5
+            elif age_minutes <= 120:
+                return 1.2
+            return 1.0
+        except (ValueError, TypeError):
+            return 1.0
+
     for cat_id, cat_info in TRIAGE_CATEGORIES.items():
         category_scores[cat_id] = {'score': 0, 'high_matches': 0, 'medium_matches': 0, 'patterns_matched': []}
         category_evidence[cat_id] = []
@@ -1946,11 +1977,14 @@ def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data:
                     file_path = finding.get('file', '')
                     
                     if regex.search(sample) or regex.search(finding.get('pattern', '')):
+                        ts_str = extract_timestamp(sample)
+                        weight = _recency_weight(ts_str)
+
                         if confidence == 'high':
-                            category_scores[cat_id]['score'] += 3
+                            category_scores[cat_id]['score'] += int(3 * weight)
                             category_scores[cat_id]['high_matches'] += 1
                         else:
-                            category_scores[cat_id]['score'] += 1
+                            category_scores[cat_id]['score'] += int(1 * weight)
                             category_scores[cat_id]['medium_matches'] += 1
                         
                         category_scores[cat_id]['patterns_matched'].append(pattern)
@@ -1959,7 +1993,8 @@ def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data:
                         category_evidence[cat_id].append({
                             'file_path': file_path,
                             'full_key': finding.get('fullKey', ''),
-                            'timestamp': extract_timestamp(sample),
+                            'timestamp': ts_str,
+                            'recency_weight': weight,
                             'line_number': None,  # Would need deep scan for this
                             'byte_range': None,
                             'excerpt': sample[:300] if sample else '',
@@ -2142,21 +2177,21 @@ def generate_triage_remediation(category: str, evidence: List[Dict],
         steps = [
             {
                 'priority': priority,
+                'action': 'Check CSI driver pods',
+                'command': 'kubectl get pods -n kube-system -l app=ebs-csi-controller',
+                'expected_outcome': 'Verify CSI controller is running — if not running, volume operations will fail'
+            },
+            {
+                'priority': priority + 1,
                 'action': 'Check PV/PVC status',
                 'command': "kubectl get pv,pvc -A | grep -E 'Pending|Failed'",
                 'expected_outcome': 'Identify stuck volumes'
             },
             {
-                'priority': priority + 1,
+                'priority': priority + 2,
                 'action': 'Check EBS volume attachment',
                 'command': "aws ec2 describe-volumes --filters Name=status,Values=attaching,error --query 'Volumes[].{ID:VolumeId,State:State}'",
                 'expected_outcome': 'Find volumes stuck in attaching state'
-            },
-            {
-                'priority': priority + 2,
-                'action': 'Check CSI driver pods',
-                'command': 'kubectl get pods -n kube-system -l app=ebs-csi-controller',
-                'expected_outcome': 'Verify CSI controller is running'
             },
         ]
     elif category == 'B':  # Node Issues
@@ -3673,6 +3708,8 @@ def search_logs_deep(arguments: Dict) -> Dict:
         all_matches = []
         files_searched = 0
         files_with_errors = 0
+        search_start = time.time() if 'time' in dir() else __import__('time').time()
+        early_terminated = False
         
         for file_info in files_to_search[:50]:  # Limit files to prevent timeout
             files_searched += 1
@@ -3693,6 +3730,13 @@ def search_logs_deep(arguments: Dict) -> Dict:
                 })
             
             if sum(len(m['matches']) for m in all_matches) >= max_results * 3:
+                break
+
+            # Early termination: if running >30s and have sufficient results
+            elapsed = (__import__('time').time() - search_start)
+            total_match_count = sum(len(m['matches']) for m in all_matches)
+            if elapsed > 30 and total_match_count >= 10:
+                early_terminated = True
                 break
         
         # Sort by match count
@@ -3740,8 +3784,15 @@ def search_logs_deep(arguments: Dict) -> Dict:
             'files_available': len(files_to_search),
             'files_skipped_size': large_file_count,
             'files_with_errors': files_with_errors,
-            'scan_complete': files_searched >= len(files_to_search),
+            'scan_complete': files_searched >= len(files_to_search) and not early_terminated,
+            'early_terminated': early_terminated,
         }
+        if early_terminated:
+            coverage_report['early_termination_reason'] = (
+                f'Search stopped after {files_searched} files ({elapsed:.1f}s elapsed) with '
+                f'{sum(m["matchCount"] for m in all_matches)} matches found. '
+                'Sufficient results available — remaining files skipped to prevent timeout.'
+            )
         
         result = {
             'instanceId': instance_id,
@@ -4571,7 +4622,45 @@ def quick_triage(arguments: Dict) -> Dict:
         result['findings'] = []
         result['errorWarning'] = str(e)
     
-    # Step 3: Triage analysis (inline, skip the summarize overhead)
+    # Step 3: Prerequisite component checks
+    prerequisite_checks = {}
+    try:
+        bundle_files_list = []
+        bundle_info_qt = find_latest_bundle_files(instance_id)
+        if bundle_info_qt.get('success'):
+            bundle_files_list = bundle_info_qt.get('files', [])
+        if bundle_files_list:
+            bundle_lower = [f.lower() for f in bundle_files_list]
+            # CSI driver presence
+            has_ebs_csi = any('ebs-csi' in f or 'ebs_csi' in f for f in bundle_lower)
+            has_efs_csi = any('efs-csi' in f or 'efs_csi' in f for f in bundle_lower)
+            # CNI presence
+            has_cni = any('aws-node' in f or 'ipamd' in f or '10-aws' in f for f in bundle_lower)
+            # CoreDNS presence
+            has_coredns = any('coredns' in f or 'kube-dns' in f for f in bundle_lower)
+            # kube-proxy presence
+            has_kube_proxy = any('kube-proxy' in f or 'kube_proxy' in f for f in bundle_lower)
+
+            prerequisite_checks = {
+                'ebsCsiDriver': 'present' if has_ebs_csi else 'not_found',
+                'efsCsiDriver': 'present' if has_efs_csi else 'not_found',
+                'vpcCni': 'present' if has_cni else 'not_found',
+                'coreDns': 'present' if has_coredns else 'not_found',
+                'kubeProxy': 'present' if has_kube_proxy else 'not_found',
+            }
+            missing_components = [k for k, v in prerequisite_checks.items() if v == 'not_found']
+            if missing_components:
+                prerequisite_checks['warning'] = (
+                    f"No log files found for: {', '.join(missing_components)}. "
+                    "These components may not be installed or their logs were not collected. "
+                    "Verify component installation before investigating related errors."
+                )
+    except Exception:
+        pass
+    if prerequisite_checks:
+        result['prerequisiteChecks'] = prerequisite_checks
+
+    # Step 4: Triage analysis (inline, skip the summarize overhead)
     if include_triage and findings:
         try:
             bundle_data = result.get('bundle', {})
@@ -4594,13 +4683,13 @@ def quick_triage(arguments: Dict) -> Dict:
     elif include_triage:
         result['triage'] = {'info': 'No findings to triage — node may be healthy'}
     
-    # Step 4: Recommendations
+    # Step 5: Recommendations
     critical = [f for f in findings if f.get('severity') == 'critical'][:10]
     high = [f for f in findings if f.get('severity') == 'high'][:10]
     medium = [f for f in findings if f.get('severity') == 'medium'][:5]
     result['recommendations'] = generate_recommendations(critical, high, medium)
     
-    # Step 5: Top evidence excerpts — gives agent enough context to avoid follow-up searches
+    # Step 6: Top evidence excerpts — gives agent enough context to avoid follow-up searches
     top_evidence = []
     seen_samples = set()
     for f in (critical + high + medium):
@@ -4619,7 +4708,7 @@ def quick_triage(arguments: Dict) -> Dict:
             break
     result['topEvidence'] = top_evidence
     
-    # Step 6: Match relevant SOPs based on findings and triage results
+    # Step 7: Match relevant SOPs based on findings and triage results
     try:
         triage_cat = result.get('rootCause', {}).get('category') if result.get('rootCause') else None
         # Build issues list from findings for SOP matching
@@ -4637,6 +4726,45 @@ def quick_triage(arguments: Dict) -> Dict:
     except Exception:
         pass  # SOP matching is best-effort, never block triage
     
+    # Step 8: Investigation hints — guide agent to avoid rabbit-holing
+    investigation_hints = []
+    root_cause_cat = result.get('rootCause', {}).get('category', '') if result.get('rootCause') else ''
+    root_cause_conf = result.get('rootCause', {}).get('confidence', '') if result.get('rootCause') else ''
+
+    if root_cause_cat:
+        hint_map = {
+            'Volume/CSI Issues': 'Check CSI driver pod status and PV/PVC phase FIRST. If CSI driver is not running, all volume errors are secondary.',
+            'Node Health Issues': 'Check node conditions (MemoryPressure, DiskPressure, PIDPressure) FIRST. OOMKill errors are symptoms, not root cause.',
+            'CNI/Networking Issues': 'Check aws-node pod status and subnet IP availability FIRST. IP allocation errors cascade into pod scheduling failures.',
+            'iptables/conntrack Issues': 'Check kube-proxy pod status FIRST. If kube-proxy is down, all service routing errors are expected.',
+            'Scheduling Issues': 'Check node resource allocations and taints FIRST. Pending pods may be waiting for resources, not experiencing errors.',
+            'Image Pull Issues': 'Check ECR authentication and network egress FIRST. Image pull failures often indicate IAM or network issues.',
+            'DNS Issues': 'Check CoreDNS pod status FIRST. If CoreDNS is not running, all DNS errors are expected.',
+            'Secrets/Webhook Issues': 'Check webhook endpoint availability FIRST. Webhook timeouts block pod creation.',
+        }
+        hint = hint_map.get(root_cause_cat, '')
+        if hint:
+            investigation_hints.append(hint)
+
+    if root_cause_conf == 'low':
+        investigation_hints.append(
+            'Confidence is LOW. Consider pivoting: the root cause may not be in the collected logs. '
+            'Check cluster-level events (kubectl get events -A) and control plane logs.'
+        )
+
+    if len(findings) > 50:
+        investigation_hints.append(
+            f'{len(findings)} findings detected. Focus on critical/high severity only. '
+            'Do NOT chase medium/low findings until critical issues are resolved.'
+        )
+
+    investigation_hints.append(
+        'TIME BUDGET: Spend no more than 2 minutes on any single hypothesis. '
+        'If log evidence is inconclusive, pivot to live cluster checks (kubectl) instead of deeper log searches.'
+    )
+
+    result['investigationHints'] = investigation_hints
+
     # Confidence
     if critical and result.get('rootCause'):
         result['confidence'] = 'high'
@@ -5804,6 +5932,36 @@ def network_diagnostics(arguments: Dict) -> Dict:
                 if has_aws_snat_chain:
                     ipt_data['vpcCniSnat'] = 'AWS-SNAT-CHAIN present (VPC CNI managing SNAT)'
 
+                # --- Port-specific DROP/REJECT rule detection ---
+                # Scan for custom rules that block critical K8s ports
+                critical_ports = {'53': 'DNS', '443': 'HTTPS/API', '6443': 'kube-apiserver', '10250': 'kubelet'}
+                port_block_findings = []
+                for line in all_lines_merged:
+                    line_upper = line.upper()
+                    if 'DROP' not in line_upper and 'REJECT' not in line_upper:
+                        continue
+                    # Skip chain definitions (lines starting with ':')
+                    if line.strip().startswith(':'):
+                        continue
+                    for port, port_name in critical_ports.items():
+                        if f'--dport {port}' in line or f'--dport {port} ' in line or f'dpt:{port}' in line:
+                            port_block_findings.append({
+                                'port': port,
+                                'service': port_name,
+                                'rule': line.strip()[:200],
+                                'action': 'DROP' if 'DROP' in line_upper else 'REJECT',
+                            })
+                if port_block_findings:
+                    blocked_services = list(set(f"{pf['service']} (port {pf['port']})" for pf in port_block_findings))
+                    ipt_data['portBlockRules'] = port_block_findings[:20]
+                    ipt_data['issues'].append(
+                        f"Custom DROP/REJECT rules found targeting critical K8s ports: {', '.join(blocked_services)}. "
+                        "These rules may block DNS resolution (53), API server communication (443/6443), "
+                        "or kubelet health checks (10250). Review and remove if unintended."
+                    )
+                    issues_found.append({'section': 'iptables', 'severity': 'critical',
+                                         'message': f'Custom DROP/REJECT rules blocking critical ports: {", ".join(blocked_services)}'})
+
             results['iptables'] = ipt_data
 
         # =====================================================================
@@ -6873,6 +7031,14 @@ def _network_assessment(issues: List[Dict]) -> str:
 
     if critical:
         sections = set(i['section'] for i in critical)
+        # Proactive tcpdump escalation for non-kube-proxy critical issues
+        if not kube_proxy_down:
+            return (
+                f"CRITICAL — {len(critical)} critical networking issues in: {', '.join(sections)}. Immediate investigation needed. "
+                "ESCALATION: If log analysis is inconclusive, use tcpdump_capture to capture live traffic "
+                "on the affected node. Target port 53 for DNS issues, port 443/6443 for API server issues, "
+                "or the pod IP for pod-to-pod connectivity problems."
+            )
         return f"CRITICAL — {len(critical)} critical networking issues in: {', '.join(sections)}. Immediate investigation needed."
     return f"WARNING — {len(issues)} non-critical networking issues found. Review recommended."
 
@@ -7069,6 +7235,18 @@ def storage_diagnostics(arguments: Dict) -> Dict:
             # Also check container logs for ebs-csi pods
             if not ebs_files:
                 ebs_files = find_files(['ebs-csi'])
+
+            # Prerequisite check: warn if no CSI driver logs found at all
+            if not ebs_files:
+                ebs_data['issues'].append(
+                    'No EBS CSI driver log files found in the bundle. '
+                    'The EBS CSI driver may not be installed on this cluster. '
+                    'Verify installation: kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver. '
+                    'If not installed, volume mount errors are expected — install the EBS CSI driver add-on first.'
+                )
+                issues_found.append({'section': 'ebs_csi', 'severity': 'critical',
+                                     'message': 'EBS CSI driver logs not found — driver may not be installed'})
+
             for f in ebs_files[:5]:
                 content = read_content(f, max_size=524288)
                 if not content:
