@@ -71,8 +71,8 @@ Required only for `tcpdump_capture` with `podName`/`podNamespace`. EKS-optimized
 
 ```bash
 # Clone the repository
-git clone https://github.com/aws-samples/eks-node-log-mcp.git
-cd eks-node-log-mcp
+git clone https://github.com/aws-samples/sample-eks-node-diagnostics-mcp.git
+cd sample-eks-node-diagnostics-mcp
 
 # Make the script executable
 chmod +x deploy.sh
