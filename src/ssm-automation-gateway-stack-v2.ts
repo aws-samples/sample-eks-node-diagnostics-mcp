@@ -29,6 +29,8 @@ export class EksNodeLogMcpStack extends cdk.Stack {
       logRetentionDays: props.logRetentionDays,
       enableEncryption: props.enableEncryption,
       enableS3DataEvents: props.enableS3DataEvents,
+      ssmDefaultHostRoleArn: props.ssmDefaultHostRoleArn,
+      eksNodeRoleArns: props.eksNodeRoleArns,
     });
   }
 }

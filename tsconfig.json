@@ -19,6 +19,6 @@
     "strictPropertyInitialization": false,
     "outDir": "./lib"
   },
-  "include": ["src/**/*", "bin/**/*"],
+  "include": ["src/**/*", "bin/**/*", "tests/**/*"],
   "exclude": ["node_modules", "cdk.out"]
 }

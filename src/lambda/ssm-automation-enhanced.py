@@ -23,11 +23,13 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
 from botocore.exceptions import ClientError
+from botocore.config import Config
 
 
 # AWS Clients - default region (where Lambda runs)
+# S3 client uses SigV4 explicitly — required for presigned URLs on KMS-encrypted buckets
 ssm_client = boto3.client('ssm')
-s3_client = boto3.client('s3')
+s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
 ec2_client = boto3.client('ec2')
 
 # Regional client cache to avoid re-creating clients per invocation
@@ -134,8 +136,88 @@ DEFAULT_CHUNK_SIZE = 1048576  # 1MB
 MAX_CHUNK_SIZE = 5242880  # 5MB
 DEFAULT_LINE_COUNT = 1000
 MAX_LINE_COUNT = 10000
-PRESIGNED_URL_EXPIRATION = 900  # 15 minutes
 FINDINGS_INDEX_FILE = 'findings_index.json'
+
+
+# =============================================================================
+# PRESIGNED URL EXPIRATION — configurable via env var (T5 mitigation)
+# =============================================================================
+
+def _parse_presigned_url_expiration() -> int:
+    """Parse PRESIGNED_URL_EXPIRATION_SECONDS env var, default to 300."""
+    raw = os.environ.get('PRESIGNED_URL_EXPIRATION_SECONDS', '')
+    try:
+        val = int(raw)
+        if val > 0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return 300
+
+PRESIGNED_URL_EXPIRATION = _parse_presigned_url_expiration()
+
+
+# =============================================================================
+# ALLOWED REGIONS — configurable via env var (T9, T11 mitigation)
+# =============================================================================
+
+ALLOWED_REGIONS = set(
+    r.strip() for r in os.environ.get('ALLOWED_REGIONS', '').split(',')
+    if r.strip()
+) or {os.environ.get('AWS_REGION', DEFAULT_REGION)}
+
+
+def validate_region(region: str) -> Optional[Dict]:
+    """
+    Validate that a region is in the allowed set.
+    Returns None if valid, or an error response dict if invalid.
+    """
+    if region not in ALLOWED_REGIONS:
+        return error_response(
+            403,
+            f"Region '{region}' is not permitted. Allowed regions: {', '.join(sorted(ALLOWED_REGIONS))}"
+        )
+    return None
+
+
+def resolve_and_validate_region(arguments: Dict, instance_id: str = None) -> tuple:
+    """
+    Resolve and validate region. Returns (region, error_response).
+    If error_response is not None, caller should return it immediately.
+    """
+    region = resolve_region(arguments, instance_id)
+    error = validate_region(region)
+    return region, error
+
+
+# =============================================================================
+# EKS INSTANCE VALIDATION — verify target is an EKS node (T4, T13 mitigation)
+# =============================================================================
+
+def validate_eks_instance(instance_id: str, region: str) -> Optional[Dict]:
+    """
+    Validate that an instance belongs to an EKS cluster by checking
+    for kubernetes.io/cluster/* tags via EC2 DescribeInstances.
+    Returns None if valid, or an error response dict if invalid.
+    """
+    try:
+        regional_ec2 = get_regional_client('ec2', region)
+        resp = regional_ec2.describe_instances(InstanceIds=[instance_id])
+        for reservation in resp.get('Reservations', []):
+            for instance in reservation.get('Instances', []):
+                tags = instance.get('Tags', [])
+                for tag in tags:
+                    if tag['Key'].startswith('kubernetes.io/cluster/'):
+                        return None  # Valid EKS instance
+        return error_response(
+            403,
+            f"Instance {instance_id} is not part of an EKS cluster "
+            f"(no kubernetes.io/cluster/* tag found)"
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+            return error_response(404, f"Instance {instance_id} not found in region {region}")
+        return error_response(500, f"Failed to validate instance {instance_id}: {str(e)}")
 
 
 class Severity(Enum):
@@ -2835,8 +2917,16 @@ def start_log_collection(arguments: Dict) -> Dict:
     if not re.match(r'^i-[0-9a-f]{8,17}$', instance_id):
         return error_response(400, f'Invalid instanceId format: {instance_id}. Expected format: i-xxxxxxxxxxxxxxxxx')
     
-    # Resolve target region (explicit > auto-detect > default)
-    target_region = resolve_region(arguments, instance_id)
+    # Resolve and validate region
+    target_region, region_error = resolve_and_validate_region(arguments, instance_id)
+    if region_error:
+        return region_error
+
+    # Validate instance belongs to an EKS cluster
+    instance_error = validate_eks_instance(instance_id, target_region)
+    if instance_error:
+        return instance_error
+
     try:
         regional_ssm = get_regional_client('ssm', target_region)
     except Exception as e:
@@ -4182,7 +4272,7 @@ def get_artifact_reference(arguments: Dict) -> Dict:
         presignedUrl, s3Uri, sha256, size
     """
     log_key = arguments.get('logKey')
-    expiration_minutes = min(arguments.get('expirationMinutes', 15), 60)
+    expiration_seconds = min(arguments.get('expirationMinutes', 0) * 60 or PRESIGNED_URL_EXPIRATION, 3600)
     
     if not log_key:
         return error_response(400, 'logKey is required')
@@ -4208,7 +4298,7 @@ def get_artifact_reference(arguments: Dict) -> Dict:
             presigned_url = s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': LOGS_BUCKET, 'Key': log_key},
-                ExpiresIn=expiration_minutes * 60
+                ExpiresIn=expiration_seconds
             )
         except Exception as e:
             return success_response({
@@ -4229,7 +4319,7 @@ def get_artifact_reference(arguments: Dict) -> Dict:
             'sizeHuman': format_bytes(head_result['size']),
             'contentType': head_result.get('content_type', 'application/octet-stream'),
             'lastModified': head_result.get('last_modified'),
-            'expiresIn': f'{expiration_minutes} minutes',
+            'expiresIn': f'{expiration_seconds} seconds',
             'note': 'Use this URL to download the full artifact. URL expires after the specified time.'
         })
         
@@ -4903,7 +4993,9 @@ def cluster_health(arguments: Dict) -> Dict:
         return error_response(400, 'clusterName is required')
 
     include_ssm = arguments.get('includeSSMStatus', True)
-    target_region = resolve_region(arguments)
+    target_region, region_error = resolve_and_validate_region(arguments)
+    if region_error:
+        return region_error
 
     try:
         regional_eks = get_regional_client('eks', target_region)
@@ -5111,6 +5203,11 @@ def compare_nodes(arguments: Dict) -> Dict:
         return error_response(400, 'instanceIds must contain at least 2 distinct instance IDs')
     if len(instance_ids) > 10:
         return error_response(400, 'Maximum 10 nodes for comparison')
+
+    # Validate region
+    target_region, region_error = resolve_and_validate_region(arguments)
+    if region_error:
+        return region_error
 
     compare_fields = arguments.get('compareFields', 'all')
 
@@ -5327,7 +5424,9 @@ def batch_collect(arguments: Dict) -> Dict:
     if not cluster_name:
         return error_response(400, 'clusterName is required')
 
-    target_region = resolve_region(arguments)
+    target_region, region_error = resolve_and_validate_region(arguments)
+    if region_error:
+        return region_error
     node_filter = arguments.get('filter', 'unhealthy')
     # Validate filter parameter
     valid_filters = ('all', 'unhealthy', 'notready')
@@ -5684,6 +5783,14 @@ def network_diagnostics(arguments: Dict) -> Dict:
     instance_id = arguments.get('instanceId')
     if not instance_id:
         return error_response(400, 'instanceId is required')
+
+    # Validate region and EKS instance
+    target_region, region_error = resolve_and_validate_region(arguments, instance_id)
+    if region_error:
+        return region_error
+    instance_error = validate_eks_instance(instance_id, target_region)
+    if instance_error:
+        return instance_error
 
     sections_str = arguments.get('sections', 'all')
     valid_sections = {'iptables', 'cni', 'routes', 'dns', 'eni', 'ipamd', 'kube_proxy'}
@@ -7065,6 +7172,14 @@ def storage_diagnostics(arguments: Dict) -> Dict:
     if not instance_id:
         return error_response(400, 'instanceId is required')
 
+    # Validate region and EKS instance
+    target_region, region_error = resolve_and_validate_region(arguments, instance_id)
+    if region_error:
+        return region_error
+    instance_error = validate_eks_instance(instance_id, target_region)
+    if instance_error:
+        return instance_error
+
     sections_str = arguments.get('sections', 'all')
     valid_sections = {'kubelet', 'ebs_csi', 'efs_csi', 'pv_pvc', 'instance'}
     if sections_str == 'all':
@@ -7811,7 +7926,15 @@ def tcpdump_capture(arguments: Dict) -> Dict:
     if command_id:
         return _poll_tcpdump_status(command_id, instance_id, arguments)
 
-    target_region = resolve_region(arguments, instance_id)
+    # Resolve and validate region
+    target_region, region_error = resolve_and_validate_region(arguments, instance_id)
+    if region_error:
+        return region_error
+
+    # Validate instance belongs to an EKS cluster
+    instance_error = validate_eks_instance(instance_id, target_region)
+    if instance_error:
+        return instance_error
 
     try:
         regional_ssm = get_regional_client('ssm', target_region)
@@ -8470,7 +8593,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 presigned_url = s3_client.generate_presigned_url(
                     'get_object',
                     Params={'Bucket': LOGS_BUCKET, 'Key': s3_key},
-                    ExpiresIn=3600,
+                    ExpiresIn=PRESIGNED_URL_EXPIRATION,
                 )
             except Exception:
                 pass
@@ -8517,7 +8640,7 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 'fileSizeHuman': format_bytes(file_size),
                 'packetCount': packet_count,
                 'presignedUrl': presigned_url,
-                'presignedUrlExpiresIn': '1 hour',
+                'presignedUrlExpiresIn': f'{PRESIGNED_URL_EXPIRATION} seconds',
                 'output': stdout[-2000:] if len(stdout) > 2000 else stdout,
                 'nextStep': f'Use tcpdump_analyze(instanceId="{instance_id}", commandId="{command_id}") to read decoded packet data and statistics.',
                 'task': {
@@ -9836,9 +9959,9 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
             results['pcapDownloadUrl'] = s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': LOGS_BUCKET, 'Key': s3_key_pcap},
-                ExpiresIn=3600,
+                ExpiresIn=PRESIGNED_URL_EXPIRATION,
             )
-            results['pcapDownloadUrlExpiresIn'] = '1 hour'
+            results['pcapDownloadUrlExpiresIn'] = f'{PRESIGNED_URL_EXPIRATION} seconds'
         except Exception:
             pass
 

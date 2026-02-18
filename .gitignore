@@ -26,6 +26,14 @@ npm-debug.log*
 # Test coverage
 coverage/
 
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Hypothesis test framework cache
+.hypothesis/
+
 # Deployment-specific outputs (contain account IDs, secrets)
 mcp-config.txt
 cdk-outputs.json

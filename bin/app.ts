@@ -14,4 +14,8 @@ new EksNodeLogMcpStack(app, 'EksNodeLogMcpStack', {
   gatewayName: 'EksNodeLogMcpGW',
   enableEncryption: true,
   logRetentionDays: 1,
+  ssmDefaultHostRoleArn: process.env.SSM_DEFAULT_HOST_ROLE_ARN,
+  eksNodeRoleArns: process.env.EKS_NODE_ROLE_ARNS
+    ? process.env.EKS_NODE_ROLE_ARNS.split(',').filter(Boolean)
+    : undefined,
 });
