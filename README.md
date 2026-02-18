@@ -1,4 +1,4 @@
-# EKS Node Log MCP
+# EKS Node Diagnostics MCP
 
 > **⚠️ Proof of Concept (POC):** This project is a proof of concept and should be tested in non-production environments first. Validate thoroughly in a staging or development account before using with production workloads.
 
