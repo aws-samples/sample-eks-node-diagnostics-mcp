@@ -1,7 +1,7 @@
 """
 EKS Node Log MCP Server - Enhanced Lambda Handler
 
-Implements world-class MCP toolset for incident response:
+MCP toolset for incident response:
 - Async task pattern with idempotency
 - Byte-range streaming for multi-GB files
 - Manifest validation and completeness verification
@@ -1981,8 +1981,7 @@ def generate_recommendations(critical_findings: List[Dict], high_findings: List[
 
 def perform_pod_node_triage(instance_id: str, findings: List[Dict], bundle_data: Dict) -> Dict:
     """
-    Perform comprehensive pod/node failure triage analysis.
-    Multi-pass scanning to ensure no errors are missed.
+    Perform pod/node failure triage analysis.
     
     Returns structured triage result with root cause, evidence, and remediation.
     """
@@ -4977,7 +4976,7 @@ def list_collection_history(arguments: Dict) -> Dict:
 
 def cluster_health(arguments: Dict) -> Dict:
     """
-    Comprehensive EKS cluster health overview.
+    EKS cluster health overview.
     Enumerates all nodes, checks SSM status, instance metadata, and flags unhealthy nodes.
 
     Inputs:
@@ -5402,7 +5401,7 @@ def _generate_comparison_insight(common: List, unique: Dict, instance_ids: List[
 
 def batch_collect(arguments: Dict) -> Dict:
     """
-    Smart batch log collection with statistical sampling.
+    Batch log collection with statistical sampling.
     Triages nodes, groups by failure signature, samples representatives.
 
     Inputs:
