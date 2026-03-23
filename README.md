@@ -160,7 +160,7 @@ EKS_NODE_ROLE_ARNS="arn:aws:iam::123456789012:role/Role1,arn:aws:iam::1234567890
 | Resource | Purpose |
 |----------|---------|
 | S3 Bucket (KMS encrypted) | Stores collected log bundles |
-| S3 Bucket (SOPs) | Stores 36 runbooks, auto-deployed via CDK |
+| S3 Bucket (SOPs) | Stores 41 runbooks, auto-deployed via CDK |
 | Lambda (SSM Automation) | Handles all 19 MCP tool invocations |
 | Lambda (Unzip) | Auto-extracts uploaded archives |
 | Lambda (Findings Indexer) | Pre-indexes errors for fast retrieval |
@@ -178,7 +178,7 @@ EKS_NODE_ROLE_ARNS="arn:aws:iam::123456789012:role/Role1,arn:aws:iam::1234567890
 If you selected node roles during the interactive deploy flow (or passed them via `EKS_NODE_ROLE_ARNS`), the CDK stack automatically grants:
 
 - S3 bucket policy: `s3:PutObject`, `s3:GetBucketPolicyStatus`, `s3:GetBucketAcl` on the logs bucket
-- KMS key policy: `kms:GenerateDataKey`, `kms:Encrypt` on the encryption key
+- KMS key policy: `kms:GenerateDataKey`, `kms:Encrypt`, `kms:Decrypt` on the encryption key (`kms:Decrypt` is required for S3 multipart uploads of files larger than ~8 MiB)
 
 No manual S3 or KMS setup is needed for those roles.
 
@@ -246,7 +246,7 @@ For a detailed walkthrough of the architecture, data flows, tool design, cross-r
 | 2 — Analysis | `search`, `correlate`, `artifact`, `summarize`, `history` | Deep investigation, correlation, summaries |
 | 3 — Cluster | `cluster_health`, `compare_nodes`, `batch_collect`, `batch_status`, `network_diagnostics` | Multi-node operations |
 | 4 — Capture | `tcpdump_capture`, `tcpdump_analyze` | Live packet capture and analysis |
-| 5 — SOPs | `list_sops`, `get_sop` | 36 structured runbooks |
+| 5 — SOPs | `list_sops`, `get_sop` | 41 structured runbooks |
 
 ### Agent Workflow
 
@@ -254,7 +254,7 @@ For a detailed walkthrough of the architecture, data flows, tool design, cross-r
 collect → status (poll) → validate → errors → search → correlate → read → summarize
 ```
 
-### Runbook Library (36 SOPs)
+### Runbook Library (41 SOPs)
 
 | Category | Coverage |
 |----------|----------|
@@ -268,6 +268,7 @@ collect → status (poll) → validate → errors → search → correlate → r
 | H — IAM/Security | Node role, IRSA/Pod Identity, IMDS |
 | I — Upgrades | Version skew |
 | J — Infrastructure | ENA/instance limits, EBS transient, AZ outage |
+| K — Workload Issues | Stuck terminating pods, probe failures, CrashLoopBackOff, containerd failures, CSI plugin |
 | Z — Catch-All | General troubleshooting |
 
 ---
@@ -303,6 +304,28 @@ i-0abc123def in kube-system. Capture UDP port 53 from inside the pod for 60s.
 I don't know what's wrong — just investigate. List the available SOPs, run a
 general triage, and follow whichever runbook matches.
 ```
+
+---
+
+## Agent Skills (Optional)
+
+A pre-built [Agent Skill](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html) is included in `skills/` to teach AWS DevOps Agent how to use this MCP server effectively. The skill loads investigation workflows, anti-hallucination guardrails, and all 41 runbook procedures into the agent's context — complementing the runtime `list_sops`/`get_sop` tools.
+
+| Skill Zip | Size | Contents |
+|-----------|------|----------|
+| [`eks-node-diagnostics.zip`](skills/eks-node-diagnostics.zip) | 188K | 21-tool workflow, 41 runbooks, VPC CNI anti-hallucination rules, storage guardrails |
+
+### Uploading the Skill
+
+1. Navigate to the **Skills** page in your [Agent Space Operator Web App](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html)
+2. Click **Add skill** → **Upload skill**
+3. Upload `skills/eks-node-diagnostics.zip`
+4. Set Agent Type to **Generic** (all agent types)
+5. Click **Upload**
+
+For more details, see the [AWS DevOps Agent Skills documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html).
+
+> **Skills vs SOPs**: The skill loads at investigation start (upfront methodology and gotchas). SOPs are fetched on-demand via `get_sop` (detailed step-by-step procedures). Use both together for best results.
 
 ---
 

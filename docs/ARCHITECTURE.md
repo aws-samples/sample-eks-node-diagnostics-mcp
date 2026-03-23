@@ -122,7 +122,7 @@ Two S3 buckets:
    tcpdump/{instance-id}/          # Packet captures
    ```
 
-2. **SOPs bucket**: Stores 36 runbook markdown files, auto-deployed via CDK `BucketDeployment` from `sops/runbooks/`.
+2. **SOPs bucket**: Stores 41 runbook markdown files, auto-deployed via CDK `BucketDeployment` from `sops/runbooks/`.
 
 ### Findings Indexer
 
@@ -312,7 +312,7 @@ Key mechanisms:
 
 | Tool | Purpose | Key Design |
 |------|---------|------------|
-| `list_sops` | Browse runbooks | Lists all 36 SOPs with title, description, severity, trigger patterns. |
+| `list_sops` | Browse runbooks | Lists all 41 SOPs with title, description, severity, trigger patterns. |
 | `get_sop` | Retrieve full SOP | Returns complete 3-phase procedure. Agent follows it step by step. |
 
 ---
@@ -347,7 +347,7 @@ The server is designed to prevent AI agents from fabricating evidence:
 
 ## SOP Runbook System
 
-36 runbooks covering the most common EKS node-level failure categories. Each follows a consistent structure:
+41 runbooks covering the most common EKS node-level failure categories. Each follows a consistent structure:
 
 ```
 Phase 1 — Triage (MUST)
