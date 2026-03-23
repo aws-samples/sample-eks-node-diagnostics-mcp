@@ -230,6 +230,28 @@ Values are also saved to `mcp-config.txt` for reference.
 
 ---
 
+## Agent Skills
+
+A pre-built [Agent Skill](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html) is included in `skills/` to teach AWS DevOps Agent how to use this MCP server effectively. The skill loads investigation workflows, anti-hallucination guardrails, and all 41 runbook procedures into the agent's context — complementing the runtime `list_sops`/`get_sop` tools.
+
+| Skill Zip | Size | Contents |
+|-----------|------|----------|
+| [`eks-node-diagnostics.zip`](skills/eks-node-diagnostics.zip) | 188K | 21-tool workflow, 41 runbooks, VPC CNI anti-hallucination rules, storage guardrails |
+
+### Uploading the Skill
+
+1. Navigate to the **Skills** page in your [Agent Space Operator Web App](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html)
+2. Click **Add skill** → **Upload skill**
+3. Upload `skills/eks-node-diagnostics.zip`
+4. Set Agent Type to **Generic** (all agent types)
+5. Click **Upload**
+
+For more details, see the [AWS DevOps Agent Skills documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html).
+
+> **Skills vs SOPs**: The skill loads at investigation start (upfront methodology and gotchas). SOPs are fetched on-demand via `get_sop` (detailed step-by-step procedures). Use both together for best results.
+
+---
+
 ## How It Works
 
 The server gives MCP-compatible agents the ability to collect full diagnostic bundles from EKS worker nodes, pre-index errors with severity classification, stream multi-GB log files without truncation, correlate events across log sources, run live tcpdump captures, compare nodes, and follow structured runbooks — all through 19 MCP tools organized in 5 tiers.
@@ -304,28 +326,6 @@ i-0abc123def in kube-system. Capture UDP port 53 from inside the pod for 60s.
 I don't know what's wrong — just investigate. List the available SOPs, run a
 general triage, and follow whichever runbook matches.
 ```
-
----
-
-## Agent Skills (Optional)
-
-A pre-built [Agent Skill](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html) is included in `skills/` to teach AWS DevOps Agent how to use this MCP server effectively. The skill loads investigation workflows, anti-hallucination guardrails, and all 41 runbook procedures into the agent's context — complementing the runtime `list_sops`/`get_sop` tools.
-
-| Skill Zip | Size | Contents |
-|-----------|------|----------|
-| [`eks-node-diagnostics.zip`](skills/eks-node-diagnostics.zip) | 188K | 21-tool workflow, 41 runbooks, VPC CNI anti-hallucination rules, storage guardrails |
-
-### Uploading the Skill
-
-1. Navigate to the **Skills** page in your [Agent Space Operator Web App](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html)
-2. Click **Add skill** → **Upload skill**
-3. Upload `skills/eks-node-diagnostics.zip`
-4. Set Agent Type to **Generic** (all agent types)
-5. Click **Upload**
-
-For more details, see the [AWS DevOps Agent Skills documentation](https://docs.aws.amazon.com/devopsagent/latest/userguide/about-aws-devops-agent-devops-agent-skills.html).
-
-> **Skills vs SOPs**: The skill loads at investigation start (upfront methodology and gotchas). SOPs are fetched on-demand via `get_sop` (detailed step-by-step procedures). Use both together for best results.
 
 ---
 
