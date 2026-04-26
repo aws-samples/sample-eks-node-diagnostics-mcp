@@ -147,11 +147,16 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     });
 
     // SSM StartAutomationExecution (region restricted via resource ARNs)
+    // Includes document resources per AWS notice (Jan 2026): StartAutomationExecution
+    // now requires permissions on 'automation-execution' and 'document' resources.
+    // 'automation-definition' retained for backward compatibility until Jan 2027 deadline.
     const ssmAutoStartResources: string[] = [];
     for (const region of allowedRegions) {
       ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
       ssmAutoStartResources.push(`arn:aws:ssm:${region}::automation-definition/*`);
       ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
+      ssmAutoStartResources.push(`arn:aws:ssm:${region}::document/*`);
+      ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     this.ssmAutomationRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMStartAutomation',
@@ -501,11 +506,15 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // SSM StartAutomationExecution
     // Region restriction is enforced via resource ARNs scoped to allowedRegions.
     // aws:RequestedRegion condition is not reliably evaluated for SSM Automation control-plane calls.
+    // Includes document resources per AWS notice (Jan 2026): StartAutomationExecution
+    // now requires permissions on 'automation-execution' and 'document' resources.
     const startAutomationResources: string[] = [];
     for (const region of allowedRegions) {
       startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
       startAutomationResources.push(`arn:aws:ssm:${region}::automation-definition/*`);
       startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
+      startAutomationResources.push(`arn:aws:ssm:${region}::document/*`);
+      startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMStartAutomation',
