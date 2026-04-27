@@ -8,6 +8,7 @@ import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -117,6 +118,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     const resourceServerName = props.resourceServerName ?? 'ssm-automation-gateway-id';
     const logRetentionDays = props.logRetentionDays ?? 1;
     const enableEncryption = props.enableEncryption ?? true;
+    const partition = cdk.Aws.PARTITION;
 
     // Default allowedRegions to the stack's region if not provided or empty
     const allowedRegions = (props.allowedRegions && props.allowedRegions.length > 0)
@@ -152,11 +154,11 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // 'automation-definition' retained for backward compatibility until Jan 2027 deadline.
     const ssmAutoStartResources: string[] = [];
     for (const region of allowedRegions) {
-      ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
-      ssmAutoStartResources.push(`arn:aws:ssm:${region}::automation-definition/*`);
-      ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
-      ssmAutoStartResources.push(`arn:aws:ssm:${region}::document/*`);
-      ssmAutoStartResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
+      ssmAutoStartResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
+      ssmAutoStartResources.push(`arn:${partition}:ssm:${region}::automation-definition/*`);
+      ssmAutoStartResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
+      ssmAutoStartResources.push(`arn:${partition}:ssm:${region}::document/*`);
+      ssmAutoStartResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     this.ssmAutomationRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMStartAutomation',
@@ -170,8 +172,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // SSM SendCommand on documents (no tag condition - AWS-owned docs have no tags)
     const ssmDocResources: string[] = [];
     for (const region of allowedRegions) {
-      ssmDocResources.push(`arn:aws:ssm:${region}::document/*`);
-      ssmDocResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
+      ssmDocResources.push(`arn:${partition}:ssm:${region}::document/*`);
+      ssmDocResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     this.ssmAutomationRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMSendCommandDocs',
@@ -185,7 +187,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       sid: 'SSMSendCommandInstances',
       effect: iam.Effect.ALLOW,
       actions: ['ssm:SendCommand'],
-      resources: [`arn:aws:ec2:*:${cdk.Stack.of(this).account}:instance/*`],
+      resources: [`arn:${partition}:ec2:*:${cdk.Stack.of(this).account}:instance/*`],
       conditions: {
         StringEquals: {
           'aws:RequestedRegion': allowedRegions,
@@ -447,6 +449,12 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       this.encryptionKey.grantEncryptDecrypt(findingsIndexerRole);
     }
 
+    const findingsIndexerLogGroup = new logs.LogGroup(this, 'FindingsIndexerLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Stack.of(this).stackName}-findings-indexer`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.findingsIndexerFunction = new lambda.Function(this, 'FindingsIndexerFunction', {
       functionName: `${cdk.Stack.of(this).stackName}-findings-indexer`,
       runtime: lambda.Runtime.PYTHON_3_11,
@@ -458,7 +466,13 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         LOGS_BUCKET_NAME: this.logsBucket.bucketName,
       },
       code: lambda.Code.fromInline(this.getFindingsIndexerCode()),
-      logRetention: logs.RetentionDays.TWO_WEEKS,
+      logGroup: findingsIndexerLogGroup,
+    });
+
+    const unzipLogGroup = new logs.LogGroup(this, 'UnzipFunctionLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Stack.of(this).stackName}-unzip-function`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     // Now create unzip function with reference to findings indexer
@@ -473,7 +487,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         FINDINGS_INDEXER_FUNCTION: this.findingsIndexerFunction.functionName,
       },
       code: lambda.Code.fromInline(this.getUnzipLambdaCode()),
-      logRetention: logs.RetentionDays.TWO_WEEKS,
+      logGroup: unzipLogGroup,
     });
 
     // Grant unzip function permission to invoke findings indexer
@@ -510,11 +524,11 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // now requires permissions on 'automation-execution' and 'document' resources.
     const startAutomationResources: string[] = [];
     for (const region of allowedRegions) {
-      startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
-      startAutomationResources.push(`arn:aws:ssm:${region}::automation-definition/*`);
-      startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
-      startAutomationResources.push(`arn:aws:ssm:${region}::document/*`);
-      startAutomationResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
+      startAutomationResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:automation-definition/*`);
+      startAutomationResources.push(`arn:${partition}:ssm:${region}::automation-definition/*`);
+      startAutomationResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:automation-execution/*`);
+      startAutomationResources.push(`arn:${partition}:ssm:${region}::document/*`);
+      startAutomationResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMStartAutomation',
@@ -528,8 +542,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // SSM SendCommand on documents (no tag condition - AWS-owned docs have no tags)
     const lambdaSsmDocResources: string[] = [];
     for (const region of allowedRegions) {
-      lambdaSsmDocResources.push(`arn:aws:ssm:${region}::document/*`);
-      lambdaSsmDocResources.push(`arn:aws:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
+      lambdaSsmDocResources.push(`arn:${partition}:ssm:${region}::document/*`);
+      lambdaSsmDocResources.push(`arn:${partition}:ssm:${region}:${cdk.Stack.of(this).account}:document/*`);
     }
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
       sid: 'SSMSendCommandDocs',
@@ -543,7 +557,7 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       sid: 'SSMSendCommandInstances',
       effect: iam.Effect.ALLOW,
       actions: ['ssm:SendCommand'],
-      resources: [`arn:aws:ec2:*:${cdk.Stack.of(this).account}:instance/*`],
+      resources: [`arn:${partition}:ec2:*:${cdk.Stack.of(this).account}:instance/*`],
       conditions: {
         StringEquals: {
           'aws:RequestedRegion': allowedRegions,
@@ -593,8 +607,8 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       effect: iam.Effect.ALLOW,
       actions: ['ssm:GetDocument', 'ssm:DescribeDocument'],
       resources: [
-        `arn:aws:ssm:*::document/AWSSupport-CollectEKSInstanceLogs`,
-        `arn:aws:ssm:*:${cdk.Stack.of(this).account}:document/*`,
+        `arn:${partition}:ssm:*::document/AWSSupport-CollectEKSInstanceLogs`,
+        `arn:${partition}:ssm:*:${cdk.Stack.of(this).account}:document/*`,
       ],
     }));
 
@@ -630,6 +644,19 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       this.encryptionKey.grantEncryptDecrypt(lambdaExecutionRole);
     }
 
+    // CloudWatch custom metrics for operational visibility
+    lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CloudWatchMetrics',
+      effect: iam.Effect.ALLOW,
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'cloudwatch:namespace': 'EksNodeLogMcp',
+        },
+      },
+    }));
+
     // PassRole for SSM
     lambdaExecutionRole.addToPolicy(new iam.PolicyStatement({
       sid: 'PassRoleForSSM',
@@ -646,6 +673,12 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     // SOP bucket read access (for list_sops / get_sop)
     this.sopBucket.grantRead(lambdaExecutionRole);
 
+    const ssmAutomationLogGroup = new logs.LogGroup(this, 'SSMAutomationLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Stack.of(this).stackName}-ssm-automation`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.ssmAutomationFunction = new lambda.Function(this, 'SSMAutomationFunction', {
       functionName: `${cdk.Stack.of(this).stackName}-ssm-automation`,
       runtime: lambda.Runtime.PYTHON_3_11,
@@ -659,9 +692,10 @@ export class SsmAutomationGatewayV2Construct extends Construct {
         SOP_BUCKET_NAME: this.sopBucket.bucketName,
         ALLOWED_REGIONS: allowedRegions.join(','),
         PRESIGNED_URL_EXPIRATION_SECONDS: String(props.presignedUrlExpirationSeconds ?? 300),
+        STACK_NAME: cdk.Stack.of(this).stackName,
       },
       code: lambda.Code.fromAsset(path.join(__dirname, 'lambda')),
-      logRetention: logs.RetentionDays.TWO_WEEKS,
+      logGroup: ssmAutomationLogGroup,
     });
 
     // ========================================================================
@@ -679,10 +713,19 @@ export class SsmAutomationGatewayV2Construct extends Construct {
       resources: [this.ssmAutomationFunction.functionArn],
     }));
 
+    const gatewayLogGroup = new logs.LogGroup(this, 'GatewayLogGroup', {
+      logGroupName: `/aws/bedrock-agentcore/${cdk.Stack.of(this).stackName}-gateway`,
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.gatewayExecutionRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
-      resources: ['*'],
+      resources: [
+        gatewayLogGroup.logGroupArn,
+        `${gatewayLogGroup.logGroupArn}:*`,
+      ],
     }));
 
     // Add Lambda resource-based policy to allow AgentCore to invoke
@@ -838,6 +881,60 @@ export class SsmAutomationGatewayV2Construct extends Construct {
     });
     gatewayTarget.node.addDependency(this.ssmAutomationFunction);
     gatewayTarget.node.addDependency(this.gatewayExecutionRole);
+
+    // ========================================================================
+    // CLOUDWATCH ALARMS — Operational visibility
+    // ========================================================================
+
+    const errorMetric = new cloudwatch.Metric({
+      namespace: 'EksNodeLogMcp',
+      metricName: 'ToolInvocationError',
+      dimensionsMap: { StackName: cdk.Stack.of(this).stackName },
+      statistic: 'Sum',
+      period: cdk.Duration.minutes(5),
+    });
+
+    new cloudwatch.Alarm(this, 'ToolErrorAlarm', {
+      alarmName: `${cdk.Stack.of(this).stackName}-tool-error-rate`,
+      alarmDescription: 'Fires when MCP tool error rate exceeds 5 errors in 5 minutes',
+      metric: errorMetric,
+      threshold: 5,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    const latencyMetric = new cloudwatch.Metric({
+      namespace: 'EksNodeLogMcp',
+      metricName: 'ToolLatency',
+      dimensionsMap: { StackName: cdk.Stack.of(this).stackName },
+      statistic: 'p99',
+      period: cdk.Duration.minutes(5),
+    });
+
+    new cloudwatch.Alarm(this, 'ToolLatencyAlarm', {
+      alarmName: `${cdk.Stack.of(this).stackName}-tool-p99-latency`,
+      alarmDescription: 'Fires when p99 tool latency exceeds 60 seconds',
+      metric: latencyMetric,
+      threshold: 60000,
+      evaluationPeriods: 3,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // Lambda error alarm (catches unhandled exceptions)
+    new cloudwatch.Alarm(this, 'LambdaErrorAlarm', {
+      alarmName: `${cdk.Stack.of(this).stackName}-lambda-errors`,
+      alarmDescription: 'Fires when Lambda function errors exceed 3 in 5 minutes',
+      metric: this.ssmAutomationFunction.metricErrors({
+        period: cdk.Duration.minutes(5),
+        statistic: 'Sum',
+      }),
+      threshold: 3,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
 
     // ========================================================================
     // OUTPUTS

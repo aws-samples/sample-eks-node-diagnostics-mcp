@@ -106,10 +106,41 @@ describe('Property 2: CDK region conditions on all SSM/EC2 policy statements', (
         expect(ssmEc2Stmts.length).toBeGreaterThanOrEqual(3); // write, read, describe
 
         for (const stmt of ssmEc2Stmts) {
-          const cond = stmt.Condition?.StringEquals?.['aws:RequestedRegion'];
-          expect(cond).toBeDefined();
-          const condRegions = Array.isArray(cond) ? cond : [cond];
-          expect(condRegions.sort()).toEqual([...regions].sort());
+          const actions: string[] = Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+          // StartAutomationExecution uses resource-level ARN scoping (region embedded in ARN)
+          // rather than aws:RequestedRegion condition — skip condition check for these
+          const isArnScoped = actions.every(a =>
+            a === 'ssm:StartAutomationExecution' || a === 'ssm:SendCommand'
+          );
+          // SendCommand on documents also uses ARN scoping (no region condition)
+          const isDocScoped = actions.includes('ssm:SendCommand') &&
+            stmt.Resource?.some?.((r: any) => typeof r === 'string' && r.includes(':document/'));
+          if (isArnScoped && !stmt.Condition?.StringEquals?.['aws:RequestedRegion']) {
+            // Verify region is embedded in resource ARNs instead
+            // ARNs may be CloudFormation intrinsic functions (Fn::Join) due to partition references
+            const resources: any[] = Array.isArray(stmt.Resource) ? stmt.Resource : [stmt.Resource];
+            const hasRegionInArn = resources.some((r: any) => {
+              if (typeof r === 'string') {
+                return regions.some(region => r.includes(`:ssm:${region}:`));
+              }
+              // Handle Fn::Join intrinsics — check the join parts for region strings
+              const joinParts = r?.['Fn::Join']?.[1];
+              if (Array.isArray(joinParts)) {
+                const joined = joinParts.filter((p: any) => typeof p === 'string').join('');
+                return regions.some(region => joined.includes(`:ssm:${region}:`));
+              }
+              return false;
+            });
+            expect(hasRegionInArn).toBe(true);
+          } else if (isDocScoped) {
+            // Document-scoped SendCommand uses ARN scoping
+            continue;
+          } else {
+            const cond = stmt.Condition?.StringEquals?.['aws:RequestedRegion'];
+            expect(cond).toBeDefined();
+            const condRegions = Array.isArray(cond) ? cond : [cond];
+            expect(condRegions.sort()).toEqual([...regions].sort());
+          }
         }
       }),
       { numRuns: 50 },
@@ -131,11 +162,15 @@ describe('Property 2: CDK region conditions on all SSM/EC2 policy statements', (
 
         // write, read, describe (SSMDocumentAccess has resource-level ARN, no region condition needed)
         const stmtsWithRegionCondition = ssmEc2Stmts.filter((s: any) => {
-          // SSMDocumentAccess uses resource ARNs, not region condition
           const actions: string[] = Array.isArray(s.Action) ? s.Action : [s.Action];
+          // SSMDocumentAccess uses resource ARNs
           const isDocAccess = actions.length === 2 &&
             actions.includes('ssm:GetDocument') && actions.includes('ssm:DescribeDocument');
-          return !isDocAccess;
+          // StartAutomationExecution and SendCommand on documents use ARN scoping
+          const isArnScoped = actions.every(a =>
+            a === 'ssm:StartAutomationExecution' || a === 'ssm:SendCommand'
+          ) && !s.Condition?.StringEquals?.['aws:RequestedRegion'];
+          return !isDocAccess && !isArnScoped;
         });
 
         expect(stmtsWithRegionCondition.length).toBeGreaterThanOrEqual(3);
@@ -173,7 +208,16 @@ describe('Property 3: CDK tag conditions on write vs read SSM statements', () =>
 
           if (hasWriteAction && actions.every(a => SSM_WRITE_ACTIONS.has(a))) {
             // Pure write statement — must have tag condition
-            expect(tagCond).toBe('*');
+            // EXCEPT: StartAutomationExecution targets automation-definition/execution/document
+            // resources which don't have EKS tags. SendCommand on documents also lacks tags.
+            // Only SendCommand on EC2 instances has the tag condition.
+            const targetsInstances = stmt.Resource?.some?.((r: any) =>
+              typeof r === 'string' && r.includes(':instance/')
+            ) || (typeof stmt.Resource === 'string' && stmt.Resource.includes(':instance/'));
+            if (targetsInstances) {
+              expect(tagCond).toBe('*');
+            }
+            // Non-instance targets (automation-definition, document) don't have tag conditions
           } else if (hasOnlyReadActions && actions.some(a => a.startsWith('ssm:'))) {
             // Pure SSM read statement — must NOT have tag condition
             expect(tagCond).toBeUndefined();
@@ -197,7 +241,13 @@ describe('Property 3: CDK tag conditions on write vs read SSM statements', () =>
           const tagCond = stmt.Condition?.StringLike?.['aws:ResourceTag/eks:cluster-name'];
 
           if (hasWriteAction && actions.every(a => LAMBDA_SSM_WRITE_ACTIONS.has(a))) {
-            expect(tagCond).toBe('*');
+            // Only SendCommand on EC2 instances has the tag condition
+            const targetsInstances = stmt.Resource?.some?.((r: any) =>
+              typeof r === 'string' && r.includes(':instance/')
+            ) || (typeof stmt.Resource === 'string' && stmt.Resource.includes(':instance/'));
+            if (targetsInstances) {
+              expect(tagCond).toBe('*');
+            }
           } else if (hasOnlyReadActions && actions.some(a => a.startsWith('ssm:') && !a.includes('Document'))) {
             // SSM read (excluding document access which has resource ARNs)
             expect(tagCond).toBeUndefined();

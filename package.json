@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
-    "test": "jest",
+    "test": "jest && python3 -m pytest tests/ -v",
+    "lint:cfn": "npx cdk synth --quiet -o cdk.out && cfn-lint cdk.out/EksNodeLogMcpStack.template.json",
     "cdk": "cdk",
     "synth": "cdk synth",
     "deploy": "cdk deploy",
@@ -23,6 +24,9 @@
     "eks",
     "troubleshooting"
   ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "author": "AWS",
   "license": "MIT-0",
   "devDependencies": {

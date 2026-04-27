@@ -20,7 +20,12 @@ export class EksNodeLogMcpStack extends cdk.Stack {
   public readonly gateway: SsmAutomationGatewayV2Construct;
 
   constructor(scope: Construct, id: string, props: SsmAutomationGatewayV2StackProps = {}) {
-    super(scope, id, props);
+    super(scope, id, {
+      ...props,
+      description: props.description ?? 'EKS Node Diagnostics MCP Server - Collects and analyzes diagnostic logs from EKS worker nodes via SSM Automation (uksb-xxxxxxx)',
+    });
+
+    this.templateOptions.templateFormatVersion = '2010-09-09';
 
     this.gateway = new SsmAutomationGatewayV2Construct(this, 'SsmAutomationGatewayV2', {
       gatewayName: props.gatewayName,

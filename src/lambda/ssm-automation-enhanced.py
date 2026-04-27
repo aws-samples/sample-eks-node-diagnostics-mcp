@@ -14,9 +14,11 @@ MCP toolset for incident response:
 
 import json
 import boto3
+import logging
 import os
 import re
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
@@ -26,11 +28,17 @@ from botocore.exceptions import ClientError
 from botocore.config import Config
 
 
+# Structured JSON logging — enables CloudWatch Logs Insights queries
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
 # AWS Clients - default region (where Lambda runs)
 # S3 client uses SigV4 explicitly — required for presigned URLs on KMS-encrypted buckets
 ssm_client = boto3.client('ssm')
 s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
 ec2_client = boto3.client('ec2')
+cloudwatch_client = boto3.client('cloudwatch')
 
 # Regional client cache to avoid re-creating clients per invocation
 _regional_clients: Dict[str, Dict[str, Any]] = {}
@@ -39,6 +47,27 @@ _regional_clients: Dict[str, Dict[str, Any]] = {}
 LOGS_BUCKET = os.environ['LOGS_BUCKET_NAME']
 SSM_AUTOMATION_ROLE_ARN = os.environ.get('SSM_AUTOMATION_ROLE_ARN', '')
 DEFAULT_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+STACK_NAME = os.environ.get('STACK_NAME', 'EksNodeLogMcp')
+
+
+def emit_metric(metric_name: str, value: float = 1.0, unit: str = 'Count',
+                dimensions: Optional[List[Dict[str, str]]] = None) -> None:
+    """Emit a CloudWatch custom metric for operational visibility."""
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace='EksNodeLogMcp',
+            MetricData=[{
+                'MetricName': metric_name,
+                'Value': value,
+                'Unit': unit,
+                'Dimensions': dimensions or [
+                    {'Name': 'StackName', 'Value': STACK_NAME},
+                ],
+            }],
+        )
+    except Exception:
+        # Metrics are best-effort — never fail the request over a metric
+        pass
 
 
 def get_regional_client(service: str, region: str) -> Any:
@@ -2780,21 +2809,23 @@ def get_sop(arguments: Dict) -> Dict:
         return error_response(500, f'Failed to get SOP: {str(e)}')
 
 
-def lambda_handler(event, context):
+def lambda_handler(event: Dict, context: Any) -> Dict:
     """Main Lambda handler - routes to appropriate tool function."""
-    print(f"Received event: {json.dumps(event)}")
-    
+    start_time = time.time()
+
+    logger.info(json.dumps({'event': 'invocation_start', 'payload': event}, default=str))
+
     # Extract tool name from AgentCore context
     delimiter = "___"
     original_tool_name = context.client_context.custom.get('bedrockAgentCoreToolName', '')
-    
+
     if delimiter in original_tool_name:
         tool_name = original_tool_name[original_tool_name.index(delimiter) + len(delimiter):]
     else:
         tool_name = original_tool_name
-    
-    print(f"Executing tool: {tool_name}")
-    
+
+    logger.info(json.dumps({'event': 'tool_dispatch', 'tool': tool_name}))
+
     # Tool routing
     tools = {
         # Core Operations (Tier 1)
@@ -2803,7 +2834,7 @@ def lambda_handler(event, context):
         'validate': validate_bundle_completeness,
         'errors': get_error_summary,
         'read': read_log_chunk,
-        
+
         # Advanced Analysis (Tier 2)
         'search': search_logs_deep,
         'correlate': correlate_events,
@@ -2824,18 +2855,45 @@ def lambda_handler(event, context):
         'list_sops': list_sops,
         'get_sop': get_sop,
     }
-    
+
     if tool_name not in tools:
+        emit_metric('ToolInvocationError', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ErrorType', 'Value': 'UnknownTool'},
+        ])
         return error_response(400, f'Unknown tool: {tool_name}', {
             'available_tools': list(tools.keys())
         })
-    
+
     try:
-        return tools[tool_name](event)
+        result = tools[tool_name](event)
+        duration_ms = (time.time() - start_time) * 1000
+        emit_metric('ToolInvocation', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ToolName', 'Value': tool_name},
+        ])
+        emit_metric('ToolLatency', value=duration_ms, unit='Milliseconds', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ToolName', 'Value': tool_name},
+        ])
+        logger.info(json.dumps({
+            'event': 'tool_complete', 'tool': tool_name,
+            'duration_ms': round(duration_ms, 1),
+            'status_code': result.get('statusCode', 0),
+        }))
+        return result
     except Exception as e:
-        print(f"Error executing {tool_name}: {str(e)}")
+        duration_ms = (time.time() - start_time) * 1000
+        logger.error(json.dumps({
+            'event': 'tool_error', 'tool': tool_name,
+            'error': str(e), 'duration_ms': round(duration_ms, 1),
+        }))
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
+        emit_metric('ToolInvocationError', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ToolName', 'Value': tool_name},
+        ])
         return error_response(500, f'Internal error: {str(e)}')
 
 
@@ -8295,7 +8353,7 @@ lines = tcpdump_lines()
 total = len(lines)
 
 # Extract IPs from tcpdump output: field 3 = src (IP.port), field 5 = dst (IP.port:)
-ip_port_re = re.compile(r'^(\d+\.\d+\.\d+\.\d+)\.\d+$')
+ip_port_re = re.compile(r'^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\.\\d+$')
 src_counter, dst_counter = Counter(), Counter()
 for line in lines:
     parts = line.split()
