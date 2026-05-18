@@ -8,86 +8,6 @@ MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS 
 
 ---
 
-## Security Model
-
-All security controls are enforced by default. The construct fails synth unless you make an explicit cluster scope choice — there is no implicit wildcard.
-
-### Defaults (no extra config)
-
-| Control | Default | Configurable via |
-|---------|---------|------------------|
-| **Region restriction** | Stack region only | `ALLOWED_REGIONS` env var |
-| **Cluster restriction** | **Fail-closed** — must set `ALLOWED_CLUSTER_NAMES` or `ALLOW_ANY_CLUSTER_NAME=true` | `ALLOWED_CLUSTER_NAMES`, `ALLOW_ANY_CLUSTER_NAME` |
-| **SSM document restriction** | `AWS-RunShellScript` only | `ALLOWED_SSM_DOCUMENTS` env var |
-| **tcpdump tools** | Removed from routing table | `ENABLED_RESTRICTED_TOOLS` env var |
-| **Presigned URL expiry (logs)** | 300 s, max 900 s | `PRESIGNED_URL_EXPIRATION` env var |
-| **Presigned URL expiry (pcap)** | 60 s, max 300 s | `PCAP_PRESIGNED_URL_EXPIRATION` env var |
-| **Per-tool authorization** | All authenticated callers may invoke any non-restricted tool | `TOOL_AUTHORIZATION` env var |
-| **Per-caller rate limit** | 60 invocations / min / caller | `PER_CALLER_RATE_LIMIT_PER_MINUTE` env var (0 disables) |
-| **VPC endpoints (S3, KMS, SSM, EC2, Logs, Metrics)** | Off (Lambda runs outside a VPC) | `MCP_VPC_ID` + `MCP_VPC_SUBNET_IDS` |
-| **Pcap upload bound** | 200 MiB (warns when exceeded) | `MAX_PCAP_BYTES` env var |
-| **Response redaction** | SG/ENI/subnet/VPC IDs, account IDs in ARNs, private IPs (network tools), IAM error bodies, JWT/AKIA tokens, fields named `*password*`/`*secret*`/`*token*`/`*credential*` | Always on |
-| **S3 encryption** | SSE-KMS with auto-rotating key | `enableEncryption` CDK prop |
-| **S3 public access** | Blocked | Always on |
-| **S3 transport** | SSL enforced | Always on |
-| **Authentication** | Cognito OAuth2 client credentials | Always on |
-| **EKS instance validation** | Tag-based + EKS API cross-reference | Always on |
-| **BPF filter validation** | Allowlist-based (not denylist) | Always on |
-| **Idempotency writes** | S3 conditional writes (`IfNoneMatch=*`) | Always on |
-| **Baseline counter writes** | Optimistic concurrency (`IfMatch=<VersionId>`, retry on `PreconditionFailed`) | Always on |
-| **Log auto-deletion** | 1 day | `logRetentionDays` CDK prop |
-
-### IAM Scoping
-
-`ssm:SendCommand` is restricted at three levels:
-
-1. **Resource ARNs** — instance ARNs are scoped to `ALLOWED_REGIONS` (e.g., `arn:aws:ec2:us-west-2:ACCOUNT:instance/*`). Document ARNs are scoped to specific document names (e.g., `document/AWS-RunShellScript`).
-2. **Tag conditions** — instances must have the `eks:cluster-name` tag matching `ALLOWED_CLUSTER_NAMES`. With specific names, the condition uses `StringEquals` (exact match). The wildcard form (`StringLike: *`) is only emitted when `ALLOW_ANY_CLUSTER_NAME=true`.
-3. **Region conditions** — all SSM, EC2, and EKS actions include `aws:RequestedRegion` conditions.
-
-If `ALLOWED_CLUSTER_NAMES` is empty **and** `ALLOW_ANY_CLUSTER_NAME` is not `true`, `cdk synth` fails with:
-
-```
-Error: SsmAutomationGatewayV2: must set either `allowedClusterNames` (preferred)
-or `allowAnyClusterName: true` to acknowledge that ssm:SendCommand should be
-permitted against every EKS cluster in this account.
-```
-
-This prevents accidental deploys with an unrestricted instance scope.
-
-### Per-Tool Authorization & Rate Limiting
-
-Every invocation extracts the caller's Cognito `client_id` and `sub` from the JWT claims forwarded by the AgentCore Gateway. Two checks then run before dispatch:
-
-1. **Per-tool ACL** — `TOOL_AUTHORIZATION` is a `;`-delimited list of `tool:client_a,client_b` entries. Tools listed get a non-empty allow-set (only those clients may invoke). Tools listed with an empty set are deny-all. Tools not listed remain open to all authenticated callers.
-2. **Token-bucket rate limit** — best-effort, per-caller, in a single warm container. Default 60/min. Returns HTTP 429 with `retryAfterSeconds` when exceeded. Set `PER_CALLER_RATE_LIMIT_PER_MINUTE=0` to disable.
-
-### tcpdump Tools
-
-`tcpdump_capture` and `tcpdump_analyze` are **not available by default**. They are completely removed from the Lambda's tool routing table — they don't appear in `available_tools` and cannot be invoked. To enable them, set `ENABLED_RESTRICTED_TOOLS=tcpdump_capture,tcpdump_analyze` before deploying. Even when enabled:
-
-- Each capture requires `confirmCapture=true`.
-- tcpdump will not be auto-installed on nodes (the script bails with manual install instructions).
-- Pcap presigned URLs use the shorter `PCAP_PRESIGNED_URL_EXPIRATION` window (default 60 s).
-- Captures larger than `MAX_PCAP_BYTES` (default 200 MiB) surface a warning in the response.
-
-### Response Redaction
-
-`redact_response` runs on every Lambda response before it returns to the gateway:
-
-- Resource IDs (`sg-…`, `eni-…`, `subnet-…`, `vpc-…`, `vol-…`, `fs-…`) are masked to `<prefix>-***`.
-- Account IDs in ARNs are replaced with `***`.
-- AWS access keys (`AKIA…`, `ASIA…`) and JWT-shaped strings are masked.
-- IAM/credential error message bodies (`AccessDenied`, `Unauthorized`, `not authorized to perform`, `ExpiredToken`, etc.) are collapsed to `<iam-error-details-redacted>`.
-- For network-related tools (`network_diagnostics`, `tcpdump_*`, `cluster_health`, `storage_diagnostics`), RFC1918 + CGNAT private IPs are masked to `<private-ip>`.
-- Fields whose key contains `password`, `secret`, `token`, `apikey`, or `credential` are replaced with `<redacted>`. `volumeHandle`/`volume_handle` is truncated to 24 chars.
-
-### VPC Endpoints (optional)
-
-Setting `MCP_VPC_ID` and `MCP_VPC_SUBNET_IDS` attaches the Lambda to your VPC and provisions a gateway endpoint for S3 plus interface endpoints for KMS, SSM, SSM Messages, EC2, CloudWatch Logs, and CloudWatch Metrics. SDK calls and presigned-URL traffic stay on the AWS network instead of the public internet.
-
----
-
 ## Prerequisites
 
 ### 1. Node.js (v18.x or later)
@@ -299,6 +219,86 @@ MAX_PCAP_BYTES=104857600 \
 | Cognito User Pool | OAuth2 authentication for MCP Gateway |
 | BedrockAgentCore Gateway | MCP protocol endpoint |
 | KMS Key | Encrypts all data at rest |
+
+---
+
+## Security Model
+
+All security controls are enforced by default. The construct fails synth unless you make an explicit cluster scope choice — there is no implicit wildcard.
+
+### Defaults (no extra config)
+
+| Control | Default | Configurable via |
+|---------|---------|------------------|
+| **Region restriction** | Stack region only | `ALLOWED_REGIONS` env var |
+| **Cluster restriction** | **Fail-closed** — must set `ALLOWED_CLUSTER_NAMES` or `ALLOW_ANY_CLUSTER_NAME=true` | `ALLOWED_CLUSTER_NAMES`, `ALLOW_ANY_CLUSTER_NAME` |
+| **SSM document restriction** | `AWS-RunShellScript` only | `ALLOWED_SSM_DOCUMENTS` env var |
+| **tcpdump tools** | Removed from routing table | `ENABLED_RESTRICTED_TOOLS` env var |
+| **Presigned URL expiry (logs)** | 300 s, max 900 s | `PRESIGNED_URL_EXPIRATION` env var |
+| **Presigned URL expiry (pcap)** | 60 s, max 300 s | `PCAP_PRESIGNED_URL_EXPIRATION` env var |
+| **Per-tool authorization** | All authenticated callers may invoke any non-restricted tool | `TOOL_AUTHORIZATION` env var |
+| **Per-caller rate limit** | 60 invocations / min / caller | `PER_CALLER_RATE_LIMIT_PER_MINUTE` env var (0 disables) |
+| **VPC endpoints (S3, KMS, SSM, EC2, Logs, Metrics)** | Off (Lambda runs outside a VPC) | `MCP_VPC_ID` + `MCP_VPC_SUBNET_IDS` |
+| **Pcap upload bound** | 200 MiB (warns when exceeded) | `MAX_PCAP_BYTES` env var |
+| **Response redaction** | SG/ENI/subnet/VPC IDs, account IDs in ARNs, private IPs (network tools), IAM error bodies, JWT/AKIA tokens, fields named `*password*`/`*secret*`/`*token*`/`*credential*` | Always on |
+| **S3 encryption** | SSE-KMS with auto-rotating key | `enableEncryption` CDK prop |
+| **S3 public access** | Blocked | Always on |
+| **S3 transport** | SSL enforced | Always on |
+| **Authentication** | Cognito OAuth2 client credentials | Always on |
+| **EKS instance validation** | Tag-based + EKS API cross-reference | Always on |
+| **BPF filter validation** | Allowlist-based (not denylist) | Always on |
+| **Idempotency writes** | S3 conditional writes (`IfNoneMatch=*`) | Always on |
+| **Baseline counter writes** | Optimistic concurrency (`IfMatch=<VersionId>`, retry on `PreconditionFailed`) | Always on |
+| **Log auto-deletion** | 1 day | `logRetentionDays` CDK prop |
+
+### IAM Scoping
+
+`ssm:SendCommand` is restricted at three levels:
+
+1. **Resource ARNs** — instance ARNs are scoped to `ALLOWED_REGIONS` (e.g., `arn:aws:ec2:us-west-2:ACCOUNT:instance/*`). Document ARNs are scoped to specific document names (e.g., `document/AWS-RunShellScript`).
+2. **Tag conditions** — instances must have the `eks:cluster-name` tag matching `ALLOWED_CLUSTER_NAMES`. With specific names, the condition uses `StringEquals` (exact match). The wildcard form (`StringLike: *`) is only emitted when `ALLOW_ANY_CLUSTER_NAME=true`.
+3. **Region conditions** — all SSM, EC2, and EKS actions include `aws:RequestedRegion` conditions.
+
+If `ALLOWED_CLUSTER_NAMES` is empty **and** `ALLOW_ANY_CLUSTER_NAME` is not `true`, `cdk synth` fails with:
+
+```
+Error: SsmAutomationGatewayV2: must set either `allowedClusterNames` (preferred)
+or `allowAnyClusterName: true` to acknowledge that ssm:SendCommand should be
+permitted against every EKS cluster in this account.
+```
+
+This prevents accidental deploys with an unrestricted instance scope.
+
+### Per-Tool Authorization & Rate Limiting
+
+Every invocation extracts the caller's Cognito `client_id` and `sub` from the JWT claims forwarded by the AgentCore Gateway. Two checks then run before dispatch:
+
+1. **Per-tool ACL** — `TOOL_AUTHORIZATION` is a `;`-delimited list of `tool:client_a,client_b` entries. Tools listed get a non-empty allow-set (only those clients may invoke). Tools listed with an empty set are deny-all. Tools not listed remain open to all authenticated callers.
+2. **Token-bucket rate limit** — best-effort, per-caller, in a single warm container. Default 60/min. Returns HTTP 429 with `retryAfterSeconds` when exceeded. Set `PER_CALLER_RATE_LIMIT_PER_MINUTE=0` to disable.
+
+### tcpdump Tools
+
+`tcpdump_capture` and `tcpdump_analyze` are **not available by default**. They are completely removed from the Lambda's tool routing table — they don't appear in `available_tools` and cannot be invoked. To enable them, set `ENABLED_RESTRICTED_TOOLS=tcpdump_capture,tcpdump_analyze` before deploying. Even when enabled:
+
+- Each capture requires `confirmCapture=true`.
+- tcpdump will not be auto-installed on nodes (the script bails with manual install instructions).
+- Pcap presigned URLs use the shorter `PCAP_PRESIGNED_URL_EXPIRATION` window (default 60 s).
+- Captures larger than `MAX_PCAP_BYTES` (default 200 MiB) surface a warning in the response.
+
+### Response Redaction
+
+`redact_response` runs on every Lambda response before it returns to the gateway:
+
+- Resource IDs (`sg-…`, `eni-…`, `subnet-…`, `vpc-…`, `vol-…`, `fs-…`) are masked to `<prefix>-***`.
+- Account IDs in ARNs are replaced with `***`.
+- AWS access keys (`AKIA…`, `ASIA…`) and JWT-shaped strings are masked.
+- IAM/credential error message bodies (`AccessDenied`, `Unauthorized`, `not authorized to perform`, `ExpiredToken`, etc.) are collapsed to `<iam-error-details-redacted>`.
+- For network-related tools (`network_diagnostics`, `tcpdump_*`, `cluster_health`, `storage_diagnostics`), RFC1918 + CGNAT private IPs are masked to `<private-ip>`.
+- Fields whose key contains `password`, `secret`, `token`, `apikey`, or `credential` are replaced with `<redacted>`. `volumeHandle`/`volume_handle` is truncated to 24 chars.
+
+### VPC Endpoints (optional)
+
+Setting `MCP_VPC_ID` and `MCP_VPC_SUBNET_IDS` attaches the Lambda to your VPC and provisions a gateway endpoint for S3 plus interface endpoints for KMS, SSM, SSM Messages, EC2, CloudWatch Logs, and CloudWatch Metrics. SDK calls and presigned-URL traffic stay on the AWS network instead of the public internet.
 
 ---
 
