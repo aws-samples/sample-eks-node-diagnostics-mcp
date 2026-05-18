@@ -332,6 +332,53 @@ else
 fi
 
 # Deploy the stack
+echo ""
+echo "=============================================="
+echo "Security Scoping Configuration"
+echo "=============================================="
+echo ""
+
+# --- ALLOWED_REGIONS: derive from selected clusters ---
+if [ -z "$ALLOWED_REGIONS" ]; then
+  if [ "${#SELECTED_CLUSTERS[@]:-0}" -gt 0 ] 2>/dev/null; then
+    # Extract unique regions from selected clusters (format: "region/cluster-name")
+    DETECTED_REGIONS=()
+    for ENTRY in "${SELECTED_CLUSTERS[@]}"; do
+      C_REGION="${ENTRY%%/*}"
+      ALREADY=false
+      for R in "${DETECTED_REGIONS[@]}"; do
+        if [ "$R" = "$C_REGION" ]; then ALREADY=true; break; fi
+      done
+      if [ "$ALREADY" = false ]; then
+        DETECTED_REGIONS+=("$C_REGION")
+      fi
+    done
+    ALLOWED_REGIONS=$(IFS=','; echo "${DETECTED_REGIONS[*]}")
+    echo "Allowed regions (from selected clusters): $ALLOWED_REGIONS"
+  else
+    ALLOWED_REGIONS="$REGION"
+    echo "Allowed regions (deploy region only): $ALLOWED_REGIONS"
+  fi
+  export ALLOWED_REGIONS
+fi
+
+# --- ALLOWED_CLUSTER_NAMES: derive from selected clusters ---
+if [ -z "$ALLOWED_CLUSTER_NAMES" ]; then
+  if [ "${#SELECTED_CLUSTERS[@]:-0}" -gt 0 ] 2>/dev/null; then
+    DETECTED_CLUSTERS=()
+    for ENTRY in "${SELECTED_CLUSTERS[@]}"; do
+      C_NAME="${ENTRY#*/}"
+      DETECTED_CLUSTERS+=("$C_NAME")
+    done
+    ALLOWED_CLUSTER_NAMES=$(IFS=','; echo "${DETECTED_CLUSTERS[*]}")
+    echo "Allowed cluster names: $ALLOWED_CLUSTER_NAMES"
+  else
+    echo "Allowed cluster names: (any EKS cluster — no clusters were selected)"
+  fi
+  export ALLOWED_CLUSTER_NAMES
+fi
+
+echo ""
 echo "Deploying CDK stack..."
 npx cdk deploy "$STACK_NAME" --require-approval never --outputs-file cdk-outputs.json
 
@@ -410,57 +457,68 @@ OAUTH_CLIENT_SECRET=$CLIENT_SECRET
 TOKEN_URL=$TOKEN_URL
 OAUTH_SCOPE=$OAUTH_SCOPE
 LOGS_BUCKET=$LOGS_BUCKET
+
+# Security Scoping
+ALLOWED_REGIONS=${ALLOWED_REGIONS:-$REGION}
+ALLOWED_CLUSTER_NAMES=${ALLOWED_CLUSTER_NAMES:-(any EKS cluster)}
+ALLOWED_SSM_DOCUMENTS=${ALLOWED_SSM_DOCUMENTS:-AWS-RunShellScript}
+PRESIGNED_URL_EXPIRATION=${PRESIGNED_URL_EXPIRATION:-300}
+ENABLED_RESTRICTED_TOOLS=${ENABLED_RESTRICTED_TOOLS:-(none — tcpdump disabled)}
 EOF
 
 echo "Configuration saved to: $CONFIG_FILE"
 echo ""
 echo "=============================================="
-echo "AVAILABLE MCP TOOLS"
+echo "SECURITY SCOPING"
 echo "=============================================="
 echo ""
-echo "TIER 1: CORE OPERATIONS"
-echo "------------------------"
-echo "1. start_log_collection"
-echo "   - Start log collection with idempotency support"
-echo "   - Parameters: instanceId (required), idempotencyToken (optional)"
+echo "  Allowed Regions:        ${ALLOWED_REGIONS:-$REGION}"
+echo "  Allowed Clusters:       ${ALLOWED_CLUSTER_NAMES:-(any EKS cluster)}"
+echo "  Allowed SSM Documents:  ${ALLOWED_SSM_DOCUMENTS:-AWS-RunShellScript}"
+echo "  Presigned URL Expiry:   ${PRESIGNED_URL_EXPIRATION:-300}s (max 900s)"
+echo "  Restricted Tools:       ${ENABLED_RESTRICTED_TOOLS:-(none — tcpdump not available)}"
 echo ""
-echo "2. get_collection_status"
-echo "   - Get detailed status with progress tracking"
-echo "   - Parameters: executionId (required), includeStepDetails (optional)"
+echo "  IAM enforces: ssm:SendCommand only on instances tagged with the"
+echo "  selected cluster names, in the allowed regions, using the allowed"
+echo "  SSM documents. tcpdump tools are removed from the routing table"
+echo "  unless explicitly enabled via ENABLED_RESTRICTED_TOOLS."
 echo ""
-echo "3. validate_bundle_completeness"
-echo "   - Verify all expected files were extracted"
-echo "   - Parameters: executionId or instanceId"
+echo "=============================================="
+echo "AVAILABLE MCP TOOLS (20)"
+echo "=============================================="
 echo ""
-echo "4. get_error_summary"
-echo "   - Get pre-indexed error findings (fast path)"
-echo "   - Parameters: instanceId (required), severity (optional)"
+echo "TIER 1 — CORE OPERATIONS"
+echo "  collect              Start log collection with idempotency"
+echo "  status               Get collection status with progress tracking"
+echo "  validate             Verify all expected files were extracted"
+echo "  errors               Get pre-indexed error findings (fast path)"
+echo "  read                 Byte-range streaming for multi-GB files"
 echo ""
-echo "5. read_log_chunk"
-echo "   - Byte-range streaming for multi-GB files (NO TRUNCATION)"
-echo "   - Parameters: logKey (required), startByte/endByte or startLine/lineCount"
+echo "TIER 2 — ADVANCED ANALYSIS"
+echo "  search               Full-text regex search across all logs"
+echo "  correlate            Cross-file timeline correlation"
+echo "  artifact             Secure presigned URLs for large artifacts"
+echo "  summarize            AI-ready structured incident summary"
+echo "  quick_triage         Rapid node health assessment"
+echo "  history              Audit trail of past collections"
 echo ""
-echo "TIER 2: ADVANCED ANALYSIS"
-echo "-------------------------"
-echo "6. search_logs_deep"
-echo "   - Full-text regex search across all logs"
-echo "   - Parameters: instanceId, query (required), logTypes, maxResults"
+echo "TIER 3 — CLUSTER INTELLIGENCE"
+echo "  cluster_health       Cluster-wide node health overview"
+echo "  compare_nodes        Compare healthy vs unhealthy nodes"
+echo "  batch_collect        Batch log collection with sampling"
+echo "  batch_status         Batch collection status"
+echo "  network_diagnostics  Network stack analysis (CNI, iptables, DNS)"
+echo "  storage_diagnostics  Storage/volume/CSI analysis"
 echo ""
-echo "7. correlate_events"
-echo "   - Cross-file timeline correlation"
-echo "   - Parameters: instanceId (required), timeWindow, pivotEvent"
+echo "TIER 4 — LIVE CAPTURE (disabled by default)"
+echo "  tcpdump_capture      Live packet capture via SSM"
+echo "  tcpdump_analyze      Analyze captured pcap files"
+echo "  NOTE: These tools are removed from the routing table unless"
+echo "        ENABLED_RESTRICTED_TOOLS includes them."
 echo ""
-echo "8. get_artifact_reference"
-echo "   - Secure presigned URLs for large artifacts"
-echo "   - Parameters: logKey (required), expirationMinutes"
-echo ""
-echo "9. generate_incident_summary"
-echo "   - AI-ready structured incident summary"
-echo "   - Parameters: instanceId (required), includeRecommendations"
-echo ""
-echo "10. list_collection_history"
-echo "    - Audit trail of past collections"
-echo "    - Parameters: instanceId, maxResults, status (all optional)"
+echo "TIER 5 — SOPs"
+echo "  list_sops            List available runbooks"
+echo "  get_sop              Retrieve a specific runbook"
 echo ""
 echo "=============================================="
 echo "EXAMPLE PROMPT FOR DEVOPS AGENT"
