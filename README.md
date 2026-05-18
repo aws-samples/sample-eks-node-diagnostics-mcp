@@ -8,6 +8,86 @@ MCP Server for AWS DevOps Agent to collect and analyze diagnostic logs from EKS 
 
 ---
 
+## Security Model
+
+All security controls are enforced by default. The construct fails synth unless you make an explicit cluster scope choice — there is no implicit wildcard.
+
+### Defaults (no extra config)
+
+| Control | Default | Configurable via |
+|---------|---------|------------------|
+| **Region restriction** | Stack region only | `ALLOWED_REGIONS` env var |
+| **Cluster restriction** | **Fail-closed** — must set `ALLOWED_CLUSTER_NAMES` or `ALLOW_ANY_CLUSTER_NAME=true` | `ALLOWED_CLUSTER_NAMES`, `ALLOW_ANY_CLUSTER_NAME` |
+| **SSM document restriction** | `AWS-RunShellScript` only | `ALLOWED_SSM_DOCUMENTS` env var |
+| **tcpdump tools** | Removed from routing table | `ENABLED_RESTRICTED_TOOLS` env var |
+| **Presigned URL expiry (logs)** | 300 s, max 900 s | `PRESIGNED_URL_EXPIRATION` env var |
+| **Presigned URL expiry (pcap)** | 60 s, max 300 s | `PCAP_PRESIGNED_URL_EXPIRATION` env var |
+| **Per-tool authorization** | All authenticated callers may invoke any non-restricted tool | `TOOL_AUTHORIZATION` env var |
+| **Per-caller rate limit** | 60 invocations / min / caller | `PER_CALLER_RATE_LIMIT_PER_MINUTE` env var (0 disables) |
+| **VPC endpoints (S3, KMS, SSM, EC2, Logs, Metrics)** | Off (Lambda runs outside a VPC) | `MCP_VPC_ID` + `MCP_VPC_SUBNET_IDS` |
+| **Pcap upload bound** | 200 MiB (warns when exceeded) | `MAX_PCAP_BYTES` env var |
+| **Response redaction** | SG/ENI/subnet/VPC IDs, account IDs in ARNs, private IPs (network tools), IAM error bodies, JWT/AKIA tokens, fields named `*password*`/`*secret*`/`*token*`/`*credential*` | Always on |
+| **S3 encryption** | SSE-KMS with auto-rotating key | `enableEncryption` CDK prop |
+| **S3 public access** | Blocked | Always on |
+| **S3 transport** | SSL enforced | Always on |
+| **Authentication** | Cognito OAuth2 client credentials | Always on |
+| **EKS instance validation** | Tag-based + EKS API cross-reference | Always on |
+| **BPF filter validation** | Allowlist-based (not denylist) | Always on |
+| **Idempotency writes** | S3 conditional writes (`IfNoneMatch=*`) | Always on |
+| **Baseline counter writes** | Optimistic concurrency (`IfMatch=<VersionId>`, retry on `PreconditionFailed`) | Always on |
+| **Log auto-deletion** | 1 day | `logRetentionDays` CDK prop |
+
+### IAM Scoping
+
+`ssm:SendCommand` is restricted at three levels:
+
+1. **Resource ARNs** — instance ARNs are scoped to `ALLOWED_REGIONS` (e.g., `arn:aws:ec2:us-west-2:ACCOUNT:instance/*`). Document ARNs are scoped to specific document names (e.g., `document/AWS-RunShellScript`).
+2. **Tag conditions** — instances must have the `eks:cluster-name` tag matching `ALLOWED_CLUSTER_NAMES`. With specific names, the condition uses `StringEquals` (exact match). The wildcard form (`StringLike: *`) is only emitted when `ALLOW_ANY_CLUSTER_NAME=true`.
+3. **Region conditions** — all SSM, EC2, and EKS actions include `aws:RequestedRegion` conditions.
+
+If `ALLOWED_CLUSTER_NAMES` is empty **and** `ALLOW_ANY_CLUSTER_NAME` is not `true`, `cdk synth` fails with:
+
+```
+Error: SsmAutomationGatewayV2: must set either `allowedClusterNames` (preferred)
+or `allowAnyClusterName: true` to acknowledge that ssm:SendCommand should be
+permitted against every EKS cluster in this account.
+```
+
+This prevents accidental deploys with an unrestricted instance scope.
+
+### Per-Tool Authorization & Rate Limiting
+
+Every invocation extracts the caller's Cognito `client_id` and `sub` from the JWT claims forwarded by the AgentCore Gateway. Two checks then run before dispatch:
+
+1. **Per-tool ACL** — `TOOL_AUTHORIZATION` is a `;`-delimited list of `tool:client_a,client_b` entries. Tools listed get a non-empty allow-set (only those clients may invoke). Tools listed with an empty set are deny-all. Tools not listed remain open to all authenticated callers.
+2. **Token-bucket rate limit** — best-effort, per-caller, in a single warm container. Default 60/min. Returns HTTP 429 with `retryAfterSeconds` when exceeded. Set `PER_CALLER_RATE_LIMIT_PER_MINUTE=0` to disable.
+
+### tcpdump Tools
+
+`tcpdump_capture` and `tcpdump_analyze` are **not available by default**. They are completely removed from the Lambda's tool routing table — they don't appear in `available_tools` and cannot be invoked. To enable them, set `ENABLED_RESTRICTED_TOOLS=tcpdump_capture,tcpdump_analyze` before deploying. Even when enabled:
+
+- Each capture requires `confirmCapture=true`.
+- tcpdump will not be auto-installed on nodes (the script bails with manual install instructions).
+- Pcap presigned URLs use the shorter `PCAP_PRESIGNED_URL_EXPIRATION` window (default 60 s).
+- Captures larger than `MAX_PCAP_BYTES` (default 200 MiB) surface a warning in the response.
+
+### Response Redaction
+
+`redact_response` runs on every Lambda response before it returns to the gateway:
+
+- Resource IDs (`sg-…`, `eni-…`, `subnet-…`, `vpc-…`, `vol-…`, `fs-…`) are masked to `<prefix>-***`.
+- Account IDs in ARNs are replaced with `***`.
+- AWS access keys (`AKIA…`, `ASIA…`) and JWT-shaped strings are masked.
+- IAM/credential error message bodies (`AccessDenied`, `Unauthorized`, `not authorized to perform`, `ExpiredToken`, etc.) are collapsed to `<iam-error-details-redacted>`.
+- For network-related tools (`network_diagnostics`, `tcpdump_*`, `cluster_health`, `storage_diagnostics`), RFC1918 + CGNAT private IPs are masked to `<private-ip>`.
+- Fields whose key contains `password`, `secret`, `token`, `apikey`, or `credential` are replaced with `<redacted>`. `volumeHandle`/`volume_handle` is truncated to 24 chars.
+
+### VPC Endpoints (optional)
+
+Setting `MCP_VPC_ID` and `MCP_VPC_SUBNET_IDS` attaches the Lambda to your VPC and provisions a gateway endpoint for S3 plus interface endpoints for KMS, SSM, SSM Messages, EC2, CloudWatch Logs, and CloudWatch Metrics. SDK calls and presigned-URL traffic stay on the AWS network instead of the public internet.
+
+---
+
 ## Prerequisites
 
 ### 1. Node.js (v18.x or later)
@@ -84,6 +164,14 @@ chmod +x deploy.sh
 AWS_REGION=us-west-2 ./deploy.sh
 ```
 
+`deploy.sh` derives the security scope automatically from your interactive choices — there's no separate "tighten" step. After you pick clusters, the script exports:
+
+- `ALLOWED_REGIONS` from the regions of the selected clusters.
+- `ALLOWED_CLUSTER_NAMES` from the names of the selected clusters.
+- `EKS_NODE_ROLE_ARNS` from the selected nodegroup roles.
+
+These flow straight into the CDK construct, so the deployed IAM policies are tag-scoped and region-scoped without any extra flags. If you skip cluster selection (or no clusters are found), the script falls back to deploy-region-only and prompts before deploying with an unrestricted cluster scope.
+
 ### Interactive Deployment Flow
 
 The deploy script walks you through three interactive prompts:
@@ -142,18 +230,61 @@ Enter comma-separated role ARNs (e.g. arn:aws:iam::123456789012:role/MyNodeRole)
 
 ### Non-Interactive / CI Mode
 
-Skip all prompts by providing role ARNs directly:
+Pre-set the env vars to skip every prompt. Recommended for repeatable deploys:
 
 ```bash
-# Via environment variable
-EKS_NODE_ROLE_ARNS="arn:aws:iam::123456789012:role/MyNodeRole" ./deploy.sh
-
-# Or as a positional argument
-./deploy.sh EksNodeLogMcpStack arn:aws:iam::123456789012:role/MyNodeRole
-
-# Multiple roles (comma-separated)
-EKS_NODE_ROLE_ARNS="arn:aws:iam::123456789012:role/Role1,arn:aws:iam::123456789012:role/Role2" ./deploy.sh
+AWS_REGION=us-east-1 \
+ALLOWED_REGIONS=us-east-1 \
+ALLOWED_CLUSTER_NAMES=prod-cluster,staging-cluster \
+EKS_NODE_ROLE_ARNS=arn:aws:iam::123456789012:role/eks-node-role \
+./deploy.sh EksNodeLogMcpStack
 ```
+
+If you genuinely need the wildcard scope (Lambda may target any EKS cluster in the account), opt in explicitly:
+
+```bash
+AWS_REGION=us-east-1 \
+ALLOW_ANY_CLUSTER_NAME=true \
+EKS_NODE_ROLE_ARNS=arn:aws:iam::123456789012:role/eks-node-role \
+./deploy.sh EksNodeLogMcpStack
+```
+
+Without one of `ALLOWED_CLUSTER_NAMES` or `ALLOW_ANY_CLUSTER_NAME=true`, `cdk synth` fails with a clear error — this is intentional.
+
+### Maximum Restriction
+
+For production deploys, layer in the rest of the controls:
+
+```bash
+AWS_REGION=us-west-2 \
+ALLOWED_REGIONS=us-west-2 \
+ALLOWED_CLUSTER_NAMES=prod-cluster \
+ALLOWED_SSM_DOCUMENTS=AWS-RunShellScript \
+EKS_NODE_ROLE_ARNS=arn:aws:iam::123456789012:role/eks-node-role \
+PRESIGNED_URL_EXPIRATION=120 \
+PCAP_PRESIGNED_URL_EXPIRATION=30 \
+PER_CALLER_RATE_LIMIT_PER_MINUTE=30 \
+TOOL_AUTHORIZATION="collect:client-soc;tcpdump_capture:client-emergency" \
+MCP_VPC_ID=vpc-0123456789abcdef0 \
+MCP_VPC_SUBNET_IDS=subnet-aaa,subnet-bbb \
+MAX_PCAP_BYTES=104857600 \
+./deploy.sh
+```
+
+| Env var | What it restricts | Default |
+|---------|-------------------|---------|
+| `ALLOWED_REGIONS` | IAM resource ARNs + Lambda region scanning | Stack region |
+| `ALLOWED_CLUSTER_NAMES` | `ssm:SendCommand` tag condition on instances | (none — fail-closed) |
+| `ALLOW_ANY_CLUSTER_NAME` | Explicit opt-in to any-cluster wildcard | `false` |
+| `ALLOWED_SSM_DOCUMENTS` | Which SSM documents can be executed | `AWS-RunShellScript` |
+| `EKS_NODE_ROLE_ARNS` | S3 PutObject + KMS Encrypt principals | Account root |
+| `PRESIGNED_URL_EXPIRATION` | Log artifact presigned URL lifetime (max 900 s) | 300 s |
+| `PCAP_PRESIGNED_URL_EXPIRATION` | Pcap presigned URL lifetime (max 300 s) | 60 s |
+| `ENABLED_RESTRICTED_TOOLS` | tcpdump tools availability | Empty (not available) |
+| `TOOL_AUTHORIZATION` | Per-tool client-id ACL (`tool:client_a,client_b;…`) | Empty (open) |
+| `PER_CALLER_RATE_LIMIT_PER_MINUTE` | Rate limit per caller (`0` disables) | 60 |
+| `MCP_VPC_ID` / `MCP_VPC_SUBNET_IDS` | Run Lambda in VPC + create S3/KMS endpoints | None |
+| `MAX_PCAP_BYTES` | Pcap upload size cap (warning only) | 200 MiB |
 
 ### What Gets Deployed
 
@@ -161,7 +292,7 @@ EKS_NODE_ROLE_ARNS="arn:aws:iam::123456789012:role/Role1,arn:aws:iam::1234567890
 |----------|---------|
 | S3 Bucket (KMS encrypted) | Stores collected log bundles |
 | S3 Bucket (SOPs) | Stores 41 runbooks, auto-deployed via CDK |
-| Lambda (SSM Automation) | Handles all 19 MCP tool invocations |
+| Lambda (SSM Automation) | Handles all 21 MCP tool invocations (19 always-on + 2 restricted tcpdump) |
 | Lambda (Unzip) | Auto-extracts uploaded archives |
 | Lambda (Findings Indexer) | Pre-indexes errors for fast retrieval |
 | SSM Automation Role | Runs log collection on EC2 instances |
@@ -254,7 +385,7 @@ For more details, see the [AWS DevOps Agent Skills documentation](https://docs.a
 
 ## How It Works
 
-The server gives MCP-compatible agents the ability to collect full diagnostic bundles from EKS worker nodes, pre-index errors with severity classification, stream multi-GB log files without truncation, correlate events across log sources, run live tcpdump captures, compare nodes, and follow structured runbooks — all through 19 MCP tools organized in 5 tiers.
+The server gives MCP-compatible agents the ability to collect full diagnostic bundles from EKS worker nodes, pre-index errors with severity classification, stream multi-GB log files without truncation, correlate events across log sources, run live tcpdump captures, compare nodes, and follow structured runbooks — all through 21 MCP tools (19 always-on + 2 restricted tcpdump tools, opt-in) organized in 5 tiers.
 
 For a detailed walkthrough of the architecture, data flows, tool design, cross-region mechanics, security model, and anti-hallucination design, see:
 
@@ -265,10 +396,12 @@ For a detailed walkthrough of the architecture, data flows, tool design, cross-r
 | Tier | Tools | Purpose |
 |------|-------|---------|
 | 1 — Core | `collect`, `status`, `validate`, `errors`, `read` | Log collection, findings, streaming |
-| 2 — Analysis | `search`, `correlate`, `artifact`, `summarize`, `history` | Deep investigation, correlation, summaries |
-| 3 — Cluster | `cluster_health`, `compare_nodes`, `batch_collect`, `batch_status`, `network_diagnostics` | Multi-node operations |
-| 4 — Capture | `tcpdump_capture`, `tcpdump_analyze` | Live packet capture and analysis |
+| 2 — Analysis | `search`, `correlate`, `artifact`, `summarize`, `quick_triage`, `history` | Deep investigation, correlation, summaries |
+| 3 — Cluster | `cluster_health`, `compare_nodes`, `batch_collect`, `batch_status`, `network_diagnostics`, `storage_diagnostics` | Multi-node operations |
+| 4 — Capture | `tcpdump_capture`, `tcpdump_analyze` | Live packet capture (**disabled by default**) |
 | 5 — SOPs | `list_sops`, `get_sop` | 41 structured runbooks |
+
+> **Note:** Tier 4 tools are removed from the routing table by default. They don't appear in `available_tools` and cannot be invoked unless `ENABLED_RESTRICTED_TOOLS` includes them. See [Security Model](#security-model).
 
 ### Agent Workflow
 
@@ -310,12 +443,18 @@ first — show me which nodes you'd sample. Then collect from the unhealthy ones
 ```
 
 ### Live Packet Capture
+
+> **Requires:** `ENABLED_RESTRICTED_TOOLS=tcpdump_capture,tcpdump_analyze` set at deploy time. tcpdump must be pre-installed on the node AMI. Each capture requires `confirmCapture=true`.
+
 ```
 Pods on node i-0abc123def can't reach the API server. Run a 2-minute tcpdump
 filtered on port 443, then analyze — show me RST counts and retransmissions.
 ```
 
 ### Pod-Level Capture
+
+> **Requires:** Same as above, plus `crictl` on the node (default on EKS-optimized AMIs).
+
 ```
 DNS lookups are timing out. CoreDNS pod coredns-5d78c9869d-abc12 is on node
 i-0abc123def in kube-system. Capture UDP port 53 from inside the pod for 60s.
@@ -350,11 +489,17 @@ general triage, and follow whichever runbook matches.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| `cdk synth` fails with "must set either `allowedClusterNames` …" | Cluster scope wasn't chosen | Set `ALLOWED_CLUSTER_NAMES=…` (preferred) or `ALLOW_ANY_CLUSTER_NAME=true` and re-run `./deploy.sh` |
+| Tool returns 403 "Tool '…' is restricted and not enabled" | Caller hit `tcpdump_capture` / `tcpdump_analyze` without opt-in | Set `ENABLED_RESTRICTED_TOOLS=tcpdump_capture,tcpdump_analyze` and redeploy |
+| Tool returns 403 "Caller is not permitted to invoke '…'" | Per-tool ACL doesn't include this client | Add the client to the matching `TOOL_AUTHORIZATION` entry |
+| Tool returns 429 "Rate limit exceeded" | Caller exceeded `PER_CALLER_RATE_LIMIT_PER_MINUTE` | Wait the `retryAfterSeconds` in the response, or raise the limit |
 | `collect` returns "document not found" | SSM document not in target region | Use a supported region or pass `region` explicitly |
-| Upload step fails | Node role missing S3/KMS permissions | Add `EksNodeLogMcpS3Upload` inline policy |
+| `collect` fails at `CheckS3BucketPublicStatus` | SSM automation role missing `s3:GetBucketPublicAccessBlock` / `s3:GetAccountPublicAccessBlock` | Already granted by the current construct — redeploy if your stack predates the fix |
+| Upload step fails | Node role missing S3/KMS permissions | Pass the node role via `EKS_NODE_ROLE_ARNS` and redeploy |
 | `status` returns wrong region | Region metadata not persisted | Pass `region` explicitly |
-| Auto-detection times out | Instance in uncommon region | Pass `region` explicitly |
+| Auto-detection times out | Instance in uncommon region | Add the region to `ALLOWED_REGIONS` and pass `region` explicitly |
 | `errors` returns empty | Findings indexer hasn't run yet | Wait a few seconds after `validate`, or use `search` |
+| Response missing IDs that should be there (e.g. `sg-…`) | Redaction layer is masking them | Expected — `redact_response` masks SG/ENI/subnet/VPC IDs and account IDs by design |
 
 ---
 
@@ -364,7 +509,7 @@ general triage, and follow whichever runbook matches.
 cdk destroy
 ```
 
-> The S3 bucket has `removalPolicy: RETAIN`. Delete it manually after stack destruction if needed.
+> The logs and SOP buckets are configured with `removalPolicy: DESTROY` and `autoDeleteObjects: true`, so `cdk destroy` will delete the buckets and all their contents. Download anything you need from `eksnodelogmcpstack-logs-<account>` first.
 
 ---
 

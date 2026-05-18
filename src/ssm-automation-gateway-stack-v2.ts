@@ -36,6 +36,18 @@ export class EksNodeLogMcpStack extends cdk.Stack {
       enableS3DataEvents: props.enableS3DataEvents,
       ssmDefaultHostRoleArn: props.ssmDefaultHostRoleArn,
       eksNodeRoleArns: props.eksNodeRoleArns,
+      allowedRegions: props.allowedRegions,
+      allowedClusterNames: props.allowedClusterNames,
+      allowAnyClusterName: props.allowAnyClusterName,
+      allowedSsmDocuments: props.allowedSsmDocuments,
+      presignedUrlExpirationSeconds: props.presignedUrlExpirationSeconds,
+      pcapPresignedUrlExpirationSeconds: props.pcapPresignedUrlExpirationSeconds,
+      enableRestrictedTools: props.enableRestrictedTools,
+      vpcId: props.vpcId,
+      vpcSubnetIds: props.vpcSubnetIds,
+      toolAuthorization: props.toolAuthorization,
+      perCallerRateLimitPerMinute: props.perCallerRateLimitPerMinute,
+      maxPcapBytes: props.maxPcapBytes,
     });
   }
 }

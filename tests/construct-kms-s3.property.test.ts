@@ -27,7 +27,9 @@ function synthesize(props: {
 }) {
   const app = new cdk.App();
   const stack = new cdk.Stack(app, 'TestStack', { env: { region: 'us-east-1', account: '123456789012' } });
-  new SsmAutomationGatewayV2Construct(stack, 'Gateway', props);
+  // allowAnyClusterName: tests rely on the wildcard cluster scope, so opt in
+  // to keep them deterministic. Production deploys should set allowedClusterNames.
+  new SsmAutomationGatewayV2Construct(stack, 'Gateway', { ...props, allowAnyClusterName: true });
   return Template.fromStack(stack);
 }
 

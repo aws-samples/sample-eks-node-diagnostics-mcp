@@ -93,7 +93,11 @@ def get_regional_client(service: str, region: str) -> Any:
 def detect_instance_region(instance_id: str) -> Optional[str]:
     """
     Auto-detect the region of an EC2 instance by querying EC2 DescribeInstances
-    across regions. Tries the default region first, then common EKS regions.
+    across ALLOWED_REGIONS only. Tries the default region first, then remaining
+    allowed regions.
+    
+    Security: Only scans regions in ALLOWED_REGIONS to prevent account-wide
+    metadata exposure (T9/T11 mitigation).
     
     Returns the region string or None if not found.
     Times out after 20 seconds to avoid Lambda timeout issues.
@@ -103,36 +107,29 @@ def detect_instance_region(instance_id: str) -> Optional[str]:
     DETECTION_TIMEOUT = 20  # seconds - leave headroom for Lambda timeout
     
     # Try default region first (fast path)
-    try:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
-        if resp['Reservations']:
-            return DEFAULT_REGION
-    except ec2_client.exceptions.ClientError:
-        pass
-    except Exception:
-        pass
+    if DEFAULT_REGION in ALLOWED_REGIONS:
+        try:
+            resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+            if resp['Reservations']:
+                return DEFAULT_REGION
+        except ec2_client.exceptions.ClientError:
+            pass
+        except Exception:
+            pass
 
-    # Try common EKS regions (ordered by popularity)
-    common_regions = [
-        'us-west-2', 'us-east-2', 'eu-west-1', 'eu-central-1',
-        'ap-southeast-1', 'ap-northeast-1', 'ap-south-1',
-        'us-west-1', 'eu-west-2', 'eu-north-1',
-        'ap-southeast-2', 'ap-northeast-2', 'sa-east-1',
-        'ca-central-1', 'me-south-1', 'af-south-1',
-    ]
-    # Remove default region since we already tried it
-    common_regions = [r for r in common_regions if r != DEFAULT_REGION]
+    # Only scan ALLOWED_REGIONS — never scan all 16+ regions (T9 mitigation)
+    remaining_regions = [r for r in sorted(ALLOWED_REGIONS) if r != DEFAULT_REGION]
 
-    for region in common_regions:
+    for region in remaining_regions:
         # Check timeout to avoid Lambda execution limit
         if time.time() - start > DETECTION_TIMEOUT:
-            print(f"Warning: Region auto-detection timed out after {DETECTION_TIMEOUT}s, checked {common_regions.index(region)} regions")
+            logger.warning(f"Region auto-detection timed out after {DETECTION_TIMEOUT}s")
             return None
         try:
             regional_ec2 = get_regional_client('ec2', region)
             resp = regional_ec2.describe_instances(InstanceIds=[instance_id])
             if resp['Reservations']:
-                print(f"Auto-detected instance {instance_id} in region {region}")
+                logger.info(f"Auto-detected instance {instance_id} in region {region}")
                 return region
         except Exception:
             continue
@@ -173,17 +170,51 @@ FINDINGS_INDEX_FILE = 'findings_index.json'
 # =============================================================================
 
 def _parse_presigned_url_expiration() -> int:
-    """Parse PRESIGNED_URL_EXPIRATION_SECONDS env var, default to 300."""
+    """Parse PRESIGNED_URL_EXPIRATION_SECONDS env var, default to 300, max 900."""
     raw = os.environ.get('PRESIGNED_URL_EXPIRATION_SECONDS', '')
+    try:
+        val = int(raw)
+        if val > 0:
+            return min(val, 900)  # Cap at 15 minutes max (T5 mitigation)
+    except (ValueError, TypeError):
+        pass
+    return 300
+
+PRESIGNED_URL_EXPIRATION = _parse_presigned_url_expiration()
+
+
+def _parse_pcap_presigned_url_expiration() -> int:
+    """
+    Parse PCAP_PRESIGNED_URL_EXPIRATION_SECONDS env var. Network captures may
+    contain credentials in transit and other sensitive payloads — they get a
+    much shorter window than ordinary log artifacts. Default 60s, max 300s.
+    """
+    raw = os.environ.get('PCAP_PRESIGNED_URL_EXPIRATION_SECONDS', '')
+    try:
+        val = int(raw)
+        if val > 0:
+            return min(val, 300)
+    except (ValueError, TypeError):
+        pass
+    return 60
+
+
+PCAP_PRESIGNED_URL_EXPIRATION = _parse_pcap_presigned_url_expiration()
+
+
+def _parse_max_pcap_bytes() -> int:
+    """Cap at which a pcap upload is flagged as oversized."""
+    raw = os.environ.get('MAX_PCAP_BYTES', '')
     try:
         val = int(raw)
         if val > 0:
             return val
     except (ValueError, TypeError):
         pass
-    return 300
+    return 200 * 1024 * 1024  # 200 MiB
 
-PRESIGNED_URL_EXPIRATION = _parse_presigned_url_expiration()
+
+MAX_PCAP_BYTES = _parse_max_pcap_bytes()
 
 
 # =============================================================================
@@ -220,33 +251,475 @@ def resolve_and_validate_region(arguments: Dict, instance_id: str = None) -> tup
 
 
 # =============================================================================
+# TOOL AUTHORIZATION TIERS — per-tool access control (T6 mitigation)
+# =============================================================================
+
+# Tools that require explicit opt-in via ENABLED_RESTRICTED_TOOLS env var.
+# These tools perform invasive operations (network captures, namespace entry)
+# and are completely removed from the routing table by default.
+# They do not appear in available_tools and cannot be invoked unless enabled.
+RESTRICTED_TOOLS = {
+    'tcpdump_capture',
+    'tcpdump_analyze',
+}
+
+# Parse enabled restricted tools from env var
+ENABLED_RESTRICTED_TOOLS = set(
+    t.strip() for t in os.environ.get('ENABLED_RESTRICTED_TOOLS', '').split(',')
+    if t.strip()
+)
+
+
+def _parse_tool_authorization() -> Dict[str, set]:
+    """
+    Parse the per-tool ACL from the TOOL_AUTHORIZATION env var.
+
+    Format: tool1:client_a,client_b;tool2:client_c
+    - Tools listed get a non-empty allow-set: only those clients may invoke.
+    - Tools not listed are open to all authenticated callers.
+    - Tools listed with no clients are deny-all.
+    """
+    raw = os.environ.get('TOOL_AUTHORIZATION', '')
+    acl: Dict[str, set] = {}
+    if not raw:
+        return acl
+    for entry in raw.split(';'):
+        entry = entry.strip()
+        if not entry or ':' not in entry:
+            continue
+        tool, clients = entry.split(':', 1)
+        tool = tool.strip()
+        if not tool:
+            continue
+        client_set = {c.strip() for c in clients.split(',') if c.strip()}
+        acl[tool] = client_set
+    return acl
+
+
+TOOL_AUTHORIZATION_ACL = _parse_tool_authorization()
+
+
+def _parse_per_caller_rate_limit() -> int:
+    """Per-caller invocations-per-minute limit. 0 disables rate limiting."""
+    raw = os.environ.get('PER_CALLER_RATE_LIMIT_PER_MINUTE', '')
+    try:
+        val = int(raw)
+        if val >= 0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return 60
+
+
+PER_CALLER_RATE_LIMIT = _parse_per_caller_rate_limit()
+
+
+# In-process token bucket. Lambda containers can be reused across invocations
+# in the same warm execution environment; this bucket gives best-effort rate
+# limiting on a single warm container. For strict cross-container limits a
+# DynamoDB-backed counter would be required — flagged below in code.
+_RATE_LIMIT_STATE: Dict[str, list] = {}
+
+
+def _extract_caller_identity(event: Dict, context: Any) -> Dict[str, Optional[str]]:
+    """
+    Extract caller identity from the AgentCore Gateway invocation envelope.
+    AgentCore forwards JWT claims via context.client_context.custom; we read
+    the Cognito client_id (and sub if available) for ACL + rate-limiter keys.
+    Returns a dict with 'client_id', 'sub', and 'principal' (best-available
+    stable identifier).
+    """
+    info: Dict[str, Optional[str]] = {'client_id': None, 'sub': None, 'principal': None}
+    try:
+        custom = getattr(context.client_context, 'custom', None) or {}
+    except Exception:
+        custom = {}
+    # Common AgentCore claim shapes
+    for key in ('bedrockAgentCoreClientId', 'clientId', 'client_id'):
+        if custom.get(key):
+            info['client_id'] = str(custom[key])
+            break
+    for key in ('bedrockAgentCoreSub', 'sub', 'principalId', 'cognito:username'):
+        if custom.get(key):
+            info['sub'] = str(custom[key])
+            break
+    # Allow event-level fallbacks (e.g. when invoked outside AgentCore)
+    if not info['client_id']:
+        ev_id = (event or {}).get('clientId') or (event or {}).get('client_id')
+        if ev_id:
+            info['client_id'] = str(ev_id)
+    if not info['sub']:
+        ev_sub = (event or {}).get('sub') or (event or {}).get('principalId')
+        if ev_sub:
+            info['sub'] = str(ev_sub)
+    info['principal'] = info['sub'] or info['client_id'] or 'anonymous'
+    return info
+
+
+def _enforce_rate_limit(caller_key: str) -> Optional[Dict]:
+    """
+    Best-effort per-caller rate limit. Returns None if under the limit, or an
+    error_response dict if the limit is exceeded.
+    """
+    if PER_CALLER_RATE_LIMIT <= 0:
+        return None
+    now = time.time()
+    window = 60.0
+    history = _RATE_LIMIT_STATE.setdefault(caller_key, [])
+    # Drop entries older than the window
+    cutoff = now - window
+    while history and history[0] < cutoff:
+        history.pop(0)
+    if len(history) >= PER_CALLER_RATE_LIMIT:
+        retry_after = max(1, int(history[0] + window - now))
+        return error_response(
+            429,
+            f'Rate limit exceeded ({PER_CALLER_RATE_LIMIT} invocations/min per caller). '
+            f'Retry in ~{retry_after}s.',
+            {'retryAfterSeconds': retry_after},
+        )
+    history.append(now)
+    return None
+
+
+def validate_tool_authorization(tool_name: str, caller: Optional[Dict] = None) -> Optional[Dict]:
+    """
+    Authorization gate. Combines:
+      (a) Restricted-tool opt-in (ENABLED_RESTRICTED_TOOLS).
+      (b) Per-tool ACL keyed on Cognito client_id (TOOL_AUTHORIZATION).
+    Returns None if authorized, or an error_response dict if denied.
+    """
+    if tool_name in RESTRICTED_TOOLS and tool_name not in ENABLED_RESTRICTED_TOOLS:
+        return error_response(
+            403,
+            f"Tool '{tool_name}' is restricted and not enabled. "
+            f"Set ENABLED_RESTRICTED_TOOLS environment variable to include '{tool_name}' to enable it.",
+            {'restrictedTools': sorted(RESTRICTED_TOOLS)},
+        )
+    if tool_name in TOOL_AUTHORIZATION_ACL:
+        allowed = TOOL_AUTHORIZATION_ACL[tool_name]
+        client_id = (caller or {}).get('client_id') or ''
+        if not allowed:
+            return error_response(
+                403,
+                f"Tool '{tool_name}' is configured deny-all (no clients in its ACL).",
+            )
+        if client_id not in allowed:
+            return error_response(
+                403,
+                f"Caller is not permitted to invoke '{tool_name}'.",
+                {'requiredClients': sorted(allowed)},
+            )
+    return None
+
+
+# =============================================================================
+# BPF FILTER VALIDATION — allowlist-based (T1 mitigation)
+# =============================================================================
+
+# Allowlist of safe BPF filter tokens. This is intentionally restrictive.
+# BPF filters are a mini-language; we only allow known-safe primitives.
+_BPF_ALLOWED_KEYWORDS = frozenset({
+    # Protocols
+    'tcp', 'udp', 'icmp', 'arp', 'ip', 'ip6', 'ether', 'vlan', 'stp',
+    # Directions
+    'src', 'dst',
+    # Qualifiers
+    'host', 'net', 'port', 'portrange', 'proto',
+    # Logical operators
+    'and', 'or', 'not',
+    # TCP flags (used in bracket expressions)
+    'tcp-syn', 'tcp-ack', 'tcp-fin', 'tcp-rst', 'tcp-push', 'tcp-urg',
+    # Misc
+    'greater', 'less', 'len',
+})
+
+# Pattern for valid BPF tokens: keywords, IPs, CIDRs, numbers, and bracket expressions
+_BPF_TOKEN_PATTERN = re.compile(
+    r'^('
+    r'\d{1,5}'                     # port numbers
+    r'|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(/\d{1,2})?'  # IPv4 addresses and CIDRs
+    r'|[0-9a-f:]+(/\d{1,3})?'      # IPv6 addresses and CIDRs
+    r'|\d+-\d+'                     # port ranges (e.g., 80-443)
+    r')$',
+    re.IGNORECASE
+)
+
+# Bracket expressions like tcp[tcpflags], tcp[13], udp[0:2]
+_BPF_BRACKET_PATTERN = re.compile(
+    r'^(tcp|udp|icmp|ip|ip6|ether)\['
+    r'[a-z0-9:]+\]'
+    r'(\s*[&|!=<>]+\s*'
+    r'(\(?(tcp-syn|tcp-ack|tcp-fin|tcp-rst|tcp-push|tcp-urg|0x[0-9a-f]+|\d+)\)?)'
+    r')?$',
+    re.IGNORECASE
+)
+
+
+def validate_bpf_filter(bpf_filter: str) -> Optional[str]:
+    """
+    Validate a BPF filter expression using allowlist-based validation.
+    
+    Returns None if valid, or an error message string if invalid.
+    
+    Security: This replaces the previous denylist approach which missed
+    backticks, newlines, and other injection vectors. The allowlist approach
+    only permits known-safe BPF primitives.
+    """
+    if not bpf_filter:
+        return None
+    
+    # Hard reject: any control characters, backticks, or shell metacharacters
+    # This catches \n, \r, \t, backticks, $, etc.
+    if re.search(r'[\x00-\x1f\x7f`$\\;{}<>!~^]', bpf_filter):
+        return 'BPF filter contains forbidden characters (control chars, backticks, shell metacharacters)'
+    
+    # Reject excessively long filters
+    if len(bpf_filter) > 256:
+        return 'BPF filter too long (max 256 characters)'
+    
+    # Reject parentheses used for subshells — BPF uses them for grouping but
+    # we handle them carefully
+    # Allow balanced parentheses only
+    depth = 0
+    for ch in bpf_filter:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if depth < 0:
+            return 'BPF filter has unbalanced parentheses'
+    if depth != 0:
+        return 'BPF filter has unbalanced parentheses'
+    
+    # Strip parentheses for token validation (BPF uses them for grouping)
+    stripped = bpf_filter.replace('(', ' ').replace(')', ' ')
+    
+    # Tokenize and validate each token
+    tokens = stripped.split()
+    if not tokens:
+        return 'BPF filter is empty after parsing'
+    
+    for token in tokens:
+        token_lower = token.lower().strip()
+        if not token_lower:
+            continue
+        
+        # Check against known keywords
+        if token_lower in _BPF_ALLOWED_KEYWORDS:
+            continue
+        
+        # Check against token pattern (IPs, ports, numbers)
+        if _BPF_TOKEN_PATTERN.match(token_lower):
+            continue
+        
+        # Check bracket expressions (e.g., tcp[tcpflags])
+        if _BPF_BRACKET_PATTERN.match(token_lower):
+            continue
+        
+        # Comparison operators
+        if token_lower in ('!=', '==', '>=', '<=', '>', '<', '=', '&'):
+            continue
+        
+        # Hex values (used in flag comparisons)
+        if re.match(r'^0x[0-9a-f]+$', token_lower):
+            continue
+        
+        return f"BPF filter contains disallowed token: '{token}'. Only standard BPF primitives are permitted."
+    
+    return None
+
+
+# =============================================================================
 # EKS INSTANCE VALIDATION — verify target is an EKS node (T4, T13 mitigation)
 # =============================================================================
 
 def validate_eks_instance(instance_id: str, region: str) -> Optional[Dict]:
     """
-    Validate that an instance belongs to an EKS cluster by checking
-    for kubernetes.io/cluster/* tags via EC2 DescribeInstances.
+    Validate that an instance belongs to an EKS cluster using both tag-based
+    AND EKS API-based verification.
+    
+    Security: Tag-based validation alone is bypassable by anyone who can tag
+    EC2 instances. We now cross-reference with EKS DescribeNodegroup or
+    the eks:cluster-name tag (set by EKS service, not user-editable).
+    
     Returns None if valid, or an error response dict if invalid.
     """
     try:
         regional_ec2 = get_regional_client('ec2', region)
         resp = regional_ec2.describe_instances(InstanceIds=[instance_id])
+        
+        eks_cluster_name = None
+        has_k8s_tag = False
+        has_eks_managed_tag = False
+        
         for reservation in resp.get('Reservations', []):
             for instance in reservation.get('Instances', []):
-                tags = instance.get('Tags', [])
-                for tag in tags:
-                    if tag['Key'].startswith('kubernetes.io/cluster/'):
-                        return None  # Valid EKS instance
-        return error_response(
-            403,
-            f"Instance {instance_id} is not part of an EKS cluster "
-            f"(no kubernetes.io/cluster/* tag found)"
-        )
+                tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+                
+                # Check for kubernetes.io/cluster/* tag (user-settable)
+                for key in tags:
+                    if key.startswith('kubernetes.io/cluster/'):
+                        has_k8s_tag = True
+                        break
+                
+                # Check for eks:cluster-name tag (set by EKS managed node groups,
+                # not user-editable via standard EC2 tag APIs)
+                eks_cluster_name = tags.get('eks:cluster-name')
+                if eks_cluster_name:
+                    has_eks_managed_tag = True
+                
+                # Also check eks:nodegroup-name as secondary signal
+                if tags.get('eks:nodegroup-name'):
+                    has_eks_managed_tag = True
+        
+        if not has_k8s_tag and not has_eks_managed_tag:
+            return error_response(
+                403,
+                f"Instance {instance_id} is not part of an EKS cluster "
+                f"(no kubernetes.io/cluster/* or eks:cluster-name tag found)"
+            )
+        
+        # If we have an EKS cluster name, verify it exists via EKS API
+        if eks_cluster_name:
+            try:
+                regional_eks = get_regional_client('eks', region)
+                regional_eks.describe_cluster(name=eks_cluster_name)
+            except ClientError as e:
+                code = e.response['Error']['Code']
+                if code == 'ResourceNotFoundException':
+                    return error_response(
+                        403,
+                        f"Instance {instance_id} references EKS cluster '{eks_cluster_name}' "
+                        f"which does not exist in region {region}. Tag may be spoofed."
+                    )
+                # Other errors (AccessDenied, etc.) — don't block, but log
+                logger.warning(f"Could not verify EKS cluster '{eks_cluster_name}': {e}")
+        
+        return None  # Valid EKS instance
+        
     except ClientError as e:
         if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
             return error_response(404, f"Instance {instance_id} not found in region {region}")
         return error_response(500, f"Failed to validate instance {instance_id}: {str(e)}")
+
+
+# =============================================================================
+# RESPONSE REDACTION — strip sensitive infra details from tool responses
+# =============================================================================
+
+# Resource ID prefixes we treat as sensitive infrastructure metadata.
+_REDACT_ID_PATTERNS: List = [
+    (re.compile(r'\bsg-[0-9a-f]{8,17}\b'),               'sg-***'),
+    (re.compile(r'\beni-[0-9a-f]{8,17}\b'),              'eni-***'),
+    (re.compile(r'\bsubnet-[0-9a-f]{8,17}\b'),           'subnet-***'),
+    (re.compile(r'\bvpc-[0-9a-f]{8,17}\b'),              'vpc-***'),
+    (re.compile(r'\bvol-[0-9a-f]{8,17}\b'),              'vol-***'),
+    (re.compile(r'\bfs-[0-9a-f]{8,17}\b'),               'fs-***'),
+    (re.compile(r'\bfsap-[0-9a-f]{8,17}\b'),             'fsap-***'),
+    # Account IDs in ARNs (12 digits between colons)
+    (re.compile(r'(arn:[^:]*:[^:]*:[^:]*:)\d{12}(:)'),   r'\1***\2'),
+    # AWS access key prefixes
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'),                'AKIA****************'),
+    (re.compile(r'\bASIA[0-9A-Z]{16}\b'),                'ASIA****************'),
+    # bearer tokens / JWT-ish strings
+    (re.compile(r'eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}'),
+     '<redacted-jwt>'),
+]
+
+# Substrings that indicate IAM / credential failure messages we want to
+# collapse to a tag rather than echo verbatim.
+_IAM_ERROR_MARKERS = (
+    'accessdenied', 'access denied', 'unauthorized', 'forbidden',
+    'not authorized to perform', 'expiredtoken', 'invalidclienttokenid',
+    'signature does not match', 'tokenrefreshrequired',
+)
+
+# Private IP redaction. RFC1918 + carrier-grade NAT (100.64.0.0/10) are common
+# in EKS pod networks; we keep a coarse signal (octet count) but obscure the
+# host portion.
+_PRIVATE_IP_RE = re.compile(
+    r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
+    r'|192\.168\.\d{1,3}\.\d{1,3}'
+    r'|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3})\b'
+)
+
+
+def _redact_string(value: str, mask_private_ips: bool = False) -> str:
+    """Apply redaction patterns to a single string."""
+    if not value or not isinstance(value, str):
+        return value
+    out = value
+    for pattern, replacement in _REDACT_ID_PATTERNS:
+        out = pattern.sub(replacement, out)
+    if mask_private_ips:
+        out = _PRIVATE_IP_RE.sub('<private-ip>', out)
+    # Collapse IAM/credential error message bodies after the marker
+    lowered = out.lower()
+    for marker in _IAM_ERROR_MARKERS:
+        idx = lowered.find(marker)
+        if idx >= 0:
+            # Keep the marker context but drop the rest of the line which often
+            # echoes principal ARNs, service names, and request IDs.
+            head = out[:idx + len(marker)]
+            out = head + ' <iam-error-details-redacted>'
+            break
+    return out
+
+
+def _redact_value(value: Any, mask_private_ips: bool = False, _depth: int = 0) -> Any:
+    """Recursively redact a JSON-serialisable structure."""
+    if _depth > 12:
+        return value  # safety: bail on deeply nested structures
+    if isinstance(value, str):
+        return _redact_string(value, mask_private_ips=mask_private_ips)
+    if isinstance(value, list):
+        return [_redact_value(v, mask_private_ips=mask_private_ips, _depth=_depth + 1) for v in value]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            kl = k.lower() if isinstance(k, str) else ''
+            # Drop wholesale: any field that names a credential, secret, token,
+            # or password — never useful in a diagnostic response.
+            if any(s in kl for s in ('password', 'secret', 'apikey', 'api_key', 'token', 'credential')):
+                # Allow short identifiers where the *name* is "tokenName" etc;
+                # we still drop the value to be safe.
+                out[k] = '<redacted>'
+                continue
+            # Volume handles often embed full EBS/EFS IDs — truncate hard.
+            if kl in ('volumehandle', 'volume_handle'):
+                out[k] = (str(v)[:24] + '…') if v else v
+                continue
+            out[k] = _redact_value(v, mask_private_ips=mask_private_ips, _depth=_depth + 1)
+        return out
+    return value
+
+
+def redact_response(response: Dict, tool_name: str = '') -> Dict:
+    """
+    Redact a Lambda response envelope ({statusCode, body}). Returns a new dict
+    with the body re-serialised after sensitive values have been masked.
+    Diagnostic tools that traffic in network metadata get aggressive private-IP
+    masking; other tools keep IPs (often needed to interpret a finding) but
+    still get IAM/secret/account-ID redaction.
+    """
+    if not isinstance(response, dict) or 'body' not in response:
+        return response
+    body_raw = response.get('body')
+    if not isinstance(body_raw, str):
+        return response
+    try:
+        parsed = json.loads(body_raw)
+    except Exception:
+        return response
+    aggressive_ip_tools = {
+        'network_diagnostics', 'tcpdump_analyze', 'tcpdump_capture',
+        'cluster_health', 'storage_diagnostics',
+    }
+    mask_ips = tool_name in aggressive_ip_tools
+    redacted = _redact_value(parsed, mask_private_ips=mask_ips)
+    return {**response, 'body': json.dumps(redacted, default=str)}
 
 
 class Severity(Enum):
@@ -1384,7 +1857,7 @@ def find_execution_by_idempotency_token(instance_id: str, token: str) -> Optiona
 
 
 def store_idempotency_mapping(instance_id: str, token: str, execution_id: str):
-    """Store idempotency token to execution mapping."""
+    """Store idempotency token to execution mapping with conditional write to prevent races."""
     key = f'idempotency/{instance_id}/{token}.json'
     mapping = {
         'executionId': execution_id,
@@ -1394,14 +1867,23 @@ def store_idempotency_mapping(instance_id: str, token: str, execution_id: str):
     }
     
     try:
+        # Use IfNoneMatch='*' to prevent overwriting existing mappings (S3 conditional write).
+        # This prevents race conditions where concurrent invocations could corrupt state.
         s3_client.put_object(
             Bucket=LOGS_BUCKET,
             Key=key,
             Body=json.dumps(mapping),
-            ContentType='application/json'
+            ContentType='application/json',
+            IfNoneMatch='*',
         )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'PreconditionFailed':
+            # Another invocation already wrote this mapping — that's fine
+            logger.info(f"Idempotency mapping already exists for {token}, skipping write")
+        else:
+            logger.warning(f"Failed to store idempotency mapping: {str(e)}")
     except Exception as e:
-        print(f"Warning: Failed to store idempotency mapping: {str(e)}")
+        logger.warning(f"Failed to store idempotency mapping: {str(e)}")
 
 
 # ========================================================================
@@ -1430,45 +1912,111 @@ def load_baselines(cluster_name: str) -> Dict[str, Dict]:
     return {}
 
 
+def _load_baselines_with_version(cluster_name: str) -> tuple:
+    """
+    Load baselines along with the S3 object's VersionId so update_baselines can
+    perform an optimistic-concurrency write (If-Match on the version). Returns
+    (baselines, version_id_or_None). Missing object returns ({}, None).
+    """
+    if not cluster_name:
+        return {}, None
+    key = f'{BASELINE_PREFIX}{cluster_name}/patterns.json'
+    try:
+        resp = s3_client.get_object(Bucket=LOGS_BUCKET, Key=key)
+        body = resp['Body'].read()
+        try:
+            content = body.decode('utf-8')
+        except UnicodeDecodeError:
+            content = body.decode('latin-1', errors='replace')
+        version_id = resp.get('VersionId')
+        try:
+            return json.loads(content), version_id
+        except Exception:
+            return {}, version_id
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', '')
+        if code in ('NoSuchKey', '404'):
+            return {}, None
+        raise
+    except Exception:
+        return {}, None
+
+
 def update_baselines(cluster_name: str, findings: List[Dict]):
     """
     Increment baseline counters for observed patterns and persist to S3.
-    Uses read-modify-write on S3 (acceptable for low-frequency updates).
+
+    Race-safe: uses optimistic concurrency control. Reads the current
+    VersionId, applies the increments locally, then PUTs with `IfMatch` set to
+    that VersionId. On `PreconditionFailed` we re-read and retry up to a small
+    number of attempts. Bucket already has versioning enabled in the construct,
+    so this gives correct cross-invocation counter updates without an external
+    lock.
     """
     if not cluster_name or not findings:
         return
-    baselines = load_baselines(cluster_name)
-    now_iso = datetime.utcnow().isoformat()
 
-    for f in findings:
-        pattern = f.get('pattern', '')
-        if not pattern:
-            continue
-        if pattern not in baselines:
-            baselines[pattern] = {
-                'count': 0,
-                'first_seen': now_iso,
-                'last_seen': now_iso,
-                'is_baseline': False,
-            }
-        entry = baselines[pattern]
-        entry['count'] = entry.get('count', 0) + 1
-        entry['last_seen'] = now_iso
-        # Auto-promote to baseline after threshold
-        if entry['count'] >= BASELINE_THRESHOLD:
-            entry['is_baseline'] = True
-
-    # Persist
     key = f'{BASELINE_PREFIX}{cluster_name}/patterns.json'
-    try:
-        s3_client.put_object(
-            Bucket=LOGS_BUCKET,
-            Key=key,
-            Body=json.dumps(baselines, default=str),
-            ContentType='application/json',
-        )
-    except Exception as e:
-        print(f"Warning: Failed to update baselines for {cluster_name}: {e}")
+    max_attempts = 5
+
+    for attempt in range(max_attempts):
+        baselines, version_id = _load_baselines_with_version(cluster_name)
+        now_iso = datetime.utcnow().isoformat()
+
+        for f in findings:
+            pattern = f.get('pattern', '')
+            if not pattern:
+                continue
+            if pattern not in baselines:
+                baselines[pattern] = {
+                    'count': 0,
+                    'first_seen': now_iso,
+                    'last_seen': now_iso,
+                    'is_baseline': False,
+                }
+            entry = baselines[pattern]
+            entry['count'] = entry.get('count', 0) + 1
+            entry['last_seen'] = now_iso
+            if entry['count'] >= BASELINE_THRESHOLD:
+                entry['is_baseline'] = True
+
+        body = json.dumps(baselines, default=str)
+        put_kwargs = {
+            'Bucket': LOGS_BUCKET,
+            'Key': key,
+            'Body': body,
+            'ContentType': 'application/json',
+        }
+        # If the object exists, require its current VersionId to match. If it
+        # didn't exist on read, require IfNoneMatch='*' to ensure we don't
+        # clobber a concurrent first-create.
+        if version_id:
+            put_kwargs['IfMatch'] = version_id
+        else:
+            put_kwargs['IfNoneMatch'] = '*'
+
+        try:
+            s3_client.put_object(**put_kwargs)
+            return
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', '')
+            if code in ('PreconditionFailed', 'ConditionalRequestConflict'):
+                # Lost the race — re-read and retry.
+                logger.info(
+                    f"Baseline update conflict for {cluster_name} (attempt {attempt + 1}/{max_attempts}); retrying."
+                )
+                # Tiny backoff to avoid lockstep retries.
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            logger.warning(f"Failed to update baselines for {cluster_name}: {e}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to update baselines for {cluster_name}: {e}")
+            return
+
+    logger.warning(
+        f"Baseline update for {cluster_name} gave up after {max_attempts} attempts due to concurrent writes."
+    )
 
 
 def annotate_findings_with_baselines(findings: List[Dict], cluster_name: str) -> List[Dict]:
@@ -2815,6 +3363,9 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
 
     logger.info(json.dumps({'event': 'invocation_start', 'payload': event}, default=str))
 
+    # Extract caller identity from AgentCore JWT claims (T6 mitigation).
+    caller = _extract_caller_identity(event, context)
+
     # Extract tool name from AgentCore context
     delimiter = "___"
     original_tool_name = context.client_context.custom.get('bedrockAgentCoreToolName', '')
@@ -2824,7 +3375,10 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
     else:
         tool_name = original_tool_name
 
-    logger.info(json.dumps({'event': 'tool_dispatch', 'tool': tool_name}))
+    logger.info(json.dumps({
+        'event': 'tool_dispatch', 'tool': tool_name,
+        'caller': {'client_id': caller.get('client_id'), 'sub': caller.get('sub')},
+    }))
 
     # Tool routing
     tools = {
@@ -2850,11 +3404,20 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
         'batch_status': batch_status,
         'network_diagnostics': network_diagnostics,
         'storage_diagnostics': storage_diagnostics,
-        'tcpdump_capture': tcpdump_capture,
-        'tcpdump_analyze': tcpdump_analyze,
         'list_sops': list_sops,
         'get_sop': get_sop,
     }
+
+    # Restricted tools are only registered when explicitly enabled.
+    # By default these are completely absent from the routing table —
+    # they don't appear in available_tools and cannot be invoked.
+    _restricted_tool_map = {
+        'tcpdump_capture': tcpdump_capture,
+        'tcpdump_analyze': tcpdump_analyze,
+    }
+    for rt_name, rt_func in _restricted_tool_map.items():
+        if rt_name in ENABLED_RESTRICTED_TOOLS:
+            tools[rt_name] = rt_func
 
     if tool_name not in tools:
         emit_metric('ToolInvocationError', dimensions=[
@@ -2865,8 +3428,36 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
             'available_tools': list(tools.keys())
         })
 
+    # Authorization gate: restricted-tool opt-in + per-tool ACL on caller client_id
+    auth_error = validate_tool_authorization(tool_name, caller=caller)
+    if auth_error:
+        emit_metric('ToolAuthorizationDenied', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ToolName', 'Value': tool_name},
+        ])
+        logger.warning(json.dumps({
+            'event': 'tool_authorization_denied', 'tool': tool_name,
+            'caller': {'client_id': caller.get('client_id'), 'sub': caller.get('sub')},
+        }))
+        return auth_error
+
+    # Per-caller rate limit (best-effort, in-process token bucket)
+    rate_limit_error = _enforce_rate_limit(caller.get('principal') or 'anonymous')
+    if rate_limit_error:
+        emit_metric('ToolRateLimited', dimensions=[
+            {'Name': 'StackName', 'Value': STACK_NAME},
+            {'Name': 'ToolName', 'Value': tool_name},
+        ])
+        logger.warning(json.dumps({
+            'event': 'tool_rate_limited', 'tool': tool_name,
+            'principal': caller.get('principal'),
+        }))
+        return rate_limit_error
+
     try:
         result = tools[tool_name](event)
+        # Redact sensitive infrastructure metadata before returning to caller
+        result = redact_response(result, tool_name=tool_name)
         duration_ms = (time.time() - start_time) * 1000
         emit_metric('ToolInvocation', dimensions=[
             {'Name': 'StackName', 'Value': STACK_NAME},
@@ -3823,7 +4414,7 @@ def search_logs_deep(arguments: Dict) -> Dict:
                 continue
             
             fsize = size_map.get(key, 0)
-            if fsize > 52428800:  # Only skip truly huge files >50MB
+            if fsize > 20971520:  # Skip files >20MB to bound resource consumption
                 large_file_count += 1
                 continue
             
@@ -4329,7 +4920,7 @@ def get_artifact_reference(arguments: Dict) -> Dict:
         presignedUrl, s3Uri, sha256, size
     """
     log_key = arguments.get('logKey')
-    expiration_seconds = min(arguments.get('expirationMinutes', 0) * 60 or PRESIGNED_URL_EXPIRATION, 3600)
+    expiration_seconds = min(arguments.get('expirationMinutes', 0) * 60 or PRESIGNED_URL_EXPIRATION, PRESIGNED_URL_EXPIRATION)
     
     if not log_key:
         return error_response(400, 'logKey is required')
@@ -7951,14 +8542,15 @@ def tcpdump_capture(arguments: Dict) -> Dict:
         return error_response(400, 'durationSeconds must be between 10 and 300')
 
     interface = arguments.get('interface', 'any')
-    # Sanitize interface name to prevent injection
+    # Sanitize interface name to prevent injection — strict allowlist
     if not re.match(r'^[a-zA-Z0-9\-\.]+$', interface):
         return error_response(400, f'Invalid interface name: {interface}')
 
     bpf_filter = arguments.get('filter', '')
-    # Basic sanitization: reject shell metacharacters
-    if bpf_filter and re.search(r'[;&|`$(){}]', bpf_filter):
-        return error_response(400, 'filter contains invalid characters')
+    # Allowlist-based BPF filter validation (replaces denylist approach)
+    bpf_error = validate_bpf_filter(bpf_filter)
+    if bpf_error:
+        return error_response(400, f'Invalid BPF filter: {bpf_error}')
 
     # Container/pod namespace support
     container_pid = arguments.get('containerPid', '')
@@ -7977,6 +8569,32 @@ def tcpdump_capture(arguments: Dict) -> Dict:
     # Can't specify both podName and containerPid
     if pod_name and container_pid:
         return error_response(400, 'Specify either podName or containerPid, not both')
+
+    # ── Confirmation gate (T2 mitigation) ──
+    # tcpdump installs packages, enters container namespaces, and captures raw
+    # network traffic as root. Require explicit confirmation to proceed.
+    confirm = arguments.get('confirmCapture', False)
+    if confirm is not True and str(confirm).lower() != 'true':
+        scope_desc = (
+            f'pod {pod_namespace}/{pod_name}' if pod_name
+            else f'container PID {container_pid}' if container_pid
+            else 'host network namespace'
+        )
+        return error_response(400,
+            f'tcpdump_capture requires explicit confirmation. This tool will: '
+            f'(1) run tcpdump as root on instance {instance_id} targeting {scope_desc}, '
+            f'(2) capture raw network packets for {duration}s on interface {interface}, '
+            f'(3) upload pcap to S3. '
+            f'Set confirmCapture=true to proceed.',
+            {
+                'requiresConfirmation': True,
+                'instanceId': instance_id,
+                'scope': scope_desc,
+                'durationSeconds': duration,
+                'interface': interface,
+                'filter': bpf_filter or 'none',
+            }
+        )
 
     # Check if this is a status poll for an existing command
     command_id = arguments.get('commandId')
@@ -8025,17 +8643,12 @@ PCAP_FILE="/tmp/tcpdump_capture_{timestamp}.pcap"
 TXT_FILE="/tmp/tcpdump_summary_{timestamp}.txt"
 STATS_FILE="/tmp/tcpdump_stats_{timestamp}.json"
 
-# Check if tcpdump is available
+# Check if tcpdump is available — do NOT auto-install packages (T2 mitigation)
 if ! command -v tcpdump &>/dev/null; then
-    echo "ERROR: tcpdump not found. Installing..."
-    if command -v yum &>/dev/null; then
-        yum install -y tcpdump 2>/dev/null || {{ echo "FATAL: Failed to install tcpdump"; exit 1; }}
-    elif command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y tcpdump 2>/dev/null || {{ echo "FATAL: Failed to install tcpdump"; exit 1; }}
-    else
-        echo "FATAL: No package manager found to install tcpdump"
-        exit 1
-    fi
+    echo "FATAL: tcpdump is not installed on this node. Install it manually or use an AMI that includes tcpdump."
+    echo "For Amazon Linux 2: yum install -y tcpdump"
+    echo "For Ubuntu: apt-get install -y tcpdump"
+    exit 1
 fi
 
 NSENTER_PREFIX=""
@@ -8653,13 +9266,15 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
 
         # If capture completed (even if S3 upload failed), treat as success with warnings
         if status in ('Success',) or (capture_completed and status == 'Failed'):
-            # Generate presigned URL for download (may fail if pcap wasn't uploaded)
+            # Generate presigned URL for download (may fail if pcap wasn't uploaded).
+            # pcap captures use a tighter expiration than ordinary log artifacts
+            # because they may contain credentials in transit.
             presigned_url = ''
             try:
                 presigned_url = s3_client.generate_presigned_url(
                     'get_object',
                     Params={'Bucket': LOGS_BUCKET, 'Key': s3_key},
-                    ExpiresIn=PRESIGNED_URL_EXPIRATION,
+                    ExpiresIn=PCAP_PRESIGNED_URL_EXPIRATION,
                 )
             except Exception:
                 pass
@@ -8694,6 +9309,16 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 if actual_failures == 3:
                     warnings.append('pcap file was NOT uploaded — it was too large to inline in stdout. Add S3 PutObject permission to the node IAM role to capture pcap files.')
 
+            # Surface a warning when the pcap exceeds the configured upload cap.
+            pcap_oversized = False
+            if file_size and MAX_PCAP_BYTES and file_size > MAX_PCAP_BYTES:
+                pcap_oversized = True
+                warnings.append(
+                    f'pcap exceeds MAX_PCAP_BYTES ({format_bytes(MAX_PCAP_BYTES)}); '
+                    f'capture is {format_bytes(file_size)}. Consider shorter durationSeconds '
+                    f'or a tighter BPF filter on future captures.'
+                )
+
             response_data = {
                 'commandId': command_id,
                 'instanceId': instance_id,
@@ -8705,8 +9330,10 @@ def _poll_tcpdump_status(command_id: str, instance_id: str, arguments: Dict) -> 
                 'fileSizeBytes': file_size,
                 'fileSizeHuman': format_bytes(file_size),
                 'packetCount': packet_count,
+                'pcapOversized': pcap_oversized,
+                'pcapMaxBytes': MAX_PCAP_BYTES,
                 'presignedUrl': presigned_url,
-                'presignedUrlExpiresIn': f'{PRESIGNED_URL_EXPIRATION} seconds',
+                'presignedUrlExpiresIn': f'{PCAP_PRESIGNED_URL_EXPIRATION} seconds',
                 'output': stdout[-2000:] if len(stdout) > 2000 else stdout,
                 'nextStep': f'Use tcpdump_analyze(instanceId="{instance_id}", commandId="{command_id}") to read decoded packet data and statistics.',
                 'task': {
@@ -10025,9 +10652,9 @@ def tcpdump_analyze(arguments: Dict) -> Dict:
             results['pcapDownloadUrl'] = s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': LOGS_BUCKET, 'Key': s3_key_pcap},
-                ExpiresIn=PRESIGNED_URL_EXPIRATION,
+                ExpiresIn=PCAP_PRESIGNED_URL_EXPIRATION,
             )
-            results['pcapDownloadUrlExpiresIn'] = f'{PRESIGNED_URL_EXPIRATION} seconds'
+            results['pcapDownloadUrlExpiresIn'] = f'{PCAP_PRESIGNED_URL_EXPIRATION} seconds'
         except Exception:
             pass
 

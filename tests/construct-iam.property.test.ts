@@ -18,7 +18,9 @@ const regionsArb: fc.Arbitrary<string[]> = fc.uniqueArray(regionArb, { minLength
 function synthesize(allowedRegions?: string[]) {
   const app = new cdk.App();
   const stack = new cdk.Stack(app, 'TestStack', { env: { region: 'us-east-1', account: '123456789012' } });
-  new SsmAutomationGatewayV2Construct(stack, 'Gateway', { allowedRegions });
+  // allowAnyClusterName: tests rely on the wildcard cluster scope, so opt in
+  // to keep them deterministic. Production deploys should set allowedClusterNames.
+  new SsmAutomationGatewayV2Construct(stack, 'Gateway', { allowedRegions, allowAnyClusterName: true });
   return Template.fromStack(stack);
 }
 
@@ -121,13 +123,23 @@ describe('Property 2: CDK region conditions on all SSM/EC2 policy statements', (
             const resources: any[] = Array.isArray(stmt.Resource) ? stmt.Resource : [stmt.Resource];
             const hasRegionInArn = resources.some((r: any) => {
               if (typeof r === 'string') {
-                return regions.some(region => r.includes(`:ssm:${region}:`));
+                // SSM SendCommand on instances uses :ec2:${region}:..:instance/*
+                // SSM SendCommand on documents and StartAutomationExecution use :ssm:${region}:..
+                return regions.some(region =>
+                  r.includes(`:ssm:${region}:`) ||
+                  r.includes(`:ssm:${region}::`) ||
+                  r.includes(`:ec2:${region}:`),
+                );
               }
               // Handle Fn::Join intrinsics — check the join parts for region strings
               const joinParts = r?.['Fn::Join']?.[1];
               if (Array.isArray(joinParts)) {
                 const joined = joinParts.filter((p: any) => typeof p === 'string').join('');
-                return regions.some(region => joined.includes(`:ssm:${region}:`));
+                return regions.some(region =>
+                  joined.includes(`:ssm:${region}:`) ||
+                  joined.includes(`:ssm:${region}::`) ||
+                  joined.includes(`:ec2:${region}:`),
+                );
               }
               return false;
             });
